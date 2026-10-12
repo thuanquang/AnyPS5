@@ -9,7 +9,7 @@ Each non-empty line has the form `Action = Type:Value`. Action names are case-in
 Supported input sources are:
 
 - `KEY:Return`, `KEY:Space`, or another key name accepted by SDL.
-- `MOUSE:Left`, `MOUSE:Middle`, `MOUSE:Right`, `MOUSE:X1`, or `MOUSE:X2`.
+- `MOUSE:Left`, `MOUSE:Middle`, `MOUSE:Right`, `MOUSE:X1`, or `MOUSE:X2`, except for `ToggleFullscreen`, which needs a keyboard key.
 - `WHEEL:Up` or `WHEEL:Down` for pad buttons.
 
 Game-controller bindings are enabled automatically and are not affected by keyboard or mouse overrides in this file.
