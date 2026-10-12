@@ -54,8 +54,8 @@ Args ParseArgs(int argc, char* argv[]) {
         } else if (arg == "--registry") {
             args.writeRegistry = true;
         } else if (arg == "--rpath") {
-            if (i + 1 >= argc)
-                throw std::runtime_error("--rpath requires a value");
+            if (i + 1 >= argc || std::string(argv[i + 1]).empty())
+                throw std::runtime_error("--rpath requires a nonempty value");
             args.runPath = argv[++i];
         } else if (arg == "--windows") {
             args.toWindows = true;

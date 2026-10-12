@@ -106,7 +106,8 @@ void rpathConsumesNextTokenVerbatim() {
 }
 
 void rpathWithoutValue() {
-    expectThrows({"--rpath"}, "--rpath requires a value");
+    expectThrows({"--rpath"}, "--rpath requires a nonempty value");
+    expectThrows({"--rpath", "", "input.elf", "output.elf"}, "--rpath requires a nonempty value");
 }
 
 void excludeSceModule() {
