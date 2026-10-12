@@ -61,6 +61,8 @@ std::vector<std::uint8_t> WriteMacOsImage(MacOsImageInput& input);
 
 std::string MachOLoadPath(const std::string& path, const std::string& origin);
 
+std::vector<std::string> MachORunPaths(const std::string& runPath, const std::string& origin);
+
 std::string MachODependency(const std::string& name, const std::string& origin);
 
 std::vector<std::string> ReadNeededLibraries(const Domain::SysVDynamicSection& dynamicSection);

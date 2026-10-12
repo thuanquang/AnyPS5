@@ -11,6 +11,9 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "macos"))
 
+from test_guest_module_directories import module_with_symbol
+from test_guest_needed_modules import executable_with_needed
+
 from import_fixture import fixture as import_fixture
 from nid import nid
 from tls_fixture import fixture as tls_fixture
@@ -145,12 +148,33 @@ def check_options(relinker, directory):
     check(result.returncode != 0 and "--windows conflicts with --macos" in result.stdout + result.stderr, "--macos together with --windows was accepted")
 
 
+def check_run_paths(relinker, directory):
+    work = Path(directory) / "run-paths"
+    (work / "sce_module").mkdir(parents=True)
+    (work / "sce_module" / "needed.prx").write_bytes(module_with_symbol(True))
+    source = work / "input.elf"
+    source.write_bytes(executable_with_needed())
+    output = work / "output" / "eboot"
+    output.parent.mkdir()
+    result = subprocess.run([str(relinker), "--macos", "--rpath", "$ORIGIN/libs:$ORIGIN/extra:/opt/libs:$ORIGIN/libs", str(source), str(output)], capture_output=True, text=True, timeout=120)
+    check(result.returncode == 0, f"run paths: relinker failed: {result.stdout}{result.stderr}")
+    executable = MachO(output.read_bytes()).rpaths
+    check(executable == ["@executable_path/libs", "@executable_path/extra", "/opt/libs"], f"run paths: executable {executable}")
+    module = MachO((output.parent / "app0" / "sce_module" / "needed.prx.guest.prx").read_bytes()).rpaths
+    check(module == ["@loader_path/../../libs", "@loader_path/../../extra", "/opt/libs"], f"run paths: module {module}")
+    for run_path, message in (("${ORIGIN}/libs", "Unsupported variable in macOS run path"), ("$ORIGIN/libs::/opt/libs", "Empty entry in macOS run path")):
+        rejected = work / "rejected"
+        result = subprocess.run([str(relinker), "--macos", "--skip-sce-module", "--rpath", run_path, str(source), str(rejected)], capture_output=True, text=True, timeout=120)
+        check(result.returncode == 2 and message in result.stderr and not rejected.exists(), f"run paths: {run_path} was not rejected: {result.stdout}{result.stderr}")
+
+
 def main():
     relinker = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="anyps5-macos-output-") as directory:
         check_imports(relink(relinker, directory, "import", import_fixture()))
         check_tls(relink(relinker, directory, "tls", tls_fixture()))
         check_options(relinker, directory)
+        check_run_paths(relinker, directory)
     print("macOS output checks passed")
 
 
