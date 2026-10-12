@@ -184,7 +184,7 @@ class Check:
             lines = [(number, KEY.match(re.sub(r"(^|\s)#.*", "", text))) for number, text in enumerate(source, 1)]
             lines = [(number, len(match[1]), match[2].strip("'\""), match[3] or "") for number, match in lines if match]
             triggers = [entry for entry in lines if entry[1] == 0 and entry[2] == "on"]
-            if not triggers or pull_request_filtered(lines, triggers[0]):
+            if not triggers or pull_request_filtered(lines, triggers[0], source):
                 continue
             for number, name, needs, condition in jobs(lines, source):
                 if name != "eligibility" and ("eligibility" not in needs or "needs.eligibility.outputs." not in condition):
@@ -256,11 +256,11 @@ def block(lines, start):
     return lines[start + 1:end]
 
 
-def pull_request_filtered(lines, trigger):
+def pull_request_filtered(lines, trigger, source):
     _, _, _, value = trigger
-    if value:
-        return "pull_request" not in re.findall(r"[A-Za-z_]+", value)
     triggers = block(lines, lines.index(trigger))
+    if value or not triggers:
+        return "pull_request" not in re.findall(r"[A-Za-z_]+", value or field(source, trigger))
     for index, (_, indent, name, value) in enumerate(triggers):
         if name == "pull_request" and indent == triggers[0][1]:
             return any(entry[2] in ("paths", "paths-ignore") for entry in block(triggers, index))
@@ -285,7 +285,8 @@ def jobs(lines, source):
     for index, (number, indent, name, _) in enumerate(entries):
         if indent != entries[0][1]:
             continue
-        fields = {entry[2]: field(source, entry) for entry in block(entries, index) if entry[1] == indent + 2}
+        children = block(entries, index)
+        fields = {entry[2]: field(source, entry) for entry in children if entry[1] == children[0][1]}
         result.append((number, name, re.findall(r"[A-Za-z0-9_-]+", fields.get("needs", "")), fields.get("if", "")))
     return result
 

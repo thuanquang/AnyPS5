@@ -89,6 +89,17 @@ class CiGateTests(unittest.TestCase):
     def test_inline_trigger_list_fails(self):
         self.assertUngated("name: Test\non: [push, pull_request]\njobs:\n  tests:\n    runs-on: ubuntu-latest\n", "tests")
 
+    def test_block_trigger_list_fails(self):
+        self.assertUngated("name: Test\non:\n  - push\n  - pull_request\njobs:\n  tests:\n    runs-on: ubuntu-latest\n", "tests")
+
+    def test_block_trigger_list_without_pull_request_passes(self):
+        self.assertGated("name: Test\non:\n  - push\n  - workflow_dispatch\njobs:\n  tests:\n    runs-on: ubuntu-latest\n")
+
+    def test_four_space_indentation(self):
+        header = "name: Test\non:\n    pull_request:\n        branches: [main]\njobs:\n    eligibility:\n        runs-on: ubuntu-latest\n"
+        self.assertGated(header + "    tests:\n        needs: eligibility\n        if: ${{ needs.eligibility.outputs.tests == 'true' }}\n")
+        self.assertUngated(header + "    tests:\n        runs-on: ubuntu-latest\n", "tests")
+
     def test_other_triggers_pass(self):
         self.assertGated(workflow("  pull_request_target:\n    types: [opened]\n  push:\n    branches: [main]\n", "  tests:\n    runs-on: ubuntu-latest\n"))
 
