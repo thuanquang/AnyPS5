@@ -142,6 +142,28 @@ def check_registry_after_failed_patch(relinker, work):
     assert not (case / "app0").exists()
 
 
+def check_diagnostics_after_failed_patch(relinker, work):
+    for run_path in (None, "${ORIGIN}/libs"):
+        case = work / f"diagnostics-failed-patch-{run_path is None}"
+        case.mkdir()
+        if run_path is None:
+            (case / "sce_sys").mkdir()
+            (case / "sce_sys" / "icon0.png").write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(40))
+        source = case / "input.elf"
+        source.write_bytes(main_fixture())
+        diagnostics = case / "windows-diagnostics-imports.txt"
+        previous = b"previous diagnostics"
+        diagnostics.write_bytes(previous)
+        options = [] if run_path is None else ["--rpath", run_path]
+        result = subprocess.run([str(relinker), "--windows", "--windows-diagnostics", "--skip-sce-module", *options,
+                                 str(source), str(case / "output.exe")], cwd=case,
+                                capture_output=True, text=True, timeout=20)
+        expected = "Invalid Windows icon PNG" if run_path is None else "Unsupported variable in Windows run path"
+        assert result.returncode == 2 and expected in result.stderr, (result.stdout, result.stderr)
+        assert diagnostics.read_bytes() == previous
+        assert not (case / "output.exe").exists()
+
+
 def check_desktop_inputs(relinker, work):
     for desktop in (False, True):
         for bundled in (False, True):
@@ -204,6 +226,7 @@ def main():
         check_diagnostic_inputs(relinker, work)
         check_desktop_inputs(relinker, work)
         check_registry_after_failed_patch(relinker, work)
+        check_diagnostics_after_failed_patch(relinker, work)
         for windows in (False, True):
             options = ["--windows"] if windows else []
             check_registry_inputs(relinker, work, windows)
