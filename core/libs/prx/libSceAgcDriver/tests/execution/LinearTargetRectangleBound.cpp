@@ -63,6 +63,7 @@ struct Surface {
 
 constexpr Surface Tall{0, 64, 256};
 constexpr Surface Shifted{6 * BlockBytes + GapBytes, 64, 16};
+constexpr VkRect2D Seed{{63, 255}, {1, 1}};
 
 alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{
     0xe0382000, 0x80000005, 0xbf8c3f70, 0xf80008cf, 0x03020100, 0xbf810000,
@@ -256,22 +257,27 @@ bool Expect(AgcDriver::VulkanDevice& device) {
     constexpr VkRect2D first{{8, 4}, {16, 16}};
     constexpr VkRect2D second{{16, 12}, {24, 16}};
     constexpr VkRect2D whole{{0, 0}, {Shifted.width, Shifted.height}};
+    Draw(device, tall, Tall, Program(0, false), Seed);
+    device.WaitIdle();
     Draw(device, tall, Tall, Program(0, false), first);
     Draw(device, tall, Tall, Program(1, true), second);
     Draw(device, shifted, Shifted, Program(0, false), whole);
     const std::array<std::array<std::uint32_t, 2>, 3> sentinels{{{50, 10}, {20, 40}, {30, 200}}};
+    const std::array<std::array<std::uint32_t, 2>, 2> between{{{30, 6}, {10, 25}}};
     for (const auto& [x, y] : sentinels) std::memset(Pixel(block, Tall, x, y), Sentinel, 16);
+    for (const auto& [x, y] : between) std::memset(Pixel(block, Tall, x, y), Sentinel, 16);
     Require((block.Address() + Shifted.offset) / BlockBytes * BlockBytes == block.Address() + Shifted.offset - GapBytes, "the shifted target does not start past a 64 KiB boundary");
     std::memset(block.data + Shifted.offset - GapBytes, Gap, GapBytes);
     device.WaitIdle();
-    std::size_t wrongDrawn = 0, wrongSentinels = 0, wrongUntouched = 0, wrongShifted = 0;
+    std::size_t wrongDrawn = 0, wrongSentinels = 0, wrongBetween = 0, wrongUntouched = 0, wrongShifted = 0;
     for (std::uint32_t y = 0; y < Tall.height; ++y) {
         for (std::uint32_t x = 0; x < Tall.width; ++x) {
             const auto* pixel = Pixel(block, Tall, x, y);
-            const bool sentinel = std::any_of(sentinels.begin(), sentinels.end(), [&](const auto& at) { return at[0] == x && at[1] == y; });
-            if (sentinel) wrongSentinels += Holds(pixel, Sentinel) ? 0u : 1u;
+            const auto at = [&](const auto& point) { return point[0] == x && point[1] == y; };
+            if (std::any_of(sentinels.begin(), sentinels.end(), at)) wrongSentinels += Holds(pixel, Sentinel) ? 0u : 1u;
+            else if (std::any_of(between.begin(), between.end(), at)) wrongBetween += Holds(pixel, Sentinel) ? 0u : 1u;
             else if (Inside(second, x, y)) wrongDrawn += HoldsOutput(pixel, x, y, 1.0f) ? 0u : 1u;
-            else if (Inside(first, x, y)) wrongDrawn += HoldsOutput(pixel, x, y, 0.0f) ? 0u : 1u;
+            else if (Inside(first, x, y) || Inside(Seed, x, y)) wrongDrawn += HoldsOutput(pixel, x, y, 0.0f) ? 0u : 1u;
             else wrongUntouched += Holds(pixel, Initial) ? 0u : 1u;
         }
     }
@@ -279,10 +285,43 @@ bool Expect(AgcDriver::VulkanDevice& device) {
         for (std::uint32_t x = 0; x < Shifted.width; ++x) wrongShifted += HoldsOutput(Pixel(block, Shifted, x, y), x, y, 0.0f) ? 0u : 1u;
     }
     const auto gapLost = static_cast<std::size_t>(std::count_if(block.data + Shifted.offset - GapBytes, block.data + Shifted.offset, [](std::uint8_t byte) { return byte != Gap; }));
-    std::printf("linear target rectangle bound: wrong drawn pixels %zu, lost sentinels %zu/%zu, changed untouched pixels %zu, wrong shifted-target pixels %zu, lost gap bytes %zu/%zu\n", wrongDrawn, wrongSentinels, sentinels.size(), wrongUntouched, wrongShifted, gapLost, GapBytes);
+    std::printf("linear target rectangle bound: wrong drawn pixels %zu, lost sentinels %zu/%zu, lost sentinels between the rectangles %zu/%zu, changed untouched pixels %zu, wrong shifted-target pixels %zu, lost gap bytes %zu/%zu\n", wrongDrawn, wrongSentinels, sentinels.size(), wrongBetween, between.size(), wrongUntouched, wrongShifted, gapLost, GapBytes);
     Require(wrongDrawn == 0 && wrongShifted == 0, "a drawn linear target's store lost pixels its draws wrote");
-    Require(wrongSentinels == 0 && gapLost == 0, "a drawn linear target's store overwrote CPU stores outside the drawn rectangle");
+    Require(wrongSentinels == 0 && gapLost == 0, "a drawn linear target's store overwrote CPU stores outside the drawn rectangles");
+    Require(wrongBetween == 0, "a drawn linear target's store overwrote CPU stores between two draws' scissor rectangles");
     Require(wrongUntouched == 0, "a drawn linear target's store changed pixels no draw and no CPU store wrote");
+    return true;
+}
+
+bool ExpectManyRows(AgcDriver::VulkanDevice& device) {
+    Block block(RegionBytes);
+    std::fill(block.data, block.data + block.bytes, Initial);
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    if (AgcDriver::Graphics::HostImportFor(context, block.Address(), block.bytes) == nullptr) return false;
+    const auto tall = DecodeTarget(block, Tall);
+    constexpr std::uint32_t Rows = 17;
+    constexpr std::uint32_t Spacing = 15;
+    Draw(device, tall, Tall, Program(0, false), Seed);
+    device.WaitIdle();
+    for (std::uint32_t row = 0; row < Rows; ++row) Draw(device, tall, Tall, Program(0, false), VkRect2D{{8, static_cast<std::int32_t>(row * Spacing)}, {16, 1}});
+    constexpr std::array<std::uint32_t, 2> between{10, 70};
+    std::memset(Pixel(block, Tall, between[0], between[1]), Sentinel, 16);
+    device.WaitIdle();
+    std::size_t wrongDrawn = 0, wrongUntouched = 0;
+    for (std::uint32_t y = 0; y < Tall.height; ++y) {
+        const bool drawnRow = y % Spacing == 0 && y / Spacing < Rows;
+        for (std::uint32_t x = 0; x < Tall.width; ++x) {
+            if (x == between[0] && y == between[1]) continue;
+            const auto* pixel = Pixel(block, Tall, x, y);
+            if ((drawnRow && x >= 8 && x < 24) || Inside(Seed, x, y)) wrongDrawn += HoldsOutput(pixel, x, y, 0.0f) ? 0u : 1u;
+            else wrongUntouched += Holds(pixel, Initial) ? 0u : 1u;
+        }
+    }
+    const bool kept = Holds(Pixel(block, Tall, between[0], between[1]), Sentinel);
+    std::printf("linear target rectangle bound, %u one-row scissors: wrong drawn pixels %zu, sentinel between the rows %s, changed untouched pixels %zu\n", Rows, wrongDrawn, kept ? "kept" : "lost", wrongUntouched);
+    Require(wrongDrawn == 0, "a drawn linear target's store lost pixels its one-row draws wrote");
+    Require(kept, "a drawn linear target's store overwrote a CPU store between two one-row scissors");
+    Require(wrongUntouched == 0, "a drawn linear target's store changed pixels no one-row draw and no CPU store wrote");
     return true;
 }
 
@@ -292,7 +331,7 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (!Expect(*device)) {
+        if (!Expect(*device) || !ExpectManyRows(*device)) {
             std::puts("linear target rectangle bound test skipped: no host import on this device");
             return VulkanTestSkipped;
         }

@@ -1690,15 +1690,15 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
         else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
     }
+    std::vector<bool> storeNow(residents.size(), false);
     for (std::size_t index = 0; index < residents.size(); ++index) {
         if (residents[index] == nullptr) continue;
-        if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor);
+        if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) storeNow[index] = !residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor) || !residents[index]->Cached();
         else if (index < slices.size()) residents[index]->MarkSliceDirty(slices[index].first, slices[index].second);
         else residents[index]->MarkDirty();
     }
-    for (const auto& resident : residents) {
-        if (resident == nullptr || resident->Descriptor().tileMode != TextureTileMode::kLinear || resident->Cached()) continue;
-        StorageTexture::FlushPending(resident->Descriptor().baseAddress, static_cast<std::size_t>(resident->GuestBytes()), nullptr, "linear target");
+    for (std::size_t index = 0; index < residents.size(); ++index) {
+        if (storeNow[index]) StorageTexture::FlushPending(residents[index]->Descriptor().baseAddress, static_cast<std::size_t>(residents[index]->GuestBytes()), nullptr, "linear target");
     }
 }
 

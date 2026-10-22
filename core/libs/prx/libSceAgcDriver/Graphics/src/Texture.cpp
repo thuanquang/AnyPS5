@@ -3844,7 +3844,9 @@ bool StorageTexture::Dirty() const {
     return dirty;
 }
 
-void StorageTexture::MarkDrawn(std::uint32_t slice, std::uint32_t count, VkRect2D scissor) {
+constexpr std::size_t MaxDrawnRects = 16;
+
+bool StorageTexture::MarkDrawn(std::uint32_t slice, std::uint32_t count, VkRect2D scissor) {
     struct Drawing {
         bool& flag;
         bool previous;
@@ -3859,27 +3861,34 @@ void StorageTexture::MarkDrawn(std::uint32_t slice, std::uint32_t count, VkRect2
     const bool rectangle = proxyImage == VK_NULL_HANDLE && descriptor.tileMode == TextureTileMode::kLinear && !blockUnits && trackedLayers == 1 && descriptor.mipCount == 1 && arrayLayers == 1 && geometry.imageLayers == 1 && geometry.imageDepth == 1 && !geometry.thick && descriptor.dccAddress == 0;
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
-    if (!anyLayerPending()) return;
+    if (!anyLayerPending()) return true;
     if (!drawnListed) {
         drawnListed = true;
         drawnWhole = false;
-        drawnLeft = drawnTop = drawnRight = drawnBottom = 0;
+        drawnRects.clear();
         pending.drawn.push_back({this, guestBytes, std::chrono::steady_clock::now()});
         pending.drawnCount.store(pending.drawn.size(), std::memory_order_release);
     }
     if (!rectangle || pendingFromOthers) drawnWhole = true;
-    if (drawnWhole || right <= left || bottom <= top) return;
-    if (drawnRight <= drawnLeft || drawnBottom <= drawnTop) {
-        drawnLeft = left;
-        drawnTop = top;
-        drawnRight = right;
-        drawnBottom = bottom;
-        return;
+    if (!drawnWhole && right > left && bottom > top) addDrawnRect({left, top, right, bottom});
+    return !drawnWhole && drawnRects.size() <= MaxDrawnRects;
+}
+
+void StorageTexture::addDrawnRect(DrawnRect rect) {
+    const auto inside = [](const DrawnRect& outer, const DrawnRect& inner) { return outer.left <= inner.left && outer.top <= inner.top && inner.right <= outer.right && inner.bottom <= outer.bottom; };
+    if (std::any_of(drawnRects.begin(), drawnRects.end(), [&](const DrawnRect& kept) { return inside(kept, rect); })) return;
+    for (auto kept = drawnRects.begin(); kept != drawnRects.end();) {
+        const bool columns = kept->left == rect.left && kept->right == rect.right && kept->top <= rect.bottom && rect.top <= kept->bottom;
+        const bool rows = kept->top == rect.top && kept->bottom == rect.bottom && kept->left <= rect.right && rect.left <= kept->right;
+        if (!columns && !rows && !inside(rect, *kept)) {
+            ++kept;
+            continue;
+        }
+        rect = {std::min(kept->left, rect.left), std::min(kept->top, rect.top), std::max(kept->right, rect.right), std::max(kept->bottom, rect.bottom)};
+        drawnRects.erase(kept);
+        kept = drawnRects.begin();
     }
-    drawnLeft = std::min(drawnLeft, left);
-    drawnTop = std::min(drawnTop, top);
-    drawnRight = std::max(drawnRight, right);
-    drawnBottom = std::max(drawnBottom, bottom);
+    drawnRects.push_back(rect);
 }
 
 void StorageTexture::forgetDrawn() {
@@ -3887,7 +3896,7 @@ void StorageTexture::forgetDrawn() {
     if (!drawnListed) return;
     drawnListed = false;
     drawnWhole = false;
-    drawnLeft = drawnTop = drawnRight = drawnBottom = 0;
+    drawnRects.clear();
     auto& pending = Pending();
     std::erase_if(pending.drawn, [this](const PendingWrites::Drawn& entry) { return entry.texture == this; });
     pending.drawnCount.store(pending.drawn.size(), std::memory_order_release);
@@ -3905,25 +3914,47 @@ StorageTexture::DrawnArea StorageTexture::drawnArea() const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     if (!drawnListed) return {};
-    return {true, !drawnWhole && !pendingFromOthers, drawnLeft, drawnTop, drawnRight, drawnBottom};
+    DrawnArea area{true, !drawnWhole && !pendingFromOthers};
+    if (!area.rect || drawnRects.empty()) return area;
+    area.left = area.top = std::numeric_limits<std::uint32_t>::max();
+    for (const auto& rect : drawnRects) {
+        area.left = std::min(area.left, rect.left);
+        area.top = std::min(area.top, rect.top);
+        area.right = std::max(area.right, rect.right);
+        area.bottom = std::max(area.bottom, rect.bottom);
+    }
+    area.rects = drawnRects;
+    return area;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::drawnSpans(const DrawnArea& area, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep) const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
-    if (area.right <= area.left || area.bottom <= area.top) return spans;
+    if (area.rects.empty()) return spans;
     const auto& mip = mips.front();
     const auto elementBytes = static_cast<std::uint64_t>(BytesPerElement(descriptor.format));
     const auto rowBase = descriptor.baseAddress + mip.tiledOffset;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> columns;
     std::size_t next = 0;
     for (auto row = area.top; row < area.bottom; ++row) {
+        columns.clear();
+        for (const auto& rect : area.rects) {
+            if (rect.top <= row && row < rect.bottom) columns.emplace_back(rect.left, rect.right);
+        }
+        std::sort(columns.begin(), columns.end());
         const auto rowStart = rowBase + std::uint64_t{row} * mip.pitchBytes;
-        const auto rowBegin = rowStart + area.left * elementBytes;
-        const auto rowEnd = rowStart + area.right * elementBytes;
-        while (next < keep.size() && keep[next].second <= rowBegin) ++next;
-        for (auto index = next; index < keep.size() && keep[index].first < rowEnd; ++index) {
-            const auto from = std::max(rowBegin, keep[index].first);
-            const auto to = std::min(rowEnd, keep[index].second);
-            if (from < to) spans.emplace_back(from, to);
+        for (std::size_t first = 0; first < columns.size();) {
+            auto right = columns[first].second;
+            auto last = first + 1;
+            for (; last < columns.size() && columns[last].first <= right; ++last) right = std::max(right, columns[last].second);
+            const auto rowBegin = rowStart + columns[first].first * elementBytes;
+            const auto rowEnd = rowStart + right * elementBytes;
+            first = last;
+            while (next < keep.size() && keep[next].second <= rowBegin) ++next;
+            for (auto index = next; index < keep.size() && keep[index].first < rowEnd; ++index) {
+                const auto from = std::max(rowBegin, keep[index].first);
+                const auto to = std::min(rowEnd, keep[index].second);
+                if (from < to) spans.emplace_back(from, to);
+            }
         }
     }
     return spans;
