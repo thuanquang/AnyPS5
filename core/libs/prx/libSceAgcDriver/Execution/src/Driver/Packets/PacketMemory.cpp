@@ -43,6 +43,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (label.has_value()) {
                 const auto bytes = label->Bytes();
                 const auto stamp = ++eventSerial;
+                if (localDevice != nullptr && submission.queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
                 reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
                 if (reason == 1) GuestMemory::Write(label->address, bytes, 4);
                 if (reason == 0 || reason == 1 || reason == 5) {
@@ -424,6 +425,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
+        if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
         reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
         if (reason != 0 && reason != 5 && reason != 6) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
