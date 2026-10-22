@@ -4426,6 +4426,30 @@ std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
     return stored;
 }
 
+std::size_t StorageTexture::StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all) {
+    auto& pending = Pending();
+    if (pending.drawnCount.load(std::memory_order_acquire) == 0 || Recorder::InCompletion()) return 0;
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    {
+        std::lock_guard lock(pending.mutex);
+        for (const auto& entry : pending.drawn) {
+            if (!entry.texture->dirty) continue;
+            const auto begin = entry.texture->descriptor.baseAddress;
+            const auto end = begin + entry.texture->guestBytes;
+            if (!all && !touches(begin, end)) continue;
+            ranges.emplace_back(begin, static_cast<std::size_t>(entry.texture->guestBytes));
+        }
+    }
+    if (ranges.empty()) return 0;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::size_t stored = 0;
+    for (const auto& [address, bytes] : ranges) {
+        if (FlushPending(address, bytes, nullptr, reason)) ++stored;
+    }
+    return stored;
+}
+
 bool StorageTexture::AnyPending() {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
