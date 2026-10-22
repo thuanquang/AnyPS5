@@ -3859,7 +3859,7 @@ void StorageTexture::MarkDrawn(std::uint32_t slice, std::uint32_t count, VkRect2
     const bool rectangle = proxyImage == VK_NULL_HANDLE && descriptor.tileMode == TextureTileMode::kLinear && !blockUnits && trackedLayers == 1 && descriptor.mipCount == 1 && arrayLayers == 1 && geometry.imageLayers == 1 && geometry.imageDepth == 1 && !geometry.thick && descriptor.dccAddress == 0;
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
-    if (!dirty) return;
+    if (!anyLayerPending()) return;
     if (!drawnListed) {
         drawnListed = true;
         drawnWhole = false;
@@ -4637,6 +4637,7 @@ bool StorageTexture::AccessKeptByCpu(std::uint64_t address, std::size_t bytes, s
     // store there would see, and the stamps only grow.
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    if (std::any_of(overlapping.begin(), overlapping.end(), [](const std::shared_ptr<StorageTexture>& texture) { return texture->drawnArea().drawn; })) return false;
     if (!blocksKept(overlapping, address, bytes)) return false;
     const auto site = static_cast<std::uint8_t>(GuestMemory::CurrentReadSite());
     std::size_t dropped = 0;
@@ -5718,7 +5719,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto index = static_cast<std::size_t>((at - spanBegin) / block);
             const bool kept = keptAtUnwatchHolds(from, layer);
             const bool written = kept || unknown || (changedBlocks[index] == GuestMemory::BlockWritten && (compared[layer] || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer])) && !unchangedSinceBaseline(from, to));
-            if (written && (!drawn.drawn || (tracked && !kept && !unknown && cpuBlocks[index] == 0))) {
+            if (written && (!drawn.rect || (tracked && !kept && !unknown && cpuBlocks[index] == 0))) {
                 skippedAny = true;
                 skippedLayer[layer] = true;
                 ++skipped;

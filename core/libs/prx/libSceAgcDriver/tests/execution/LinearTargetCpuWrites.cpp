@@ -228,8 +228,8 @@ std::array<float, 4> Texel(const std::uint8_t* target, std::uint32_t x, std::uin
 
 enum class Outcome { Kept, Lost, Skipped };
 
-Outcome Run(AgcDriver::VulkanDevice& device, bool watched, bool seeded) {
-    const auto name = std::string(seeded ? "seeded" : "unseeded") + ", " + (watched ? "write-watched" : "unwatched") + " memory";
+Outcome Run(AgcDriver::VulkanDevice& device, bool watched, bool seeded, bool hookRead) {
+    const auto name = std::string(seeded ? "seeded" : "unseeded") + ", " + (watched ? "write-watched" : "unwatched") + " memory" + (hookRead ? ", driver read before the store" : "");
     Block block(watched ? std::size_t{16} * BlockBytes : BlockBytes, watched);
     std::fill(block.data, block.data + block.bytes, std::uint8_t{0xff});
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
@@ -255,6 +255,15 @@ Outcome Run(AgcDriver::VulkanDevice& device, bool watched, bool seeded) {
     Draw(device, color, Program(1, true), Drawn);
     for (std::uint32_t y = 0; y < Height; ++y) std::memset(block.data + y * RowBytes + Drawn * 16u, 0x42, RowBytes - Drawn * 16u);
     const bool watchedAtStore = AgcDriver::GuestMemory::Watched(block.Address(), TargetBytes);
+    if (hookRead) {
+        std::vector<std::uint8_t> row(RowBytes);
+        AgcDriver::GuestMemory::Read(block.Address(), std::as_writable_bytes(std::span(row)), 1);
+        for (std::uint32_t x = 0; x < Drawn; ++x) {
+            const std::array<float, 4> expected{static_cast<float>(x), 0.0f, 1.0f, 1.0f};
+            const auto texel = Texel(row.data(), x, 0);
+            Require(texel == expected, name + ": a driver read of row 0 before the store: pixel (" + std::to_string(x) + ", 0) holds (" + std::to_string(texel[0]) + ", " + std::to_string(texel[1]) + ", " + std::to_string(texel[2]) + ", " + std::to_string(texel[3]) + "), not the second draw's");
+        }
+    }
     device.WaitIdle();
     std::size_t wrongGpu = 0;
     std::size_t wrongCpu = 0;
@@ -280,9 +289,11 @@ int main() {
         bool ran = false;
         for (const bool watched : {true, false}) {
             for (const bool seeded : {false, true}) {
-                const auto outcome = Run(*device, watched, seeded);
-                ran = ran || outcome != Outcome::Skipped;
-                kept = kept && outcome != Outcome::Lost;
+                for (const bool hookRead : {false, true}) {
+                    const auto outcome = Run(*device, watched, seeded, hookRead);
+                    ran = ran || outcome != Outcome::Skipped;
+                    kept = kept && outcome != Outcome::Lost;
+                }
             }
         }
         if (!ran) {

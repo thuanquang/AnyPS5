@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -40,6 +41,14 @@
 
 extern "C" int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name);
 extern "C" int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq);
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -338,6 +347,10 @@ int main(int argc, char** argv) {
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
+            if (AgcDriver::VulkanDeviceTestAccess::ContextOf(*device).hostImportAlignment == 0) {
+                std::puts("linear target completion point tests skipped: no host import on this device, so the target is never resident");
+                return VulkanTestSkipped;
+            }
         }
         std::vector<std::unique_ptr<Region>> regions;
         struct ShutdownGuard {
