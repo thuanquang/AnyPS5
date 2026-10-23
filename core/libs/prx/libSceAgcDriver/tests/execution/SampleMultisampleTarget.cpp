@@ -166,6 +166,12 @@ alignas(256) constexpr std::array<std::uint32_t, 26> GradientCode{
     0x80001301, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 18> AdjustCode{
+    0x34020087, 0xe0301000, 0x80000201, 0xe0301004, 0x80000301, 0xbf8c3f70, 0xf0800f09, 0x00611002,
+    0xbf8c3f70, 0xe0701030, 0x80001001, 0xe0701034, 0x80001101, 0xe0701038, 0x80001201, 0xe070103c,
+    0x80001301, 0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 19> StoreCode{
     0x34020087, 0xe030100c, 0x80000501, 0xe0301010, 0x80000601, 0xe0301014, 0x80000701, 0xe0301018,
     0x80001001, 0xe030101c, 0x80001101, 0xe0301020, 0x80001201, 0xe0301024, 0x80001301, 0xbf8c3f70,
@@ -601,6 +607,24 @@ void CheckTwoSampleOffsetAndGradientReads(AgcDriver::VulkanDevice& device) {
                 std::snprintf(what, sizeof(what), "a DIM 2D image_sample_d at gradients of %g and %g texels per pixel", gradientX, gradientY);
                 check(texel, sampleZero(pixel % Side, pixel / Side), what, pixel);
             }
+        }
+    }
+    std::vector<std::uint32_t> adjustUserData;
+    const auto adjust = CompileProgram(device, AdjustCode, texture, adjustUserData, PointMipSampler);
+    for (std::uint32_t first = 0; first < Side * Side; first += Threads) {
+        Buffer.fill(0xdeadbeefu);
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+            const auto pixel = first + tid;
+            Buffer[tid * Words] = std::bit_cast<std::uint32_t>((pixel % Side + 0.5f) / Side);
+            Buffer[tid * Words + 1u] = std::bit_cast<std::uint32_t>((pixel / Side + 0.5f) / Side);
+        }
+        device.Dispatch(adjust, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(AdjustCode.data()));
+        device.WaitIdle();
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+            const auto pixel = first + tid;
+            std::array<std::uint32_t, 4> texel{};
+            std::copy_n(&Buffer[tid * Words + LoadResult], texel.size(), texel.begin());
+            check(texel, sampleZero(pixel % Side, pixel / Side), "a DIM 2D image_sample_a", pixel);
         }
     }
 }
@@ -1106,7 +1130,8 @@ int main(int argc, char** argv) {
         std::puts("DIM 2D image_load, image_sample_lz and image_sample_l reads of a 4x color target return each pixel's sample 0");
         RequireReadRefused(*device, NearOffsetCode, TargetDescriptor(block, SampleShift), "a DIM 2D image_sample_lz_o read of a 4x color target");
         RequireReadRefused(*device, GradientCode, TargetDescriptor(block, SampleShift), "a DIM 2D image_sample_d read of a 4x color target");
-        std::puts("DIM 2D image_sample_lz_o and image_sample_d reads of a 4x color target are refused");
+        RequireReadRefused(*device, AdjustCode, TargetDescriptor(block, SampleShift), "a DIM 2D image_sample_a read of a 4x color target");
+        std::puts("DIM 2D image_sample_lz_o, image_sample_d and image_sample_a reads of a 4x color target are refused");
         Block swapped(4u * BlockBytes);
         Draw(*device, TargetState(DecodeSwappedTarget(swapped)), 0, 2u, Unorm8PixelCode);
         const auto swappedSamples = LoadSamples(*device, swapped, Format8888Unorm);
@@ -1163,10 +1188,10 @@ int main(int argc, char** argv) {
         std::puts("stores to one sample of each pixel of a drawn 4x target and to samples of zeroed color memory no draw rendered to reach exactly those samples, and a store to non-uniform color memory no draw rendered to is refused");
         const auto limits = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device).limits;
         if ((limits.framebufferColorSampleCounts & limits.sampledImageColorSampleCounts & limits.storageImageSampleCounts & VK_SAMPLE_COUNT_2_BIT) == 0) {
-            std::puts("DIM 2D image_sample_lz_o and image_sample_d reads of a 2x target not tested: the device lacks 2-sample color, sampled or storage images");
+            std::puts("DIM 2D image_sample_lz_o, image_sample_d and image_sample_a reads of a 2x target not tested: the device lacks 2-sample color, sampled or storage images");
         } else {
             CheckTwoSampleOffsetAndGradientReads(*device);
-            std::puts("DIM 2D image_sample_lz_o reads at texel offsets from -8 to 7 and image_sample_d reads at gradients of 0 to 16 texels per pixel of a 2x 32_FLOAT surface return sample 0 of the offset texel, wrapped, at level 0");
+            std::puts("DIM 2D image_sample_lz_o reads at texel offsets from -8 to 7 and image_sample_d reads at gradients of 0 to 16 texels per pixel of a 2x 32_FLOAT surface return sample 0 of the offset texel, wrapped, at level 0, and image_sample_a reads return sample 0 as image_sample does");
         }
         for (const auto mode : {TileZ64KBX, TileD64KBX}) {
             Block swizzled(BlockBytes);
