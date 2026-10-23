@@ -84,6 +84,10 @@ constexpr std::array<float, 4> Ones{1.0f, 1.0f, 1.0f, 1.0f};
 constexpr std::array<float, 4> Written{0.75f, 0.25f, 0.5f, 1.0f};
 constexpr std::uint32_t StoredSample = 1;
 constexpr std::array<std::uint32_t, 4> PointMipSampler{0u, 0xfffu << 12u, 1u << 26u, 0u};
+constexpr std::uint32_t TwoSamples = 2;
+constexpr std::uint32_t TwoSampleShift = 1;
+constexpr std::uint32_t Format32Float = 22;
+constexpr std::uint32_t OffsetReads = 4;
 
 alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{
     0xe0382000, 0x80000005, 0xbf8c3f70, 0xf80008cf, 0x03020100, 0xbf810000,
@@ -126,6 +130,42 @@ alignas(256) constexpr std::array<std::uint32_t, 44> PlaneCode{
     0x80001a01, 0xe070105c, 0x80001b01, 0xbf810000,
 };
 
+constexpr std::uint32_t TexelOffset(std::int32_t x, std::int32_t y) {
+    return (static_cast<std::uint32_t>(x) & 0x3fu) | ((static_cast<std::uint32_t>(y) & 0x3fu) << 8u);
+}
+
+using TexelOffsets = std::array<std::array<std::int32_t, 2>, OffsetReads>;
+
+constexpr std::array<std::uint32_t, 56> LevelZeroOffsetCode(const TexelOffsets& offsets) {
+    std::array<std::uint32_t, 56> code{0x34020087, 0xe0301000, 0x80000301, 0xe0301004, 0x80000401, 0xbf8c3f70};
+    std::uint32_t word = 6;
+    for (std::uint32_t read = 0; read < OffsetReads; ++read) {
+        code[word++] = 0x7e0402ff;
+        code[word++] = TexelOffset(offsets[read][0], offsets[read][1]);
+        code[word++] = 0xf0dc0f08;
+        code[word++] = 0x00610002u | ((16u + read * 4u) << 8u);
+    }
+    code[word++] = 0xbf8c3f70;
+    for (std::uint32_t result = 0; result < OffsetReads * 4u; ++result) {
+        code[word++] = 0xe0701000u | ((LoadResult + result) * 4u);
+        code[word++] = 0x80000001u | ((16u + result) << 8u);
+    }
+    code[word] = 0xbf810000;
+    return code;
+}
+
+constexpr TexelOffsets NearOffsets{{{0, 0}, {1, 0}, {0, 1}, {-1, 0}}};
+constexpr TexelOffsets FarOffsets{{{0, -1}, {1, 1}, {-8, 7}, {7, -8}}};
+alignas(256) constexpr auto NearOffsetCode = LevelZeroOffsetCode(NearOffsets);
+alignas(256) constexpr auto FarOffsetCode = LevelZeroOffsetCode(FarOffsets);
+
+alignas(256) constexpr std::array<std::uint32_t, 26> GradientCode{
+    0x34020087, 0xe0301000, 0x80000201, 0xe0301004, 0x80000301, 0xe0301008, 0x80000401, 0xe030100c,
+    0x80000501, 0xe0301010, 0x80000601, 0xe0301014, 0x80000701, 0xbf8c3f70, 0xf0880f08, 0x00611002,
+    0xbf8c3f70, 0xe0701030, 0x80001001, 0xe0701034, 0x80001101, 0xe0701038, 0x80001201, 0xe070103c,
+    0x80001301, 0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 19> StoreCode{
     0x34020087, 0xe030100c, 0x80000501, 0xe0301010, 0x80000601, 0xe0301014, 0x80000701, 0xe0301018,
     0x80001001, 0xe030101c, 0x80001101, 0xe0301020, 0x80001201, 0xe0301024, 0x80001301, 0xbf8c3f70,
@@ -136,6 +176,7 @@ struct SampleWrite {
     std::uint32_t x;
     std::uint32_t y;
     std::uint32_t sample;
+    std::array<float, 4> color = Written;
 };
 
 constexpr std::array<std::array<float, 4>, 3> Triangle{{
@@ -385,7 +426,7 @@ void StoreSamples(AgcDriver::VulkanDevice& device, const std::array<std::uint32_
         Buffer.fill(0u);
         for (std::uint32_t tid = 0; tid < Threads; ++tid) {
             const auto& write = writes[std::min(first + tid, writes.size() - 1)];
-            const std::array<std::uint32_t, 10> words{0u, 0u, 0u, write.x, write.y, write.sample, std::bit_cast<std::uint32_t>(Written[0]), std::bit_cast<std::uint32_t>(Written[1]), std::bit_cast<std::uint32_t>(Written[2]), std::bit_cast<std::uint32_t>(Written[3])};
+            const std::array<std::uint32_t, 10> words{0u, 0u, 0u, write.x, write.y, write.sample, std::bit_cast<std::uint32_t>(write.color[0]), std::bit_cast<std::uint32_t>(write.color[1]), std::bit_cast<std::uint32_t>(write.color[2]), std::bit_cast<std::uint32_t>(write.color[3])};
             std::copy(words.begin(), words.end(), &Buffer[tid * Words]);
         }
         device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(StoreCode.data()));
@@ -495,6 +536,87 @@ void CheckFirstSampleReads(AgcDriver::VulkanDevice& device, const std::array<std
         }
     }
     Require(!distinct || differs, "no pixel's sample 0 differs from its other samples " + what);
+}
+
+void CheckTwoSampleOffsetAndGradientReads(AgcDriver::VulkanDevice& device) {
+    Block block(BlockBytes);
+    const auto texture = TargetDescriptor(block, TwoSampleShift, Format32Float, TileZ64KBX);
+    std::vector<SampleWrite> writes;
+    for (std::uint32_t index = 0; index < Side * Side * TwoSamples; ++index) writes.push_back({index / TwoSamples % Side, index / TwoSamples / Side, index % TwoSamples, {static_cast<float>(index + 1u), 0.0f, 0.0f, 1.0f}});
+    StoreSamples(device, texture, writes);
+    const auto samples = LoadSamples(device, texture, TwoSamples);
+    for (std::uint32_t index = 0; index < samples.size(); ++index) {
+        char where[128];
+        std::snprintf(where, sizeof(where), "sample %u of pixel (%u, %u) of the 2x 32_FLOAT surface loads %g, not the stored %u", index % TwoSamples, index / TwoSamples % Side, index / TwoSamples / Side, samples[index][0], index + 1u);
+        Require(samples[index][0] == static_cast<float>(index + 1u), where);
+    }
+    const auto sampleZero = [&](std::uint32_t x, std::uint32_t y) { return std::bit_cast<std::array<std::uint32_t, 4>>(samples[(y * Side + x) * TwoSamples]); };
+    const auto wrapped = [](std::uint32_t coordinate, std::int32_t offset) { return static_cast<std::uint32_t>(static_cast<std::int32_t>(coordinate + Side) + offset) % Side; };
+    const auto check = [](const std::array<std::uint32_t, 4>& texel, const std::array<std::uint32_t, 4>& expected, const char* read, std::uint32_t pixel) {
+        char where[256];
+        std::snprintf(where, sizeof(where), "%s of pixel (%u, %u) of a 2x 32_FLOAT surface read %08x %08x %08x %08x, not sample 0 of the expected texel %08x %08x %08x %08x", read, pixel % Side, pixel / Side, texel[0], texel[1], texel[2], texel[3], expected[0], expected[1], expected[2], expected[3]);
+        Require(texel == expected, where);
+    };
+    for (const auto& [code, offsets] : {std::pair<std::span<const std::uint32_t>, TexelOffsets>{NearOffsetCode, NearOffsets}, std::pair<std::span<const std::uint32_t>, TexelOffsets>{FarOffsetCode, FarOffsets}}) {
+        std::vector<std::uint32_t> userData;
+        const auto program = CompileProgram(device, code, texture, userData, PointMipSampler);
+        for (std::uint32_t first = 0; first < Side * Side; first += Threads) {
+            Buffer.fill(0xdeadbeefu);
+            for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+                const auto pixel = first + tid;
+                Buffer[tid * Words] = std::bit_cast<std::uint32_t>((pixel % Side + 0.5f) / Side);
+                Buffer[tid * Words + 1u] = std::bit_cast<std::uint32_t>((pixel / Side + 0.5f) / Side);
+            }
+            device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+            device.WaitIdle();
+            for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+                const auto pixel = first + tid;
+                for (std::uint32_t read = 0; read < OffsetReads; ++read) {
+                    std::array<std::uint32_t, 4> texel{};
+                    std::copy_n(&Buffer[tid * Words + LoadResult + read * 4u], texel.size(), texel.begin());
+                    char what[96];
+                    std::snprintf(what, sizeof(what), "a DIM 2D image_sample_lz_o at offset (%d, %d)", offsets[read][0], offsets[read][1]);
+                    check(texel, sampleZero(wrapped(pixel % Side, offsets[read][0]), wrapped(pixel / Side, offsets[read][1])), what, pixel);
+                }
+            }
+        }
+    }
+    std::vector<std::uint32_t> userData;
+    const auto program = CompileProgram(device, GradientCode, texture, userData, PointMipSampler);
+    for (const auto& [gradientX, gradientY] : std::array<std::array<float, 2>, 4>{{{0.0f, 0.0f}, {2.0f, 2.0f}, {16.0f, 16.0f}, {4.0f, 1.0f}}}) {
+        for (std::uint32_t first = 0; first < Side * Side; first += Threads) {
+            Buffer.fill(0xdeadbeefu);
+            for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+                const auto pixel = first + tid;
+                const std::array<std::uint32_t, 6> words{std::bit_cast<std::uint32_t>(gradientX / Side), 0u, 0u, std::bit_cast<std::uint32_t>(gradientY / Side), std::bit_cast<std::uint32_t>((pixel % Side + 0.5f) / Side), std::bit_cast<std::uint32_t>((pixel / Side + 0.5f) / Side)};
+                std::copy(words.begin(), words.end(), &Buffer[tid * Words]);
+            }
+            device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(GradientCode.data()));
+            device.WaitIdle();
+            for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+                const auto pixel = first + tid;
+                std::array<std::uint32_t, 4> texel{};
+                std::copy_n(&Buffer[tid * Words + LoadResult], texel.size(), texel.begin());
+                char what[96];
+                std::snprintf(what, sizeof(what), "a DIM 2D image_sample_d at gradients of %g and %g texels per pixel", gradientX, gradientY);
+                check(texel, sampleZero(pixel % Side, pixel / Side), what, pixel);
+            }
+        }
+    }
+}
+
+void RequireReadRefused(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::array<std::uint32_t, 8>& texture, const std::string& what) {
+    std::string refusal;
+    try {
+        std::vector<std::uint32_t> userData;
+        const auto program = CompileProgram(device, code, texture, userData, PointMipSampler);
+        Buffer.fill(0u);
+        device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+        device.WaitIdle();
+    } catch (const std::exception& error) {
+        refusal = error.what();
+    }
+    Require(refusal.find("incompatible with the static runtime image interface") != std::string::npos, what + " was not refused: " + refusal);
 }
 
 std::array<std::uint32_t, 8> CompressedDescriptor(const Block& block, std::uint32_t tileMode, std::uint64_t htile) {
@@ -982,6 +1104,9 @@ int main(int argc, char** argv) {
         CheckSamples(state, aliasedSamples, {});
         CheckFirstSampleReads(*device, TargetDescriptor(aliased, SampleShift), aliasedSamples, true, "from a 4x RGBA16F target drawn after a BGRA8 target at the same address");
         std::puts("DIM 2D image_load, image_sample_lz and image_sample_l reads of a 4x color target return each pixel's sample 0");
+        RequireReadRefused(*device, NearOffsetCode, TargetDescriptor(block, SampleShift), "a DIM 2D image_sample_lz_o read of a 4x color target");
+        RequireReadRefused(*device, GradientCode, TargetDescriptor(block, SampleShift), "a DIM 2D image_sample_d read of a 4x color target");
+        std::puts("DIM 2D image_sample_lz_o and image_sample_d reads of a 4x color target are refused");
         Block swapped(4u * BlockBytes);
         Draw(*device, TargetState(DecodeSwappedTarget(swapped)), 0, 2u, Unorm8PixelCode);
         const auto swappedSamples = LoadSamples(*device, swapped, Format8888Unorm);
@@ -1002,7 +1127,7 @@ int main(int argc, char** argv) {
             std::puts("DIM 2D reads of a drawn 4x 8_8_8_8_UINT target and of 8_8_8_8_SINT color memory no draw rendered to return each pixel's sample 0 bit for bit");
         }
         if (!AgcDriver::VulkanDeviceTestAccess::ContextOf(*device).storageImageMultisample) {
-            std::puts("multisampled target fills, stores and swizzle modes not tested: storage image multisampling unavailable");
+            std::puts("multisampled target fills, stores, swizzle modes and 2x image_sample_lz_o and image_sample_d reads not tested: storage image multisampling unavailable");
             return VulkanTestSkipped;
         }
         const auto colorBytes = AgcDriver::Graphics::MultisampledColorBytes(color);
@@ -1036,6 +1161,13 @@ int main(int argc, char** argv) {
         std::memcpy(mixedStore.data + colorBytes - sizeof(odd), &odd, sizeof(odd));
         RequireStoreRefused(*device, TargetDescriptor(mixedStore, SampleShift), "writing the 16x16 multisampled texture", "storing to a multisampled texture no draw rendered to whose color memory is not uniform");
         std::puts("stores to one sample of each pixel of a drawn 4x target and to samples of zeroed color memory no draw rendered to reach exactly those samples, and a store to non-uniform color memory no draw rendered to is refused");
+        const auto limits = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device).limits;
+        if ((limits.framebufferColorSampleCounts & limits.sampledImageColorSampleCounts & limits.storageImageSampleCounts & VK_SAMPLE_COUNT_2_BIT) == 0) {
+            std::puts("DIM 2D image_sample_lz_o and image_sample_d reads of a 2x target not tested: the device lacks 2-sample color, sampled or storage images");
+        } else {
+            CheckTwoSampleOffsetAndGradientReads(*device);
+            std::puts("DIM 2D image_sample_lz_o reads at texel offsets from -8 to 7 and image_sample_d reads at gradients of 0 to 16 texels per pixel of a 2x 32_FLOAT surface return sample 0 of the offset texel, wrapped, at level 0");
+        }
         for (const auto mode : {TileZ64KBX, TileD64KBX}) {
             Block swizzled(BlockBytes);
             StoreWords(swizzled, colorBytes, FillOnes);

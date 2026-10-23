@@ -91,6 +91,7 @@ struct ImageResource {
     bool constantSwizzle = false;
     bool constantSwizzleCompatible = true;
     bool cubeFaceCompatible = true;
+    bool twoSamplePlaneCompatible = true;
     bool flatVolumeCompatible = true;
     bool singleMipPlaneBiasCompatible = false;
     bool volumeArraySampleCompatible = false;

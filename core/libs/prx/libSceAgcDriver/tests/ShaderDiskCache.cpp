@@ -317,6 +317,7 @@ CompiledVariant sampleVariant() {
     image.constantSwizzle = true;
     image.constantSwizzleCompatible = false;
     image.cubeFaceCompatible = false;
+    image.twoSamplePlaneCompatible = false;
     image.flatVolumeCompatible = false;
     image.singleMipPlaneBiasCompatible = true;
     image.volumeArraySampleCompatible = true;

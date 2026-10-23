@@ -7565,6 +7565,7 @@ void verifyMultisamplePlaneReadMode() {
     };
     auto other = image;
     other.cubeFaceCompatible = false;
+    other.twoSamplePlaneCompatible = false;
     refused(other, "a 2D read of a 2D MSAA T# through a mip, gather, bias, gradient or offset access was accepted");
     other = image;
     other.depthCompare = true;
@@ -7573,6 +7574,26 @@ void verifyMultisamplePlaneReadMode() {
     other.resourceClass = ImageResourceClass::Storage;
     other.written = true;
     refused(other, "a 2D storage access to a 2D MSAA T# was accepted");
+    const DescriptorValue twoSamples{{0x02754d00u, 0xc1600000u, 0x00cbc167u, 0xe1810facu, 0u, 0x00700010u, 0u, 0u}, 8u};
+    auto offsetOrGradient = image;
+    offsetOrGradient.cubeFaceCompatible = false;
+    const auto planeModes = ResourceMaterializer::RuntimeImageModes(offsetOrGradient);
+    const auto& plane = planeModes[ResourceMaterializer::RuntimeImageMode(offsetOrGradient, twoSamples, planeModes)];
+    require(plane.dimension == RdnaImageDimension::Dim2D && !plane.cube && plane.numericClass == IrTextureNumericClass::Float, "a 2D image_sample_lz_o or image_sample_d read of a 2-sample 32_FLOAT 2D MSAA T# did not select a 2D runtime mode");
+    const auto refusedAt = [&](const ImageResource& access, const DescriptorValue& words, const char* what) {
+        expectFailure([&] { static_cast<void>(ResourceMaterializer::RuntimeImageMode(access, words, ResourceMaterializer::RuntimeImageModes(access))); }, "incompatible with the static runtime image interface", what);
+    };
+    refusedAt(offsetOrGradient, DescriptorValue{{0x02754d00u, 0xc1600000u, 0x00cbc167u, 0xe1820facu, 0u, 0x00700020u, 0u, 0u}, 8u}, "a 2D image_sample_lz_o or image_sample_d read of a 4-sample 2D MSAA T# was accepted");
+    refusedAt(offsetOrGradient, DescriptorValue{{0x02754d00u, 0xc1600000u, 0x00cbc167u, 0xe1830facu, 0u, 0x00700030u, 0u, 0u}, 8u}, "a 2D image_sample_lz_o or image_sample_d read of an 8-sample 2D MSAA T# was accepted");
+    other = offsetOrGradient;
+    other.twoSamplePlaneCompatible = false;
+    refusedAt(other, twoSamples, "a 2D read of a 2-sample 2D MSAA T# through an offset or gradient access other than image_sample_lz_o and a 2D image_sample_d was accepted");
+    other = offsetOrGradient;
+    other.table = 0u;
+    refusedAt(other, twoSamples, "an image table element read of a 2-sample 2D MSAA T# through image_sample_lz_o or image_sample_d was accepted");
+    other = offsetOrGradient;
+    other.dimension = RdnaImageDimension::Dim3D;
+    refusedAt(other, twoSamples, "a DIM 3D read of a 2-sample 2D MSAA T# was accepted");
 }
 
 void verifyVolumeBiasTableRejection() {
