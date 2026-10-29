@@ -869,6 +869,13 @@ constexpr unsigned ImportHashThreads = 4;
 
 enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow, Fresh };
 
+thread_local std::uint64_t storeSerial = 0;
+std::atomic<DriverStoreObserver> driverStoreObserver{nullptr};
+
+void reportDriverStore(std::uint64_t begin, std::uint64_t end) {
+    if (const auto observer = driverStoreObserver.load(std::memory_order_acquire)) observer(begin, end, storeSerial);
+}
+
 std::uint64_t HashPage(const std::byte* page) {
     constexpr std::uint64_t prime1 = 0x9E3779B185EBCA87ull;
     constexpr std::uint64_t prime2 = 0xC2B2AE3D27D4EB4Full;
@@ -1144,6 +1151,7 @@ struct WriteTracker {
         const auto begin = blockBegin(block);
         const auto from = static_cast<std::uint32_t>(std::max(address, begin) - begin);
         const auto to = static_cast<std::uint32_t>(std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin);
+        reportDriverStore(begin + from, begin + to);
         if (from == 0 && to == WriteBlockBytes) {
             auto& entry = driverPieces[block];
             if (complete) {
@@ -1203,6 +1211,7 @@ struct WriteTracker {
     std::vector<std::uint32_t> unstampedStores;
 
     void noteUnstampedStore(std::uint64_t address, std::uint64_t end) {
+        reportDriverStore(address, end);
         if (unstampedStores.empty()) unstampedStores.assign(UnstampedSlots, 0);
         const auto first = address / WriteBlockBytes;
         const auto last = (end - 1) / WriteBlockBytes;
@@ -1650,6 +1659,22 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 
 std::uint64_t WriteGeneration() {
     return Tracker().generation.load(std::memory_order_acquire);
+}
+
+std::uint64_t CurrentStoreSerial() {
+    return storeSerial;
+}
+
+StoreSerialScope::StoreSerialScope(std::uint64_t serial) : previous(storeSerial) {
+    storeSerial = serial;
+}
+
+StoreSerialScope::~StoreSerialScope() {
+    storeSerial = previous;
+}
+
+void SetDriverStoreObserver(DriverStoreObserver observer) {
+    driverStoreObserver.store(observer, std::memory_order_release);
 }
 
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written) {

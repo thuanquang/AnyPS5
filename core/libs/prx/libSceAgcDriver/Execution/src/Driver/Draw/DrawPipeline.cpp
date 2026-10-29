@@ -177,6 +177,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     idle.wait(lock, [&] { return jobs.size() < depth; });
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
+    storeSerials.push_back(GuestMemory::CurrentStoreSerial());
     outstanding.fetch_add(1, std::memory_order_release);
     if (!running) {
         running = true;
@@ -193,6 +194,7 @@ void DrawFinisher::run() {
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
+        std::uint64_t storing = 0;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -200,10 +202,12 @@ void DrawFinisher::run() {
             wake.wait(lock, [&] { return !jobs.empty(); });
             sleeping = false;
             job = &jobs.front();
+            storing = storeSerials.front();
             failed = failure != nullptr;
         }
         std::exception_ptr error;
         try {
+            const GuestMemory::StoreSerialScope stores(storing);
             if (!failed) (*job)();
         } catch (...) {
             error = std::current_exception();
@@ -213,6 +217,7 @@ void DrawFinisher::run() {
         ran.push_back(std::move(jobs.front()));
         jobs.pop_front();
         pending.pop_front();
+        storeSerials.pop_front();
         outstanding.fetch_sub(1, std::memory_order_release);
         idle.notify_all();
     }
@@ -320,7 +325,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     ++enqueued;
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
     countWrites(writes, true);
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, GuestMemory::CurrentStoreSerial()});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] {
@@ -378,6 +383,7 @@ void DrawPipeline::run() {
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
+        std::uint64_t storing = 0;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -387,12 +393,14 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            storing = items.front().storeSerial;
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
         try {
+            const GuestMemory::StoreSerialScope stores(storing);
             if (commit != nullptr) (*commit)();
             if (!isDraw) GuestMemory::BreakProofs();
         } catch (const std::exception&) {
