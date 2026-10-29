@@ -2977,7 +2977,14 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
 
 void Recorder::OnComplete(std::function<void()> action) {
     ensureOpen();
-    open->completions.push_back(std::move(action));
+    if (const auto serial = GuestMemory::CurrentStoreSerial(); serial != 0) {
+        open->completions.push_back([action = std::move(action), serial] {
+            const GuestMemory::StoreSerialScope stores(serial);
+            action();
+        });
+    } else {
+        open->completions.push_back(std::move(action));
+    }
     ++open->writeBackCompletionCount;
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -4228,6 +4235,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             InCompletion() { ++completionDepth; }
             ~InCompletion() { --completionDepth; }
         } inCompletion;
+        const GuestMemory::StoreSerialScope unattributed(0);
         for (auto& action : batch->completions) {
             try {
                 action();
