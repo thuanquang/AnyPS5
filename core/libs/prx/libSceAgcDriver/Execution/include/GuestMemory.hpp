@@ -98,6 +98,7 @@ private:
 };
 using DriverStoreObserver = void (*)(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
 void SetDriverStoreObserver(DriverStoreObserver observer);
+bool DriverStoreObserved();
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written);
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):

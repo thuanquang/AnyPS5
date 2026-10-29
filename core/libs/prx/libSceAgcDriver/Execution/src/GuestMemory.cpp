@@ -1677,6 +1677,10 @@ void SetDriverStoreObserver(DriverStoreObserver observer) {
     driverStoreObserver.store(observer, std::memory_order_release);
 }
 
+bool DriverStoreObserved() {
+    return driverStoreObserver.load(std::memory_order_acquire) != nullptr;
+}
+
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written) {
     written.clear();
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;

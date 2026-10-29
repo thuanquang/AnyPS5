@@ -2977,7 +2977,7 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
 
 void Recorder::OnComplete(std::function<void()> action) {
     ensureOpen();
-    if (const auto serial = GuestMemory::CurrentStoreSerial(); serial != 0) {
+    if (const auto serial = GuestMemory::CurrentStoreSerial(); serial != 0 && GuestMemory::DriverStoreObserved()) {
         open->completions.push_back([action = std::move(action), serial] {
             const GuestMemory::StoreSerialScope stores(serial);
             action();
@@ -3543,7 +3543,8 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         std::lock_guard ringLock(writtenBackMutex);
         return writtenBackSequence;
     }();
-    batch.completions.push_back([this, address, copy = std::move(copy), sequence, storedOnGpu] {
+    batch.completions.push_back([this, address, copy = std::move(copy), sequence, storedOnGpu, serial = GuestMemory::CurrentStoreSerial()] {
+        const GuestMemory::StoreSerialScope stores(serial);
         if (storedOnGpu && !always && !writtenBackSince(sequence, address, address + copy.size())) {
             completionStoresSkipped.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -3579,7 +3580,14 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
 bool Recorder::AfterRecordedWork(std::function<void()> action) {
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
-    batch.completions.push_back(std::move(action));
+    if (const auto serial = GuestMemory::CurrentStoreSerial(); serial != 0 && GuestMemory::DriverStoreObserved()) {
+        batch.completions.push_back([action = std::move(action), serial] {
+            const GuestMemory::StoreSerialScope stores(serial);
+            action();
+        });
+    } else {
+        batch.completions.push_back(std::move(action));
+    }
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
         GuestMemory::BreakProofs();
