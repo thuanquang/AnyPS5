@@ -5912,7 +5912,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
 }
 
 void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
-    const GuestMemory::StoreSerialScope stores(writerPending && !writerUnknown ? writerSerial : 0);
+    const GuestMemory::StoreSerialScope storing(writerPending && !writerUnknown ? writerSerial : 0);
     // Block units are stored per access; an image whose units keep being asked for in pieces (a
     // consumer touching it through many small ranges, each piece re-arming the pending memos of
     // the next dispatch) stores every pending unit once more than `pieces` partial stores fall
@@ -5969,7 +5969,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
-    const GuestMemory::StoreSerialScope stores(writerPending && !writerUnknown ? writerSerial : 0);
+    const GuestMemory::StoreSerialScope storing(writerPending && !writerUnknown ? writerSerial : 0);
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;

@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -158,6 +159,7 @@ private:
     std::uint64_t unattributedStores = 0;
     std::uint64_t inFlightDeltas = 0;
     std::uint64_t heldDeltas = 0;
+    std::set<std::uint64_t> callThreads;
     static std::atomic<FrameRecorder*> observing;
     std::vector<std::string> warnings;
     std::chrono::steady_clock::time_point origin;

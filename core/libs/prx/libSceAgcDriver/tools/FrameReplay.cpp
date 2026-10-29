@@ -276,7 +276,7 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     std::size_t size = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
     if (!reader.Header().empty() && headerNumber(reader.Header(), "arena_base") != base) throw std::runtime_error("frame replay: the guest arena is at a different address than in the capture");
-    if (reader.Version() >= 2 && !reader.Header().empty() && headerNumber(reader.Header(), "stale_delta") != 0) throw std::runtime_error("frame replay: the capture stopped because a memory delta was read while submissions that stored into it were in flight (stale_delta " + std::to_string(headerNumber(reader.Header(), "stale_delta")) + ")");
+    if (reader.Version() >= 2 && reader.Header().find("\"stale_delta\":") != std::string::npos && headerNumber(reader.Header(), "stale_delta") != 0) throw std::runtime_error("frame replay: the capture stopped because a memory delta was read while submissions that stored into it were in flight (stale_delta " + std::to_string(headerNumber(reader.Header(), "stale_delta")) + ")");
     progress();
     Skipped skipped;
     mapHostRanges(reader, skipped);

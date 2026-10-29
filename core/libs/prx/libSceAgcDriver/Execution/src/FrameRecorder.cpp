@@ -178,6 +178,9 @@ void FrameRecorder::noteDriverStore(std::uint64_t begin, std::uint64_t end, std:
 }
 
 bool FrameRecorder::needsHold(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks) {
+    for (const auto& wait : DriverDetail::Driver::Get().AwaitedWaits()) {
+        if (wait.address != 0) return true;
+    }
     {
         std::lock_guard lock(storeMutex);
         for (const auto& [begin, end] : blocks) {
@@ -294,6 +297,7 @@ void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
         return;
     }
     if (state != State::Recording || stopOnHazard()) return;
+    callThreads.insert(call.thread);
     const auto entry = DriverDetail::Driver::Get().StartedProgress();
     {
         const struct Released {
@@ -362,6 +366,7 @@ void FrameRecorder::recordLocked(FrameCall call, bool prologueCall, std::span<co
         return;
     }
     if (state != State::Recording || stopOnHazard()) return;
+    callThreads.insert(call.thread);
     const auto entry = DriverDetail::Driver::Get().StartedProgress();
     const struct Released {
         Released() { DriverDetail::Driver::Get().HoldForRecorder(); }
@@ -513,7 +518,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     std::vector<std::uint64_t> started;
     bool inFlightRead = false;
     if (completed < accepted && (!added.empty() || !blocks.empty() || !hostPages.empty())) {
-        if (unwatched || !added.empty() || !hostPages.empty() || needsHold(blocks)) {
+        if (unwatched || !added.empty() || !hostPages.empty() || callThreads.size() > 1 || needsHold(blocks)) {
             driver.ReleaseForRecorder();
             if (!driver.WaitSettledFor(std::chrono::seconds(10))) {
                 stop("stopped: the GPU work submitted before a memory delta neither finished nor waited for the title within 10 s");
