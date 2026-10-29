@@ -333,6 +333,16 @@ StartedProgressSnapshot Driver::StartedProgress() {
     return {accepted, completed, std::vector<std::uint64_t>(startedAhead.begin(), startedAhead.end())};
 }
 
+bool Driver::UnfinishedLabelOverlaps(std::uint64_t begin, std::uint64_t end) {
+    std::lock_guard lock(mutex);
+    for (const auto& [id, worker] : workers) {
+        for (const auto& [dword, count] : worker.unfinishedWrites) {
+            if (count != 0 && dword < end && dword + 4 > begin) return true;
+        }
+    }
+    return false;
+}
+
 void Driver::CheckFailure() {
     if (failed.load(std::memory_order_acquire)) {
         std::lock_guard lock(mutex);
