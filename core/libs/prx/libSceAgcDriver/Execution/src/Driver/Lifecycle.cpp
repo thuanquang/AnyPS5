@@ -333,6 +333,24 @@ StartedProgressSnapshot Driver::StartedProgress() {
     return {accepted, completed, std::vector<std::uint64_t>(startedAhead.begin(), startedAhead.end())};
 }
 
+void Driver::HoldForRecorder() {
+    recorderHold.store(true, std::memory_order_release);
+}
+
+void Driver::ReleaseForRecorder() {
+    {
+        std::lock_guard lock(mutex);
+        recorderHold.store(false, std::memory_order_release);
+    }
+    changed.notify_all();
+}
+
+void Driver::ParkForRecorder() {
+    if (!recorderHold.load(std::memory_order_acquire)) return;
+    std::unique_lock lock(mutex);
+    changed.wait(lock, [&] { return !recorderHold.load(std::memory_order_acquire) || stopping.load(std::memory_order_acquire) || failure != nullptr; });
+}
+
 bool Driver::SerialDone(std::uint64_t serial) {
     std::lock_guard lock(mutex);
     return serial <= completed || completedOutOfOrder.contains(serial);

@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -188,7 +190,7 @@ bool FrameRecorder::needsHold(std::span<const std::pair<std::uint64_t, std::uint
     for (const auto& [begin, end] : blocks) {
         if (driver.UnfinishedLabelOverlaps(begin, end) || Graphics::Recorder::SnapshotWriteOverlaps(begin, static_cast<std::size_t>(end - begin))) return true;
     }
-    return DriverDetail::DrawPipeline::Queue0().OverlapsAny(blocks);
+    return Graphics::StorageTexture::AnyPendingOverlaps(blocks) || Graphics::AnyShadowedOverlaps(blocks) || DriverDetail::DrawPipeline::Queue0().OverlapsAny(blocks);
 }
 
 void FrameRecorder::arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted) {
@@ -293,7 +295,13 @@ void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
     }
     if (state != State::Recording || stopOnHazard()) return;
     const auto entry = DriverDetail::Driver::Get().StartedProgress();
-    emitDelta();
+    {
+        const struct Released {
+            Released() { DriverDetail::Driver::Get().HoldForRecorder(); }
+            ~Released() { DriverDetail::Driver::Get().ReleaseForRecorder(); }
+        } released;
+        emitDelta();
+    }
     if (state != State::Recording) return;
     call.ordinal = ++ordinal;
     call.accepted = entry.accepted;
@@ -355,6 +363,10 @@ void FrameRecorder::recordLocked(FrameCall call, bool prologueCall, std::span<co
     }
     if (state != State::Recording || stopOnHazard()) return;
     const auto entry = DriverDetail::Driver::Get().StartedProgress();
+    const struct Released {
+        Released() { DriverDetail::Driver::Get().HoldForRecorder(); }
+        ~Released() { DriverDetail::Driver::Get().ReleaseForRecorder(); }
+    } released;
     if (prologueCall) emitShaderDelta(shaders);
     else emitDelta();
     if (state != State::Recording) return;
@@ -502,6 +514,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     bool inFlightRead = false;
     if (completed < accepted && (!added.empty() || !blocks.empty() || !hostPages.empty())) {
         if (unwatched || !added.empty() || !hostPages.empty() || needsHold(blocks)) {
+            driver.ReleaseForRecorder();
             if (!driver.WaitSettledFor(std::chrono::seconds(10))) {
                 stop("stopped: the GPU work submitted before a memory delta neither finished nor waited for the title within 10 s");
                 return;

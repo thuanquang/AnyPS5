@@ -78,6 +78,9 @@ public:
     StartedProgressSnapshot StartedProgress();
     bool UnfinishedLabelOverlaps(std::uint64_t begin, std::uint64_t end);
     bool SerialDone(std::uint64_t serial);
+    void HoldForRecorder();
+    void ReleaseForRecorder();
+    void ParkForRecorder();
     std::uint64_t FlipSubmissions() const;
     std::vector<AwaitedWait> AwaitedWaits();
     void WaitForPipelineJournal();
@@ -480,6 +483,7 @@ private:
 
     std::atomic<bool> failed{false};
     std::atomic<bool> stopping{false};
+    std::atomic<bool> recorderHold{false};
     bool stopped = false;
     bool resetGraphics = false;
 

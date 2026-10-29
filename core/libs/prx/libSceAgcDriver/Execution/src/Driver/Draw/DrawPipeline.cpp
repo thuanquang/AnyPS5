@@ -192,6 +192,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
     for (;;) {
+        Driver::Get().ParkForRecorder();
         Job* job = nullptr;
         bool failed = false;
         std::uint64_t storing = 0;
@@ -381,6 +382,7 @@ void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
     for (;;) {
+        Driver::Get().ParkForRecorder();
         Commit* commit = nullptr;
         bool isDraw = false;
         std::uint64_t storing = 0;
