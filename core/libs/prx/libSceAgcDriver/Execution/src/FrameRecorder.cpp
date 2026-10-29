@@ -230,10 +230,12 @@ void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
         return;
     }
     if (state != State::Recording) return;
+    const auto entry = DriverDetail::Driver::Get().StartedProgress();
     emitDelta();
     if (state != State::Recording) return;
     call.ordinal = ++ordinal;
-    std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
+    call.accepted = entry.accepted;
+    call.completed = entry.completed;
     writer->WriteCall(call);
     ++recordedCalls;
 }
@@ -290,11 +292,13 @@ void FrameRecorder::recordLocked(FrameCall call, bool prologueCall, std::span<co
         return;
     }
     if (state != State::Recording) return;
+    const auto entry = DriverDetail::Driver::Get().StartedProgress();
     if (prologueCall) emitShaderDelta(shaders);
     else emitDelta();
     if (state != State::Recording) return;
     call.ordinal = ++ordinal;
-    std::tie(call.accepted, call.completed) = DriverDetail::Driver::Get().SerialProgress();
+    call.accepted = entry.accepted;
+    call.completed = entry.completed;
     writer->WriteCall(call);
     ++recordedCalls;
 }
