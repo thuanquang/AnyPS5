@@ -276,6 +276,7 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     std::size_t size = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
     if (!reader.Header().empty() && headerNumber(reader.Header(), "arena_base") != base) throw std::runtime_error("frame replay: the guest arena is at a different address than in the capture");
+    if (reader.Version() >= 2 && !reader.Header().empty() && headerNumber(reader.Header(), "stale_delta") != 0) throw std::runtime_error("frame replay: the capture stopped because a memory delta was read while submissions that stored into it were in flight (stale_delta " + std::to_string(headerNumber(reader.Header(), "stale_delta")) + ")");
     progress();
     Skipped skipped;
     mapHostRanges(reader, skipped);
@@ -484,6 +485,13 @@ struct Replay {
             const std::unique_lock lock(memoryMutex);
             const auto began = Clock::now();
             const bool pacing = options.pace && recording;
+            if (pacing && reader.Version() >= 2 && (call.flags & AgcDriver::InFlightDeltaFlag) != 0) {
+                if (threads > 1) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " was read with submissions in flight, which this replay orders only for a capture from one thread");
+                waitStarted(call);
+                paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+                restoreGroup(call.values.at(0));
+                return;
+            }
             const bool settled = !pacing || AgcDriverHoldSettled_nid_postfix(stalled.load() && progress().second == stalledAt.load() ? 0 : options.busyTimeout.count());
             const SettledHold hold{pacing};
             paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
@@ -497,6 +505,18 @@ struct Replay {
             return;
         }
         throw std::runtime_error("frame replay: unknown call kind");
+    }
+
+    void waitStarted(const FrameCall& call) {
+        const auto accepted = progress().first;
+        const auto limit = Clock::now() + options.busyTimeout;
+        for (std::size_t index = 1; index < call.values.size(); ++index) {
+            const auto serial = accepted - (call.accepted - call.values[index]);
+            while (!AgcDriverSerialDone_nid_postfix(serial)) {
+                if (Clock::now() >= limit) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waited longer than the busy timeout for submission " + std::to_string(serial) + ", which had started when the delta was read");
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
     }
 
     static bool rewindWait(const AgcDriver::AwaitedWait& wait) {

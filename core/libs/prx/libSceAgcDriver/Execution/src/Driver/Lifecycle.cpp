@@ -333,6 +333,11 @@ StartedProgressSnapshot Driver::StartedProgress() {
     return {accepted, completed, std::vector<std::uint64_t>(startedAhead.begin(), startedAhead.end())};
 }
 
+bool Driver::SerialDone(std::uint64_t serial) {
+    std::lock_guard lock(mutex);
+    return serial <= completed || completedOutOfOrder.contains(serial);
+}
+
 bool Driver::UnfinishedLabelOverlaps(std::uint64_t begin, std::uint64_t end) {
     std::lock_guard lock(mutex);
     for (const auto& [id, worker] : workers) {

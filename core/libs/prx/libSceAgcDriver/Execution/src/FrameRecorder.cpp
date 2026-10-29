@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -150,7 +152,67 @@ FrameRecorder* FrameRecorder::Active() {
 }
 
 FrameRecorder::FrameRecorder(std::filesystem::path directory, std::filesystem::path trigger, std::uint64_t atBoundary, std::uint64_t frames)
-    : directory(std::move(directory)), trigger(std::move(trigger)), atBoundary(atBoundary), frames(frames), origin(std::chrono::steady_clock::now()) {}
+    : directory(std::move(directory)), trigger(std::move(trigger)), atBoundary(atBoundary), frames(frames), origin(std::chrono::steady_clock::now()) {
+    observing.store(this, std::memory_order_release);
+    GuestMemory::SetDriverStoreObserver(&FrameRecorder::observeDriverStore);
+}
+
+std::atomic<FrameRecorder*> FrameRecorder::observing{nullptr};
+
+void FrameRecorder::observeDriverStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial) {
+    if (auto* const recorder = observing.load(std::memory_order_acquire)) recorder->noteDriverStore(begin, end, serial);
+}
+
+void FrameRecorder::noteDriverStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial) {
+    if (end <= begin) return;
+    std::lock_guard lock(storeMutex);
+    if (serial == 0) ++unattributedStores;
+    for (auto page = begin & ~std::uint64_t{HostPageBytes - 1}; page < end; page += HostPageBytes) {
+        driverPages.insert(page);
+        if (storeHazard.group != 0 || serial == GuestMemory::TitleCallStoreSerial) continue;
+        const auto found = storeOwners.find(page);
+        if (found != storeOwners.end() && (serial == 0 || serial <= found->second.accepted)) storeHazard = {found->second.group, page, serial};
+    }
+}
+
+bool FrameRecorder::needsHold(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks) {
+    {
+        std::lock_guard lock(storeMutex);
+        for (const auto& [begin, end] : blocks) {
+            for (auto page = begin & ~std::uint64_t{HostPageBytes - 1}; page < end; page += HostPageBytes) {
+                if (driverPages.contains(page)) return true;
+            }
+        }
+    }
+    auto& driver = DriverDetail::Driver::Get();
+    for (const auto& [begin, end] : blocks) {
+        if (driver.UnfinishedLabelOverlaps(begin, end) || Graphics::Recorder::SnapshotWriteOverlaps(begin, static_cast<std::size_t>(end - begin))) return true;
+    }
+    return DriverDetail::DrawPipeline::Queue0().OverlapsAny(blocks);
+}
+
+void FrameRecorder::arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted) {
+    std::lock_guard lock(storeMutex);
+    for (const auto& [begin, end] : blocks) {
+        for (auto page = begin & ~std::uint64_t{HostPageBytes - 1}; page < end; page += HostPageBytes) storeOwners[page] = {group, accepted};
+    }
+}
+
+bool FrameRecorder::stopOnHazard() {
+    StoreHazard hazard;
+    {
+        std::lock_guard lock(storeMutex);
+        hazard = storeHazard;
+    }
+    if (hazard.group == 0) return false;
+    const auto reason = "stopped: memory delta " + std::to_string(hazard.group) + " was read while submission " + (hazard.serial == 0 ? std::string("(unknown)") : std::to_string(hazard.serial)) + ", in flight at its read, stored into its page 0x" + [&] {
+        char text[32];
+        std::snprintf(text, sizeof text, "%llx", static_cast<unsigned long long>(hazard.page));
+        return std::string(text);
+    }();
+    stop(reason.c_str());
+    return true;
+}
 
 FrameCall FrameRecorder::make(FrameCallKind kind) {
     FrameCall call;
@@ -229,7 +291,7 @@ void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
         if (reservations.size() > ReservationHistory) reservations.pop_front();
         return;
     }
-    if (state != State::Recording) return;
+    if (state != State::Recording || stopOnHazard()) return;
     const auto entry = DriverDetail::Driver::Get().StartedProgress();
     emitDelta();
     if (state != State::Recording) return;
@@ -291,7 +353,7 @@ void FrameRecorder::recordLocked(FrameCall call, bool prologueCall, std::span<co
         prologue.push_back(std::move(call));
         return;
     }
-    if (state != State::Recording) return;
+    if (state != State::Recording || stopOnHazard()) return;
     const auto entry = DriverDetail::Driver::Get().StartedProgress();
     if (prologueCall) emitShaderDelta(shaders);
     else emitDelta();
@@ -415,16 +477,12 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         DriverDetail::Driver& driver;
         ~Hold() { driver.ReleaseSettled(); }
     } hold{driver};
-    auto [accepted, completed] = driver.SerialProgress();
-    if (completed < accepted && (!added.empty() || !spans.empty() || !hostPages.empty())) {
-        if (!driver.WaitSettledFor(std::chrono::seconds(10))) {
-            stop("stopped: the GPU work submitted before a memory delta neither finished nor waited for the title within 10 s");
-            return;
-        }
-        std::tie(accepted, completed) = driver.SerialProgress();
-    }
+    const auto entry = driver.StartedProgress();
+    auto accepted = entry.accepted;
+    auto completed = entry.completed;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> blocks;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    bool unwatched = false;
     for (const auto& span : spans) {
         for (std::uint64_t offset = 0; offset < span.bytes;) {
             const auto at = span.address + offset;
@@ -434,11 +492,29 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
                 blocks.insert(blocks.end(), written.begin(), written.end());
             } else {
                 blocks.emplace_back(at, at + bytes);
+                unwatched = true;
             }
             offset += bytes;
         }
     }
     const auto group = deltaGroups + 1;
+    std::vector<std::uint64_t> started;
+    bool inFlightRead = false;
+    if (completed < accepted && (!added.empty() || !blocks.empty() || !hostPages.empty())) {
+        if (unwatched || !added.empty() || !hostPages.empty() || needsHold(blocks)) {
+            if (!driver.WaitSettledFor(std::chrono::seconds(10))) {
+                stop("stopped: the GPU work submitted before a memory delta neither finished nor waited for the title within 10 s");
+                return;
+            }
+            std::tie(accepted, completed) = driver.SerialProgress();
+            ++heldDeltas;
+        } else {
+            arm(blocks, group, accepted);
+            started = entry.started;
+            inFlightRead = true;
+            ++inFlightDeltas;
+        }
+    }
     bool any = false;
     std::vector<std::byte> bytes;
     std::vector<std::pair<std::size_t, std::size_t>> runs;
@@ -500,6 +576,8 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     call.accepted = accepted;
     call.completed = completed;
     call.values = {group};
+    call.values.insert(call.values.end(), started.begin(), started.end());
+    if (inFlightRead) call.flags = InFlightDeltaFlag;
     writer->WriteCall(call);
 }
 
@@ -689,6 +767,7 @@ void FrameRecorder::finish() {
     std::tie(end.accepted, end.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(end);
     writeReferenceFrames();
+    if (stopOnHazard()) return;
     writer->Finish(header());
     std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
                  static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(deltaGroups), static_cast<double>(deltaBytes) / (1024.0 * 1024.0),
@@ -702,7 +781,7 @@ std::string FrameRecorder::header() const {
     std::uintptr_t arenaBase = 0;
     std::size_t arenaBytes = 0;
     GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
-    std::string text = "{\"magic\":\"aps5-frame-capture 1\"";
+    std::string text = "{\"magic\":\"aps5-frame-capture 2\"";
     text += ",\"commit\":" + jsonString(APS5_TRACE_COMMIT);
     text += std::string(",\"dirty\":") + (APS5_TRACE_DIRTY < 0 ? "null" : APS5_TRACE_DIRTY != 0 ? "true" : "false");
     text += ",\"arena_base\":" + std::to_string(arenaBase) + ",\"arena_bytes\":" + std::to_string(arenaBytes);
@@ -714,6 +793,10 @@ std::string FrameRecorder::header() const {
     text += ",\"submit_depths\":[";
     for (std::size_t depth = 0; depth < submitDepths.size(); ++depth) text += (depth == 0 ? "" : ",") + std::to_string(submitDepths[depth]);
     text += "]";
+    {
+        std::lock_guard lock(storeMutex);
+        text += ",\"in_flight_deltas\":" + std::to_string(inFlightDeltas) + ",\"held_deltas\":" + std::to_string(heldDeltas) + ",\"stale_delta\":" + std::to_string(storeHazard.group) + ",\"unattributed_stores\":" + std::to_string(unattributedStores);
+    }
     text += ",\"env\":{";
     bool first = true;
     for (const auto& [name, value] : captureEnvironment()) {

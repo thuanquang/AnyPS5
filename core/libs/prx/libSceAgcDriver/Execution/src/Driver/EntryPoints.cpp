@@ -159,6 +159,10 @@ extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix() {
     AgcDriver::DriverDetail::Driver::Get().WaitForPipelineJournal();
 }
 
+extern "C" bool AgcDriverSerialDone_nid_postfix(std::uint64_t serial) {
+    return AgcDriver::DriverDetail::Driver::Get().SerialDone(serial);
+}
+
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed) {
     const auto [submitted, done] = AgcDriver::DriverDetail::Driver::Get().SerialProgress();
     *accepted = submitted;
