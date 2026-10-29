@@ -3852,6 +3852,11 @@ void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t la
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
+    if (const auto serial = GuestMemory::CurrentStoreSerial(); serial != GuestMemory::TitleCallStoreSerial) {
+        if (serial == 0) writerUnknown = true;
+        else writerSerial = writerPending ? std::min(writerSerial, serial) : serial;
+        writerPending = true;
+    }
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     std::vector<bool> unsaved;
     bool anyUnsaved = false;
@@ -5907,6 +5912,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
 }
 
 void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
+    const GuestMemory::StoreSerialScope stores(writerPending && !writerUnknown ? writerSerial : 0);
     // Block units are stored per access; an image whose units keep being asked for in pieces (a
     // consumer touching it through many small ranges, each piece re-arming the pending memos of
     // the next dispatch) stores every pending unit once more than `pieces` partial stores fall
@@ -5963,6 +5969,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    const GuestMemory::StoreSerialScope stores(writerPending && !writerUnknown ? writerSerial : 0);
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -5975,7 +5982,14 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // layers pending).
     struct Reconcile {
         StorageTexture& texture;
-        ~Reconcile() { texture.reconcilePending(); }
+        ~Reconcile() {
+            texture.reconcilePending();
+            if (std::find(texture.layerPending.begin(), texture.layerPending.end(), true) == texture.layerPending.end()) {
+                texture.writerPending = false;
+                texture.writerUnknown = false;
+                texture.writerSerial = 0;
+            }
+        }
     } reconcile{*this};
     const auto elementBytes = BytesPerElement(descriptor.format);
     // 64 KiB blocks the CPU wrote since the layer was last in sync keep the CPU's bytes: the game
