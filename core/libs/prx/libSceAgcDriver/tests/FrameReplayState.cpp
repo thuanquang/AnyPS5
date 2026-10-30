@@ -321,6 +321,56 @@ void testBlockingSubmission(const std::filesystem::path& directory) {
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
 }
 
+void testGateFailure(const std::filesystem::path& directory) {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* label = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* commands = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    *label = 0;
+    const std::array<std::uint32_t, 7> wait{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address(label)), static_cast<std::uint32_t>(address(label) >> 32u), 1u, 0xffffffffu, 4u};
+    std::copy(wait.begin(), wait.end(), commands);
+    const std::uint32_t stored = 7;
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(bytes + 8192), std::as_bytes(std::span(&stored, 1)));
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.busyTimeout = std::chrono::milliseconds(3000);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    AgcDriverSubmitGraphics_nid_postfix(commands, static_cast<std::uint32_t>(wait.size()));
+    const auto parked = [&] {
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        return std::any_of(awaited.begin(), awaited.begin() + static_cast<std::ptrdiff_t>(count), [&](const AgcDriver::AwaitedWait& slot) { return slot.address == address(label); });
+    };
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    while (!parked()) {
+        check(Clock::now() < deadline, "the submission did not wait on its unwritten label");
+        std::this_thread::yield();
+    }
+    const auto [accepted, completed] = progress();
+    AgcDriverReportFailure_nid_postfix(std::make_exception_ptr(std::runtime_error("gate driver failure")));
+    auto call = memoryCall(1, 1);
+    call.ordinal = 1;
+    call.flags = AgcDriver::InFlightDeltaFlag;
+    call.accepted = accepted;
+    call.completed = completed;
+    call.values = {1, accepted};
+    std::string failure;
+    try {
+        replay.runWindow(std::span(&call, 1));
+    } catch (const std::runtime_error& error) {
+        failure = error.what();
+    }
+    check(failure == "gate driver failure", "a driver failure during a flagged delta's gate did not end the replay with the driver's error");
+    bool rethrown = false;
+    try { AgcDriverShutdown_nid_postfix(); }
+    catch (const std::runtime_error& error) { rethrown = std::string_view(error.what()) == "gate driver failure"; }
+    check(rethrown, "the injected driver failure was not propagated at shutdown");
+}
+
 void testShaderCode(const std::filesystem::path& directory, bool host) {
     auto* bytes = allocate(1u << 20);
     auto* shader = reinterpret_cast<Shader*>(bytes);
@@ -492,10 +542,11 @@ int main(int argc, char** argv) {
         else if (mode == "tokens") testEopTokens();
         else if (mode == "reservations" || mode == "reservation_failure") testRepeatedReservations(directory, mode == "reservation_failure");
         else if (mode == "blocking") testBlockingSubmission(directory);
+        else if (mode == "gate_failure") testGateFailure(directory);
         else if (mode == "environment") testColdPipelines();
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else throw std::runtime_error("unknown test");
-        if (mode != "reservation_failure") AgcDriverShutdown_nid_postfix();
+        if (mode != "reservation_failure" && mode != "gate_failure") AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");
         return 0;
     } catch (const std::exception& error) {

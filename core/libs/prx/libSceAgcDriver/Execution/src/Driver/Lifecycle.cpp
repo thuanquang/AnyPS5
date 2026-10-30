@@ -355,6 +355,7 @@ void Driver::ParkForRecorder() {
 
 bool Driver::SerialDone(std::uint64_t serial) {
     std::lock_guard lock(mutex);
+    rethrowFailure();
     return serial <= completed || completedOutOfOrder.contains(serial);
 }
 
