@@ -112,12 +112,12 @@ private:
 
 class ReplayFlip final : public AgcDriver::IFlipRequest {
 public:
-    explicit ReplayFlip(Frames& frames) : frames(frames) {}
-    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override { frames.MarkReady(); }
-    void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
+    explicit ReplayFlip(std::shared_ptr<Frames> frames) : frames(std::move(frames)) {}
+    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override { frames->MarkReady(); }
+    void Fail(std::exception_ptr error) noexcept override { frames->Failed(error); }
 
 private:
-    Frames& frames;
+    std::shared_ptr<Frames> frames;
 };
 
 class ReplayRenderingWait final : public AgcDriver::IRenderingWait {
@@ -127,13 +127,13 @@ public:
 
 class ReplayOutput final : public AgcDriver::IVideoOutput {
 public:
-    explicit ReplayOutput(Frames& frames) : frames(frames) {}
+    explicit ReplayOutput(std::shared_ptr<Frames> frames) : frames(std::move(frames)) {}
     std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override { return std::make_shared<ReplayFlip>(frames); }
     std::shared_ptr<AgcDriver::IRenderingWait> CaptureRenderingWait(std::uint32_t) override { return std::make_shared<ReplayRenderingWait>(); }
-    void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
+    void Fail(std::exception_ptr error) noexcept override { frames->Failed(error); }
 
 private:
-    Frames& frames;
+    std::shared_ptr<Frames> frames;
 };
 
 std::uint64_t headerNumber(const std::string& header, std::string_view key) {
@@ -328,7 +328,7 @@ std::pair<std::uint64_t, std::uint64_t> progress() {
 struct Replay {
     const Options& options;
     const FrameCaptureReader& reader;
-    Frames frames;
+    std::shared_ptr<Frames> frames = std::make_shared<Frames>();
     std::map<std::uint32_t, std::shared_ptr<ReplayOutput>> outputs;
     std::mutex memoryMutex;
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
@@ -368,7 +368,7 @@ struct Replay {
     void report() const {
         const auto [accepted, completed] = progress();
         std::fprintf(stderr, "[frame-replay] %llu submits, %zu frames ready, %.1f s since the first frame, pacing waited %.1f s (%llu timeouts), serials %llu/%llu, blocked on%s\n",
-                     static_cast<unsigned long long>(submits.load()), frames.Times().size(), std::chrono::duration<double>(Clock::now() - startedAt).count(), paceWaitedSeconds(),
+                     static_cast<unsigned long long>(submits.load()), frames->Times().size(), std::chrono::duration<double>(Clock::now() - startedAt).count(), paceWaitedSeconds(),
                      static_cast<unsigned long long>(paceTimeouts.load()), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), describeBlocked().c_str());
     }
 
@@ -1166,14 +1166,14 @@ int run(const Options& options) {
                 if (call->kind == FrameCallKind::ReserveEopFlip) replay.execute(*call);
             }
         }
-        Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
+        Pass measured{replay.frames->Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
         replay.recording = true;
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
         replay.endedAt = Clock::now();
-        if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
-        measured.frames = replay.frames.Times().size() - measured.firstFrame;
+        if (const auto failure = replay.frames->Failure()) std::rethrow_exception(failure);
+        measured.frames = replay.frames->Times().size() - measured.firstFrame;
         measured.seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
         measured.paceTimeouts = replay.paceTimeouts.load() - measured.paceTimeouts;
         measured.synthesized = replay.syntheticReleases.load() - measured.synthesized;
@@ -1186,7 +1186,7 @@ int run(const Options& options) {
     } else if (!options.dumps.empty()) {
         std::fprintf(stderr, "[frame-replay] no dumps written: the GPU work did not finish\n");
     }
-    const auto ready = replay.frames.Times();
+    const auto ready = replay.frames->Times();
     const std::size_t firstMeasured = passes.size() > 1 ? 1 : 0;
     std::vector<double> frameMs;
     std::string frameList;
@@ -1262,16 +1262,24 @@ int main(int argc, char** argv) {
     }
     if (options.directory.empty()) return usage();
     configureEnvironment(options);
+    const bool listing = options.shaders || options.submits != 0;
     int code = 2;
     try {
-        const bool listing = options.shaders || options.submits != 0;
         code = options.shaders ? listShaders(options) : options.submits != 0 ? listSubmits(options) : run(options);
-        if (code == 0 && !listing) {
-            AgcDriverShutdown_nid_postfix();
-            return 0;
-        }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
+    }
+    if (!listing) {
+        try {
+            AgcDriverShutdown_nid_postfix();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "agc_frame_replay: the driver failed at shutdown: %s\n", error.what());
+            if (code == 0) code = 2;
+        } catch (...) {
+            std::fprintf(stderr, "agc_frame_replay: the driver failed at shutdown with a non-standard exception\n");
+            if (code == 0) code = 2;
+        }
+        if (code == 0) return 0;
     }
     std::fflush(stdout);
     std::fflush(stderr);

@@ -155,8 +155,7 @@ void testUnwatched() {
 }
 
 void testEopTokens() {
-    Frames frames;
-    auto output = std::make_shared<ReplayOutput>(frames);
+    auto output = std::make_shared<ReplayOutput>(std::make_shared<Frames>());
     AgcDriverRegisterVideoOutput_nid_postfix(7, output);
     std::barrier together(2);
     std::atomic<int> wrong{0};
@@ -186,19 +185,19 @@ void testEopTokens() {
 
 class ReservationOutput final : public AgcDriver::IVideoOutput {
 public:
-    explicit ReservationOutput(Frames& frames) : frames(frames) {}
+    explicit ReservationOutput(std::shared_ptr<Frames> frames) : frames(std::move(frames)) {}
     std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override {
         ++reservations;
         if (failure) std::rethrow_exception(failure);
         return available ? std::make_shared<ReplayFlip>(frames) : nullptr;
     }
-    void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
+    void Fail(std::exception_ptr error) noexcept override { frames->Failed(error); }
     std::exception_ptr failure;
     bool available = true;
     std::size_t reservations = 0;
 
 private:
-    Frames& frames;
+    std::shared_ptr<Frames> frames;
 };
 
 FrameCall reservationCall(std::uint32_t token) {
@@ -274,7 +273,7 @@ void testRepeatedReservations(const std::filesystem::path& directory, bool drive
 
 class WaitingOutput final : public AgcDriver::IVideoOutput {
 public:
-    WaitingOutput(Frames& frames, const std::uint32_t* label) : frames(frames), label(label) {}
+    WaitingOutput(std::shared_ptr<Frames> frames, const std::uint32_t* label) : frames(std::move(frames)), label(label) {}
     std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override {
         const auto deadline = Clock::now() + std::chrono::seconds(2);
         while (*static_cast<const volatile std::uint32_t*>(label) == 0) {
@@ -283,10 +282,10 @@ public:
         }
         return std::make_shared<ReplayFlip>(frames);
     }
-    void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
+    void Fail(std::exception_ptr error) noexcept override { frames->Failed(error); }
 
 private:
-    Frames& frames;
+    std::shared_ptr<Frames> frames;
     const std::uint32_t* label;
 };
 
@@ -318,7 +317,7 @@ void testBlockingSubmission(const std::filesystem::path& directory) {
         replay.runWindow(calls);
         check(*label == ready && replay.unfinished == 0, "blocking submission did not complete");
     }
-    check(replay.frames.Times().size() == 2, "blocking submissions lost a flip");
+    check(replay.frames->Times().size() == 2, "blocking submissions lost a flip");
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
 }
 
