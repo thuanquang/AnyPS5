@@ -1,0 +1,34 @@
+# Performance comparison
+
+| Capture | Commit | Trace | Presents | Window (ms) |
+| --- | --- | --- | ---: | ---: |
+| baseline | aaccd0ba39b7 | aps5-trace-aaccd0ba39b7-7860.json.gz | 45 | 4033.198 |
+| candidate | 047be9a2ce41 | aps5-trace-047be9a2ce41-25536.json.gz | 45 | 4073.964 |
+
+- Compare captures from the same machine, title, content version and scene; matching recorded metadata cannot verify the physical machine or scene.
+- Changes are candidate minus baseline. A negative frame-time change means a shorter frame interval.
+- A missing top phase is unreported, not zero; its change is unavailable.
+
+## Frame and GPU times (ms)
+
+| Metric | Baseline | Candidate | Change | Change (%) |
+| --- | ---: | ---: | ---: | ---: |
+| frame_ms.p50 | 92.198 | 89.017 | -3.181 | -3.450 |
+| frame_ms.p90 | 103.290 | 95.046 | -8.244 | -7.981 |
+| frame_ms.p99 | 109.100 | 159.165 | +50.065 | +45.889 |
+| frame_ms.max | 109.100 | 159.165 | +50.065 | +45.889 |
+| mean_frame_ms | 89.627 | 90.533 | +0.906 | +1.011 |
+| gpu_busy_ms_per_present | 55.027 | 54.163 | -0.864 | -1.570 |
+
+## Top phases (ms per frame)
+
+| Metric | Baseline | Candidate | Change | Change (%) |
+| --- | ---: | ---: | ---: | ---: |
+| Driver.Draw | 79.283 | 81.140 | +1.857 | +2.342 |
+| Driver.Draw.draw_enqueued | 46.402 | 48.499 | +2.097 | +4.519 |
+| Driver.Draw.shader_compile_and_link | 26.673 | 26.783 | +0.110 | +0.412 |
+| Driver.Packet | 87.958 | 88.979 | +1.021 | +1.161 |
+| Driver.Packet.draw | 79.765 | 81.603 | +1.838 | +2.304 |
+| Graphics.Draw | 77.793 | 76.536 | -1.257 | -1.616 |
+| Graphics.Draw.draw_and_resource_release | 71.826 | 71.075 | -0.751 | -1.046 |
+| Shader.DrawStage | 21.535 | 21.913 | +0.378 | +1.755 |

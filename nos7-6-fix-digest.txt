@@ -1,0 +1,47 @@
+**seconds 560:4** from present 13796: 48 presents, frame p50 85.8 / p90 99.8 / p99 159.2 / max 159.2 ms, GPU busy 50.7 ms per present
+AMD Radeon RX 6700 XT, AMD proprietary driver 26.10.1 (AMD proprietary shader compiler), Windows 10.0.26200, 3840x2160, commit 047be9a2ce41, dropped: no
+
+```json
+{"commit":"047be9a2ce41","dirty":false,"env":{"APS5_DUMP_FRAMES":"1300","APS5_DUMP_FRAMES_EVERY":"20","APS5_NO_PAD_INPUT":"1","APS5_PAD_INPUT_FILE":"<path>","APS5_TRACE_DIR":"<path>","APS5_TRACE_SECONDS":"560:4"},"gpu":"AMD Radeon RX 6700 XT","driver":"AMD proprietary driver 26.10.1 (AMD proprietary shader compiler)","os":"Windows 10.0.26200","cpu":"AMD Ryzen 5 5600X 6-Core Processor","cpu_threads":12,"memory_mib":32690,"title_id":"PPSA05110","title":"Persona 5 Royal","content_version":"01.000.000","resolution":"3840x2160","window":{"spec":"seconds 560:4","first_present":13796,"ms":4002.765},"presents":48,"frame_ms":{"p50":85.754,"p90":99.784,"p99":159.247,"max":159.247},"gpu_busy_ms_per_present":50.714,"worker_busy_pct":{"queue worker 0x0":98.14},"top_phases_ms_per_frame":{"Driver.Packet":81.8,"Driver.Packet.draw":73.946,"Driver.Draw":73.474,"Graphics.Draw":69.44,"Graphics.Draw.draw_and_resource_release":63.822,"Driver.Draw.draw_enqueued":40.61,"Driver.Draw.shader_compile_and_link":27.133,"Shader.DrawStage":22.313},"trace_dropped":false,"trace":"aps5-trace-047be9a2ce41-8828.json.gz"}
+```
+
+**Slowest frames** (largest slices inside each, inclusive)
+
+- present 13832: 159.2 ms at 2957 ms: Driver.Packet (queue worker 0x0) 140.8, Driver.Packet.draw (queue worker 0x0) 138.7, Driver.Draw (queue worker 0x0) 138.3, Driver.Draw.shader_compile_and_link (queue worker 0x0) 82.0
+- present 13818: 115.5 ms at 1789 ms: Driver.Packet (queue worker 0x0) 97.3, Driver.Packet.draw (queue worker 0x0) 94.8, Driver.Draw (queue worker 0x0) 93.6, Graphics.Draw (draw committer) 78.4
+- present 13820: 103.3 ms at 1976 ms: Driver.Packet (queue worker 0x0) 87.6, Driver.Packet.draw (queue worker 0x0) 85.5, Driver.Draw (queue worker 0x0) 84.8, Graphics.Draw (draw committer) 80.3
+- present 13826: 102.9 ms at 2466 ms: Driver.Packet (queue worker 0x0) 84.5, Driver.Packet.draw (queue worker 0x0) 82.5, Driver.Draw (queue worker 0x0) 81.9, Graphics.Draw (draw committer) 76.1
+- present 13816: 99.8 ms at 1617 ms: Driver.Packet (queue worker 0x0) 79.6, Driver.Packet.draw (queue worker 0x0) 77.3, Driver.Draw (queue worker 0x0) 76.7, Graphics.Draw (draw committer) 71.2
+
+**Threads** (ms per frame)
+
+| thread | busy | wait | untraced | in slices < 20 us | largest |
+|---|---|---|---|---|---|
+| title | 0.1 (0 %) | 0.5 (1 %) | 82.9 | 3.4 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveGraphicsAbi 0.0 |
+| queue worker 0x0 | 63.8 (77 %) | 0.0 (0 %) | 19.6 | 102.0 | Driver.Packet 63.8, Driver.EndSubmission 0.0 |
+| draw committer | 55.2 (66 %) | 0.2 (0 %) | 28.0 | 36.9 | Graphics.Draw 53.6, Recorder.Submit 1.0 |
+| presenter | 1.6 (2 %) | 18.6 (22 %) | 63.3 | 0.0 | VideoOut.Flip 19.8, Driver.Present 0.3 |
+| gpu | 52.0 (62 %) | 0.0 (0 %) | 31.4 | 0.0 | batch 52.0 |
+
+**Largest slices** (ms per frame, inclusive, all threads): Driver.Packet 63.8, Driver.Packet.draw 61.7, Driver.Draw 61.3, Graphics.Draw 53.6, batch 52.0, Graphics.Draw.draw_and_resource_release 47.9, Driver.Draw.draw_enqueued 37.0, Driver.Present 19.9, VideoOut.Flip 19.8, VideoOut.Flip.present 19.6
+
+**Longest waits**
+
+- GpuMutex.wait.hook (title) 23.5 ms at 1571 ms, present 13815
+- Driver.Present.render_fence_wait (presenter) 19.1 ms at 2888 ms, present 13831
+- Vulkan.Acquire.acquire_fence_wait (presenter) 18.2 ms at 414 ms, present 13801
+- Vulkan.Acquire.acquire_fence_wait (presenter) 17.7 ms at 320 ms, present 13800
+- Driver.Present.render_fence_wait (presenter) 17.0 ms at 2400 ms, present 13825
+- Vulkan.Acquire.acquire_fence_wait (presenter) 16.6 ms at 2466 ms, present 13826
+- Vulkan.Acquire.acquire_fence_wait (presenter) 16.4 ms at 3335 ms, present 13836
+- Driver.Present.render_fence_wait (presenter) 16.4 ms at 1553 ms, present 13815
+- Vulkan.Acquire.acquire_fence_wait (presenter) 15.8 ms at 3832 ms, present 13842
+- Vulkan.Acquire.acquire_fence_wait (presenter) 15.4 ms at 1789 ms, present 13818
+
+**Largest GPU batches** (GPU ranges inside, and the CPU slices that recorded each, inclusive)
+
+- batch 1059: 20.1 ms at 2509 ms, present 13826: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.1, Graphics.Draw.draw_and_resource_release (draw committer) 0.0, Recorder.Submit (draw committer) 0.0, Recorder.Reap (draw committer) 0.0
+- batch 851: 19.9 ms at 2020 ms, present 13820: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.4, Graphics.Draw.draw_and_resource_release (draw committer) 0.3, Recorder.Submit (draw committer) 0.0
+- batch 503: 18.4 ms at 1163 ms, present 13810: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.2, Graphics.Draw.draw_and_resource_release (draw committer) 0.1, Recorder.Reap (draw committer) 0.1, Recorder.Submit (draw committer) 0.0
+- batch 1409: 18.4 ms at 3373 ms, present 13836: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.2, Graphics.Draw.draw_and_resource_release (draw committer) 0.1, Recorder.Submit (draw committer) 0.0
+- batch 362: 17.9 ms at 842 ms, present 13806: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.2, Graphics.Draw.draw_and_resource_release (draw committer) 0.1, Recorder.Submit (draw committer) 0.0
