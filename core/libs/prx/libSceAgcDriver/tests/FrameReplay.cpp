@@ -974,10 +974,7 @@ void testDeltaReadInFlight(const std::filesystem::path& tool) {
     check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
     const FrameCaptureReader reader(directory);
     const bool inFlight = std::any_of(reader.Calls().begin(), reader.Calls().end(), [](const auto& call) { return call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0; });
-    if (!inFlight && (reader.Header().find("\"held_deltas\":0") != std::string::npos || reader.Header().find("\"queued\":0") == std::string::npos)) {
-        std::puts("inconclusive: the 64 MiB copy finished before the title's next call");
-        std::exit(77);
-    }
+    if (!inFlight && (reader.Header().find("\"held_deltas\":0") != std::string::npos || reader.Header().find("\"queued\":0") == std::string::npos)) throw Inconclusive("the 64 MiB copy finished before the title's next call");
     check(inFlight, "the delta read while the 64 MiB copy was in flight is not marked as read in flight, so the capture held the title: " + reader.Header());
     const auto capture = checkCapture(1);
     check(replayed(tool, capture, layout.firstTarget, DataBytes) == stored, "the replay did not copy the page the title stored while the first copy was in flight");
@@ -1018,8 +1015,7 @@ void testStoreIntoDeltaReadInFlight(const std::filesystem::path& tool) {
     const auto inFlight = std::any_of(reader.Calls().begin(), reader.Calls().end(), [](const auto& call) { return call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0; });
     if (!inFlight) {
         check(header.find("\"stale_delta\":0") != std::string::npos, "the capture held every delta and still reported a stale delta: " + header);
-        std::puts("inconclusive: the 64 MiB copy finished before the title's next call, so no delta was read in flight");
-        std::exit(77);
+        throw Inconclusive("the 64 MiB copy finished before the title's next call, so no delta was read in flight");
     }
     check(header.find("\"stale_delta\":0") == std::string::npos && header.find("was read while submission") != std::string::npos, "a submission in flight at a delta's read stored into its page and the capture was kept: " + header);
     const auto log = std::filesystem::path(directory) / "refused.log";
@@ -1066,7 +1062,7 @@ int main(int argc, char** argv) {
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
         {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"in_flight_store", testStoreIntoDeltaReadInFlight}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|in_flight_store]\n");
         return 2;
     }
     int status = 0;
