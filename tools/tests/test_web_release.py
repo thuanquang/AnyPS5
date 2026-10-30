@@ -76,6 +76,10 @@ class WebReleaseTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
+        patcher = patch.object(build_web, "release_web_files",
+                               side_effect=lambda rev: set(FILES) if rev == REVISION else None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.root = Path(self.directory.name)
         self.build = self.root / "build"
         self.output = self.build / "web"
@@ -475,6 +479,18 @@ class TestWebRunnerTests(unittest.TestCase):
                     test_web.main(["--build", str(build)])
             self.assertEqual(error.exception.code, 2)
             self.assertIn("zip library URL not found", err.getvalue())
+
+    def test_main_rejects_invalid_utf8_archive_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / "build"
+            (build / "web").mkdir(parents=True)
+            (build / "web/archive.mjs").write_bytes(b"\xff\xfe\x80")
+            with patch("subprocess.run"):
+                with self.assertRaises(SystemExit) as error, contextlib.redirect_stderr(io.StringIO()) as err:
+                    test_web.main(["--build", str(build)])
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("can't decode byte", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
     def test_main_decodes_archive_with_utf8_bom(self):
         with tempfile.TemporaryDirectory() as tmp:
