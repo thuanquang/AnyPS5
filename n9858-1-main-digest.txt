@@ -1,0 +1,47 @@
+**seconds 560:4** from present 17469: 48 presents, frame p50 89.1 / p90 101.6 / p99 109.9 / max 109.9 ms, GPU busy 52.2 ms per present
+AMD Radeon RX 6700 XT, AMD proprietary driver 26.10.1 (AMD proprietary shader compiler), Windows 10.0.26200, 3840x2160, commit 3a2b91981651, dropped: no
+
+```json
+{"commit":"3a2b91981651","dirty":false,"env":{"APS5_DUMP_FRAMES":"1300","APS5_DUMP_FRAMES_EVERY":"20","APS5_NO_PAD_INPUT":"1","APS5_PAD_INPUT_FILE":"<path>","APS5_TRACE_DIR":"<path>","APS5_TRACE_SECONDS":"560:4"},"gpu":"AMD Radeon RX 6700 XT","driver":"AMD proprietary driver 26.10.1 (AMD proprietary shader compiler)","os":"Windows 10.0.26200","cpu":"AMD Ryzen 5 5600X 6-Core Processor","cpu_threads":12,"memory_mib":32690,"title_id":"PPSA05110","title":"Persona 5 Royal","content_version":"01.000.000","resolution":"3840x2160","window":{"spec":"seconds 560:4","first_present":17469,"ms":4078.94},"presents":48,"frame_ms":{"p50":89.069,"p90":101.648,"p99":109.948,"max":109.948},"gpu_busy_ms_per_present":52.21,"worker_busy_pct":{"queue worker 0x0":98.185},"top_phases_ms_per_frame":{"Driver.Packet":83.396,"Driver.Packet.draw":75.121,"Driver.Draw":74.676,"Graphics.Draw":72.905,"Graphics.Draw.draw_and_resource_release":67.357,"Driver.Draw.draw_enqueued":42.252,"Driver.Draw.shader_compile_and_link":26.438,"Shader.DrawStage":21.593},"trace_dropped":false,"trace":"aps5-trace-3a2b91981651-8168.json.gz"}
+```
+
+**Slowest frames** (largest slices inside each, inclusive)
+
+- present 17478: 109.9 ms at 751 ms: Driver.Packet (queue worker 0x0) 92.4, Driver.Packet.draw (queue worker 0x0) 89.9, Driver.Draw (queue worker 0x0) 89.2, Graphics.Draw (draw committer) 81.7
+- present 17472: 105.7 ms at 246 ms: Driver.Packet (queue worker 0x0) 87.3, Driver.Packet.draw (queue worker 0x0) 84.4, Driver.Draw (queue worker 0x0) 83.5, Graphics.Draw (draw committer) 74.9
+- present 17502: 102.9 ms at 2756 ms: Driver.Packet (queue worker 0x0) 84.8, Driver.Packet.draw (queue worker 0x0) 82.4, Driver.Draw (queue worker 0x0) 82.0, Graphics.Draw (draw committer) 75.4
+- present 17482: 102.7 ms at 1093 ms: Driver.Packet (queue worker 0x0) 85.2, Driver.Packet.draw (queue worker 0x0) 82.9, Driver.Draw (queue worker 0x0) 82.4, Graphics.Draw (draw committer) 76.0
+- present 17504: 101.6 ms at 2933 ms: Driver.Packet (queue worker 0x0) 82.1, Driver.Packet.draw (queue worker 0x0) 80.0, Driver.Draw (queue worker 0x0) 79.4, Graphics.Draw (draw committer) 72.5
+
+**Threads** (ms per frame)
+
+| thread | busy | wait | untraced | in slices < 20 us | largest |
+|---|---|---|---|---|---|
+| title | 0.0 (0 %) | 0.5 (1 %) | 84.4 | 3.4 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveAbi 0.0 |
+| queue worker 0x0 | 66.2 (78 %) | 0.0 (0 %) | 18.8 | 99.6 | Driver.Packet 66.2, Driver.EndSubmission 0.0 |
+| draw committer | 60.0 (71 %) | 0.2 (0 %) | 24.8 | 34.8 | Graphics.Draw 58.0, Recorder.Submit 1.0 |
+| presenter | 1.5 (2 %) | 17.5 (21 %) | 66.0 | 0.0 | VideoOut.Flip 18.6, Driver.Present 0.4 |
+| gpu | 53.4 (63 %) | 0.0 (0 %) | 31.6 | 0.0 | batch 53.4 |
+
+**Largest slices** (ms per frame, inclusive, all threads): Driver.Packet 66.2, Driver.Packet.draw 63.7, Driver.Draw 63.3, Graphics.Draw 58.0, batch 53.4, Graphics.Draw.draw_and_resource_release 52.2, Driver.Draw.draw_enqueued 38.8, Driver.Present 18.9, VideoOut.Flip 18.6, VideoOut.Flip.present 18.5
+
+**Longest waits**
+
+- GpuMutex.wait.hook (title) 24.6 ms at 2546 ms, present 17499
+- Driver.Present.gpu_mutex_wait (presenter) 18.9 ms at 3982 ms, present 17516
+- Driver.Present.render_fence_wait (presenter) 18.1 ms at 3039 ms, present 17505
+- Driver.Present.render_fence_wait (presenter) 18.0 ms at 3884 ms, present 17515
+- Driver.Present.render_fence_wait (presenter) 17.1 ms at 865 ms, present 17479
+- Driver.Present.gpu_mutex_wait (presenter) 16.6 ms at 2432 ms, present 17498
+- Driver.Present.gpu_mutex_wait (presenter) 16.5 ms at 248 ms, present 17472
+- Driver.Present.render_fence_wait (presenter) 16.2 ms at 519 ms, present 17475
+- Driver.Present.render_fence_wait (presenter) 16.1 ms at 682 ms, present 17477
+- Driver.Present.render_fence_wait (presenter) 16.0 ms at 3551 ms, present 17511
+
+**Largest GPU batches** (GPU ranges inside, and the CPU slices that recorded each, inclusive)
+
+- batch 125: 20.0 ms at 289 ms, present 17472: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.5, Graphics.Draw.draw_and_resource_release (draw committer) 0.4, Recorder.Submit (draw committer) 0.1
+- batch 399: 17.3 ms at 966 ms, present 17480: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.4, Graphics.Draw.draw_and_resource_release (draw committer) 0.3, Recorder.Submit (draw committer) 0.0
+- batch 193: 16.9 ms at 457 ms, present 17474: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.3, Graphics.Draw.draw_and_resource_release (draw committer) 0.3, Recorder.Submit (draw committer) 0.0
+- batch 1662: 16.2 ms at 4021 ms, present 17516: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.4, Graphics.Draw.draw_and_resource_release (draw committer) 0.3, Recorder.Submit (draw committer) 0.0
+- batch 260: 15.4 ms at 620 ms, present 17476: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.7, Graphics.Draw.draw_and_resource_release (draw committer) 0.6, Recorder.Submit (draw committer) 0.0
