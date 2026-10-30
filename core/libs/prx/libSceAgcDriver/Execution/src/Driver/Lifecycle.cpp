@@ -330,7 +330,9 @@ std::pair<std::uint64_t, std::uint64_t> Driver::SerialProgress() {
 
 StartedProgressSnapshot Driver::StartedProgress() {
     std::lock_guard lock(mutex);
-    return {accepted, completed, std::vector<std::uint64_t>(startedAhead.begin(), startedAhead.end())};
+    std::uint64_t begun = startedAhead.size();
+    for (const auto serial : completedOutOfOrder) begun += !startedAhead.contains(serial);
+    return {accepted, completed, std::vector<std::uint64_t>(startedAhead.begin(), startedAhead.end()), accepted - completed - std::min(begun, accepted - completed)};
 }
 
 void Driver::HoldForRecorder() {

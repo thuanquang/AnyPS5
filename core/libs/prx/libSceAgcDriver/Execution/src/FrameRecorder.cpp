@@ -177,23 +177,27 @@ void FrameRecorder::noteDriverStore(std::uint64_t begin, std::uint64_t end, std:
     }
 }
 
-bool FrameRecorder::needsHold(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks) {
+std::size_t FrameRecorder::holdReason(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks) {
     for (const auto& wait : DriverDetail::Driver::Get().AwaitedWaits()) {
-        if (wait.address != 0) return true;
+        if (wait.address != 0) return 4;
     }
     {
         std::lock_guard lock(storeMutex);
         for (const auto& [begin, end] : blocks) {
             for (auto page = begin & ~std::uint64_t{HostPageBytes - 1}; page < end; page += HostPageBytes) {
-                if (driverPages.contains(page)) return true;
+                if (driverPages.contains(page)) return 5;
             }
         }
     }
     auto& driver = DriverDetail::Driver::Get();
     for (const auto& [begin, end] : blocks) {
-        if (driver.UnfinishedLabelOverlaps(begin, end) || Graphics::Recorder::SnapshotWriteOverlaps(begin, static_cast<std::size_t>(end - begin))) return true;
+        if (driver.UnfinishedLabelOverlaps(begin, end)) return 6;
+        if (Graphics::Recorder::SnapshotWriteOverlaps(begin, static_cast<std::size_t>(end - begin))) return 7;
     }
-    return Graphics::StorageTexture::AnyPendingOverlaps(blocks) || Graphics::AnyShadowedOverlaps(blocks) || DriverDetail::DrawPipeline::Queue0().OverlapsAny(blocks);
+    if (Graphics::StorageTexture::AnyPendingOverlaps(blocks)) return 8;
+    if (Graphics::AnyShadowedOverlaps(blocks)) return 9;
+    if (DriverDetail::DrawPipeline::Queue0().OverlapsAny(blocks)) return 10;
+    return 0;
 }
 
 void FrameRecorder::arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted) {
@@ -518,7 +522,9 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     std::vector<std::uint64_t> started;
     bool inFlightRead = false;
     if (completed < accepted && (!added.empty() || !blocks.empty() || !hostPages.empty())) {
-        if (unwatched || !added.empty() || !hostPages.empty() || callThreads.size() > 1 || needsHold(blocks)) {
+        const auto reason = unwatched ? 1 : !added.empty() || !hostPages.empty() ? 2 : callThreads.size() > 1 ? 3 : entry.queued != 0 ? 11 : holdReason(blocks);
+        if (reason != 0) {
+            ++holdReasons[reason];
             driver.ReleaseForRecorder();
             if (!driver.WaitSettledFor(std::chrono::seconds(10))) {
                 stop("stopped: the GPU work submitted before a memory delta neither finished nor waited for the title within 10 s");
@@ -813,7 +819,12 @@ std::string FrameRecorder::header() const {
     text += "]";
     {
         std::lock_guard lock(storeMutex);
-        text += ",\"in_flight_deltas\":" + std::to_string(inFlightDeltas) + ",\"held_deltas\":" + std::to_string(heldDeltas) + ",\"stale_delta\":" + std::to_string(storeHazard.group) + ",\"unattributed_stores\":" + std::to_string(unattributedStores);
+        text += ",\"in_flight_deltas\":" + std::to_string(inFlightDeltas) + ",\"held_deltas\":" + std::to_string(heldDeltas) + ",\"hold_reasons\":{" + [&] {
+            static constexpr std::array<const char*, 12> names{"", "unwatched", "late_or_host", "threads", "parked", "driver_page", "label", "snapshot", "storage", "shadow", "queue0", "queued"};
+            std::string reasons;
+            for (std::size_t index = 1; index < names.size(); ++index) reasons += std::string(index == 1 ? "" : ",") + "\"" + names[index] + "\":" + std::to_string(holdReasons[index]);
+            return reasons + "}";
+        }() + ",\"stale_delta\":" + std::to_string(storeHazard.group) + ",\"unattributed_stores\":" + std::to_string(unattributedStores);
     }
     text += ",\"env\":{";
     bool first = true;

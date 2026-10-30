@@ -68,7 +68,7 @@ private:
     };
     static void observeDriverStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
     void noteDriverStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
-    bool needsHold(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks);
+    std::size_t holdReason(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks);
     void arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted);
     bool stopOnHazard();
 
@@ -159,6 +159,7 @@ private:
     std::uint64_t unattributedStores = 0;
     std::uint64_t inFlightDeltas = 0;
     std::uint64_t heldDeltas = 0;
+    std::array<std::uint64_t, 12> holdReasons{};
     std::set<std::uint64_t> callThreads;
     static std::atomic<FrameRecorder*> observing;
     std::vector<std::string> warnings;

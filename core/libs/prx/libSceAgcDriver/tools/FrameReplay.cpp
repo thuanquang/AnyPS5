@@ -348,6 +348,7 @@ struct Replay {
     std::atomic<std::size_t> sequenced{0};
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
+    std::uint64_t singleThreadOrdinal = 0;
     std::size_t pass = 0;
     bool recording = false;
     Clock::time_point startedAt{};
@@ -486,7 +487,7 @@ struct Replay {
             const auto began = Clock::now();
             const bool pacing = options.pace && recording;
             if (pacing && reader.Version() >= 2 && (call.flags & AgcDriver::InFlightDeltaFlag) != 0) {
-                if (threads > 1) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " was read with submissions in flight, which this replay orders only for a capture from one thread");
+                if (call.ordinal > singleThreadOrdinal) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " was read with submissions in flight after a second thread made calls, which this replay cannot order");
                 waitStarted(call);
                 paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
                 restoreGroup(call.values.at(0));
@@ -660,6 +661,12 @@ struct Replay {
         std::map<std::uint64_t, std::vector<std::size_t>> byThread;
         for (std::size_t index = 0; index < calls.size(); ++index) byThread[calls[index].thread].push_back(index);
         threads = byThread.size();
+        singleThreadOrdinal = calls.empty() ? 0 : calls.back().ordinal;
+        for (const auto& call : calls) {
+            if (call.thread == calls.front().thread) continue;
+            singleThreadOrdinal = call.ordinal - 1;
+            break;
+        }
         std::mutex mutex;
         std::condition_variable turn;
         std::size_t started = 0;

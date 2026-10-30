@@ -163,6 +163,10 @@ extern "C" bool AgcDriverSerialDone_nid_postfix(std::uint64_t serial) {
     return AgcDriver::DriverDetail::Driver::Get().SerialDone(serial);
 }
 
+extern "C" std::uint64_t AgcDriverQueuedSerials_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().StartedProgress().queued;
+}
+
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed) {
     const auto [submitted, done] = AgcDriver::DriverDetail::Driver::Get().SerialProgress();
     *accepted = submitted;

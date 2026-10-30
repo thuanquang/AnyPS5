@@ -25,6 +25,7 @@ struct StartedProgressSnapshot {
     std::uint64_t accepted = 0;
     std::uint64_t completed = 0;
     std::vector<std::uint64_t> started;
+    std::uint64_t queued = 0;
 };
 
 }
@@ -41,6 +42,7 @@ extern "C" void AgcDriverRequestScreenshot_nid_postfix();
 extern "C" void AgcDriverSuspendPoint_nid_postfix();
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed);
 extern "C" bool AgcDriverSerialDone_nid_postfix(std::uint64_t serial);
+extern "C" std::uint64_t AgcDriverQueuedSerials_nid_postfix();
 extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds);
 extern "C" void AgcDriverReleaseSettled_nid_postfix();
 extern "C" bool AgcDriverSettled_nid_postfix();

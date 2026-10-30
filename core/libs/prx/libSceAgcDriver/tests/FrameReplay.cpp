@@ -936,6 +936,14 @@ void testQueueBusyPastPacing(const std::filesystem::path& tool) {
     check(replayed(tool, checkCapture(0), layout.firstTarget, DataBytes, " --pace-timeout-ms 1") == copied, "the replay gave up pacing or released the compute queue while the graphics queue was still copying");
 }
 
+void awaitStarted() {
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (AgcDriverQueuedSerials_nid_postfix() != 0) {
+        check(std::chrono::steady_clock::now() < limit, "the copying submission did not start within 10 s");
+        std::this_thread::yield();
+    }
+}
+
 void testDeltaReadInFlight(const std::filesystem::path& tool) {
     constexpr std::size_t CopyBytes = 64u << 20;
     const auto layout = allocate();
@@ -950,6 +958,7 @@ void testDeltaReadInFlight(const std::filesystem::path& tool) {
     for (std::size_t offset = 0; offset < CopyBytes; offset += CopyBytes / 8) sceAgcDcbDmaData(&graphics, 0, DmaMemory, 0, at(big.base + CopyBytes + offset), DmaMemory, 0, at(big.base + offset), CopyBytes / 8, 0, 1, 0);
     Packet copying{layout.firstCommands, static_cast<std::uint32_t>(graphics.cursor_up - layout.firstCommands), 0, {}};
     check(sceAgcDriverSubmitDcb(&copying) == 0, "the copying submission failed");
+    awaitStarted();
     const auto stored = pattern(41);
     std::memcpy(written.source, stored.data(), stored.size());
     auto second = commands(layout.secondCommands);
@@ -961,10 +970,16 @@ void testDeltaReadInFlight(const std::filesystem::path& tool) {
     flip();
     flip();
     AgcDriverWaitIdle_nid_postfix();
-    const auto capture = checkCapture(1);
-    const FrameCaptureReader reader(capture);
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
     const bool inFlight = std::any_of(reader.Calls().begin(), reader.Calls().end(), [](const auto& call) { return call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0; });
-    check(inFlight, "the delta read while the 64 MiB copy was in flight is not marked as read in flight, so the capture held the title");
+    if (!inFlight && (reader.Header().find("\"held_deltas\":0") != std::string::npos || reader.Header().find("\"queued\":0") == std::string::npos)) {
+        std::puts("inconclusive: the 64 MiB copy finished before the title's next call");
+        std::exit(77);
+    }
+    check(inFlight, "the delta read while the 64 MiB copy was in flight is not marked as read in flight, so the capture held the title: " + reader.Header());
+    const auto capture = checkCapture(1);
     check(replayed(tool, capture, layout.firstTarget, DataBytes) == stored, "the replay did not copy the page the title stored while the first copy was in flight");
 }
 
@@ -985,6 +1000,7 @@ void testStoreIntoDeltaReadInFlight(const std::filesystem::path& tool) {
     sceAgcDcbDmaData(&graphics, 0, DmaMemory, 0, at(page.source), DmaMemory, 0, at(layout.source), DataBytes, 0, 1, 0);
     Packet copying{layout.firstCommands, static_cast<std::uint32_t>(graphics.cursor_up - layout.firstCommands), 0, {}};
     check(sceAgcDriverSubmitDcb(&copying) == 0, "the copying submission failed");
+    awaitStarted();
     const auto stored = pattern(57);
     std::memcpy(page.source, stored.data(), stored.size());
     auto second = commands(layout.secondCommands);
