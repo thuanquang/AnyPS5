@@ -371,6 +371,57 @@ void testGateFailure(const std::filesystem::path& directory) {
     check(rethrown, "the injected driver failure was not propagated at shutdown");
 }
 
+void testUnverifiedDeltas(const std::filesystem::path& directory) {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    const std::uint32_t stored = 7;
+    std::uintptr_t base = 0;
+    std::size_t arenaSize = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &arenaSize);
+    const auto arena = "{\"arena_base\":" + std::to_string(base);
+    const auto refusal = [&](const std::string& name, bool inFlight, const std::optional<std::string>& header) {
+        const auto capture = directory / name;
+        {
+            FrameCaptureWriter writer(capture);
+            writer.WriteDelta(1, 1, address(bytes), std::as_bytes(std::span(&stored, 1)));
+            auto call = memoryCall(1, 1);
+            call.ordinal = 1;
+            call.accepted = 2;
+            call.completed = inFlight ? 1 : 2;
+            if (inFlight) {
+                call.flags = AgcDriver::InFlightDeltaFlag;
+                call.values.push_back(2);
+            }
+            writer.WriteCall(call);
+            if (header) writer.Finish(*header);
+        }
+        const FrameCaptureReader reader(capture);
+        try {
+            restoreMemory(reader);
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    const auto refused = [&](const std::string& name, const std::optional<std::string>& header, const char* reason) {
+        const auto message = refusal(name, true, header);
+        check(!message.empty(), ("the replay accepted capture " + name + ", whose memory delta was read with submissions in flight and never verified").c_str());
+        check(message.find(reason) != std::string::npos, ("the replay refused capture " + name + " without '" + reason + "': " + message).c_str());
+    };
+    refused("missing", std::nullopt, "capture.json is missing");
+    refused("bare", arena + "}", "capture.json has no stale_delta");
+    refused("unrecorded", arena + ",\"stale_delta\":0,\"warnings\":[]}", "capture.json has no unverified_deltas");
+    refused("unparsed", arena + ",\"stale_delta\":0,\"unverified_deltas\":null,\"warnings\":[]}", "unverified_deltas is not a number");
+    refused("unverified", arena + ",\"stale_delta\":0,\"unverified_deltas\":1,\"warnings\":[]}", "capture.json has unverified_deltas 1");
+    refused("unlisted", arena + ",\"stale_delta\":0,\"unverified_deltas\":0}", "capture.json has no warnings");
+    refused("unclosed", arena + ",\"stale_delta\":0,\"unverified_deltas\":0,\"warnings\":[\"stopped: early\"}", "warnings are not a list");
+    refused("stopped", arena + ",\"stale_delta\":0,\"unverified_deltas\":0,\"warnings\":[\"no reference frames: the driver did not go idle after the last frame\",\"stopped: less than 4 GiB free on the capture volume\"]}", "the capture stopped: less than 4 GiB free on the capture volume");
+    refused("stale", arena + ",\"stale_delta\":1,\"unverified_deltas\":0,\"warnings\":[\"stopped: memory delta 1 was read while submission 2, in flight at its read, stored into its page 0x10000\"]}", "(stale_delta 1)");
+    const auto verified = refusal("verified", true, arena + ",\"stale_delta\":0,\"unverified_deltas\":0,\"warnings\":[\"a \\\"stopped: quoted\\\" warning \\\\ \\u0009\",\"4096 bytes under multisampled targets whose samples are only on the host are zero in the capture, so replay starts those targets without their earlier contents\"]}");
+    check(verified.empty(), ("the replay refused a capture whose memory delta read in flight was verified: " + verified).c_str());
+    const auto held = refusal("held", false, arena + ",\"unverified_deltas\":1,\"warnings\":[\"stopped: less than 4 GiB free on the capture volume\"]}");
+    check(held.empty(), ("the replay refused a capture without memory deltas read in flight: " + held).c_str());
+}
+
 void testShaderCode(const std::filesystem::path& directory, bool host) {
     auto* bytes = allocate(1u << 20);
     auto* shader = reinterpret_cast<Shader*>(bytes);
@@ -543,6 +594,7 @@ int main(int argc, char** argv) {
         else if (mode == "reservations" || mode == "reservation_failure") testRepeatedReservations(directory, mode == "reservation_failure");
         else if (mode == "blocking") testBlockingSubmission(directory);
         else if (mode == "gate_failure") testGateFailure(directory);
+        else if (mode == "unverified") testUnverifiedDeltas(directory);
         else if (mode == "environment") testColdPipelines();
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else throw std::runtime_error("unknown test");

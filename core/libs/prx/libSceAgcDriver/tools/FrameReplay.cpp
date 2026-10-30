@@ -136,11 +136,77 @@ private:
     std::shared_ptr<Frames> frames;
 };
 
-std::uint64_t headerNumber(const std::string& header, std::string_view key) {
+std::optional<std::uint64_t> headerValue(const std::string& header, std::string_view key) {
     const auto quoted = "\"" + std::string(key) + "\":";
     const auto at = header.find(quoted);
-    if (at == std::string::npos) throw std::runtime_error("frame replay: the capture header has no " + std::string(key));
-    return std::strtoull(header.c_str() + at + quoted.size(), nullptr, 10);
+    if (at == std::string::npos) return std::nullopt;
+    const auto* const end = header.data() + header.size();
+    std::uint64_t value = 0;
+    const auto [last, error] = std::from_chars(header.data() + at + quoted.size(), end, value);
+    if (error != std::errc{} || last == end || std::string_view(",} \t\r\n").find(*last) == std::string_view::npos) throw std::runtime_error("frame replay: the capture header's " + std::string(key) + " is not a number");
+    return value;
+}
+
+std::uint64_t headerNumber(const std::string& header, std::string_view key) {
+    const auto value = headerValue(header, key);
+    if (!value) throw std::runtime_error("frame replay: the capture header has no " + std::string(key));
+    return *value;
+}
+
+std::optional<std::vector<std::string>> headerStrings(const std::string& header, std::string_view key) {
+    const auto quoted = "\"" + std::string(key) + "\":[";
+    auto at = header.find(quoted);
+    if (at == std::string::npos) return std::nullopt;
+    const auto malformed = [&] { return std::runtime_error("frame replay: the capture header's " + std::string(key) + " are not a list of the strings the recorder writes"); };
+    std::vector<std::string> strings;
+    for (at += quoted.size(); at < header.size() && header[at] != ']';) {
+        if (!strings.empty() && header[at++] != ',') throw malformed();
+        if (at >= header.size() || header[at++] != '"') throw malformed();
+        std::string text;
+        while (at < header.size() && header[at] != '"') {
+            if (header[at] != '\\') {
+                text += header[at++];
+                continue;
+            }
+            if (header.size() - at < 2) throw malformed();
+            const auto escaped = header[at + 1];
+            if (escaped == '"' || escaped == '\\') {
+                text += escaped;
+                at += 2;
+                continue;
+            }
+            unsigned code = 0;
+            const auto* const digits = header.data() + at + 2;
+            if (escaped != 'u' || header.size() - at < 6 || std::from_chars(digits, digits + 4, code, 16).ptr != digits + 4 || code >= 0x80) throw malformed();
+            text += static_cast<char>(code);
+            at += 6;
+        }
+        if (at >= header.size()) throw malformed();
+        ++at;
+        strings.push_back(std::move(text));
+    }
+    if (at >= header.size()) throw malformed();
+    return strings;
+}
+
+void requireVerifiedDeltas(const FrameCaptureReader& reader) {
+    if (reader.Version() < 2) return;
+    const auto& header = reader.Header();
+    const auto stale = headerValue(header, "stale_delta");
+    if (stale.value_or(0) != 0) throw std::runtime_error("frame replay: the capture stopped because a memory delta was read while submissions that stored into it were in flight (stale_delta " + std::to_string(*stale) + ")");
+    const auto inFlight = std::count_if(reader.Calls().begin(), reader.Calls().end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0; });
+    if (inFlight == 0) return;
+    const auto refuse = [&](const std::string& reason) { return std::runtime_error("frame replay: " + std::to_string(inFlight) + " memory deltas were read while submissions were in flight, but " + reason + ", so stores those submissions made into them later were never checked"); };
+    if (header.empty()) throw refuse("capture.json is missing or empty");
+    if (!stale) throw refuse("capture.json has no stale_delta");
+    const auto unverified = headerValue(header, "unverified_deltas");
+    if (!unverified) throw refuse("capture.json has no unverified_deltas");
+    if (*unverified != 0) throw refuse("capture.json has unverified_deltas " + std::to_string(*unverified));
+    const auto warnings = headerStrings(header, "warnings");
+    if (!warnings) throw refuse("capture.json has no warnings");
+    for (const auto& warning : *warnings) {
+        if (warning.starts_with("stopped:")) throw refuse("the capture " + warning);
+    }
 }
 
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
@@ -276,7 +342,7 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     std::size_t size = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
     if (!reader.Header().empty() && headerNumber(reader.Header(), "arena_base") != base) throw std::runtime_error("frame replay: the guest arena is at a different address than in the capture");
-    if (reader.Version() >= 2 && reader.Header().find("\"stale_delta\":") != std::string::npos && headerNumber(reader.Header(), "stale_delta") != 0) throw std::runtime_error("frame replay: the capture stopped because a memory delta was read while submissions that stored into it were in flight (stale_delta " + std::to_string(headerNumber(reader.Header(), "stale_delta")) + ")");
+    requireVerifiedDeltas(reader);
     progress();
     Skipped skipped;
     mapHostRanges(reader, skipped);
