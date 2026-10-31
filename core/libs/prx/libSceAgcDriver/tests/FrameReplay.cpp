@@ -1158,17 +1158,43 @@ std::uint64_t jsonCount(const std::map<std::string, std::uint64_t>& counts, cons
     return found->second;
 }
 
+bool awaits(const std::uint32_t* word);
+
 void testHoldDiagnostics(const std::filesystem::path& tool) {
     constexpr std::uint32_t Stored = 0x77u;
+    constexpr std::uint32_t ComputeQueue = 0x20;
     const auto layout = allocate();
     const auto bulk = allocate();
+    const auto busy = allocate();
+    std::memset(busy.base, 0, BlockBytes);
     auto* const word = reinterpret_cast<std::uint32_t*>(bulk.base);
     AgcDriver::GuestMemory::Unwatch(at(bulk.base), 4096);
     check(!AgcDriver::GuestMemory::Watched(at(bulk.base), 4096), "the test buffer did not lose write-watch coverage");
+    auto* const busyWords = reinterpret_cast<std::uint32_t*>(busy.base);
+    auto* const busyLabels = reinterpret_cast<std::uint32_t*>(busy.base + BusyLabels);
+    auto* const awaitedLabel = busyLabels + BusyPackets;
+    CommandBuffer labelling{busyWords, busyLabels, busyWords, busyLabels, nullptr, nullptr, 0};
+    for (std::size_t index = 0; index < BusyPackets; ++index) writeDone(labelling, busyLabels + index);
+    writeDone(labelling, awaitedLabel);
+    const Packet labelWriter{busyWords, static_cast<std::uint32_t>(labelling.cursor_up - busyWords), 0, {}};
+    auto* const waitWords = reinterpret_cast<std::uint32_t*>(busy.base + BusyLabels + 2 * CommandBytes);
+    auto waiting = commands(waitWords);
+    sceAgcAcbWaitRegMem(&waiting, 0, 3, 0, awaitedLabel, Done, 0xffffffffu, 0);
+    sceAgcAcbWriteData(&waiting, ComputeMemory, 0, at(awaitedLabel + 1), &Done, 1, 0, 1);
+    const Packet labelWaiter{waitWords, static_cast<std::uint32_t>(waiting.cursor_up - waitWords), 0, {}};
+    const auto afterLabel = labelPacket(reinterpret_cast<std::uint32_t*>(busy.base + BusyLabels + 3 * CommandBytes), awaitedLabel + 2);
     auto output = std::make_shared<Output>();
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
 
     flip();
+    AgcDriverWaitIdle_nid_postfix();
+    check(sceAgcDriverSubmitAcb(ComputeQueue, &labelWaiter) == 0, "the compute submission that waits on a label failed");
+    waitUntil([&] { return awaits(awaitedLabel); }, "the compute submission never waited on its label");
+    std::memset(layout.source, 0x11, DataBytes);
+    check(sceAgcDriverSubmitDcb(&labelWriter) == 0, "the submission that writes the awaited label failed");
+    std::memset(layout.source, 0x22, DataBytes);
+    if (!awaits(awaitedLabel) || std::atomic_ref<std::uint32_t>(*awaitedLabel).load(std::memory_order_acquire) == Done) throw Inconclusive("the busy labels reached the awaited label before the title's next call; raise BusyPackets");
+    check(sceAgcDriverSubmitDcb(&afterLabel) == 0, "the submission after the label wait failed");
     AgcDriverWaitIdle_nid_postfix();
     auto* const gate = layout.label + 1;
     auto gated = commands(layout.firstCommands);
@@ -1210,6 +1236,16 @@ void testHoldDiagnostics(const std::filesystem::path& tool) {
     check(entry != std::string::npos, "the capture header does not list the unwatched block: " + header);
     const auto block = jsonCounts(header.substr(entry + 1, header.find('}', entry) - entry - 1));
     check(jsonCount(block, "deltas", header) >= 2 && jsonCount(block, "changed", header) == 1 && jsonCount(block, "driver_stored", header) == 0, "the unwatched block's counters do not show one CPU store and no driver store between the deltas read while the gate was closed: " + header);
+    for (const char* name : {"parked_on_title", "driver_page_since_full", "title_wait_unpassed", "wait_dword_in_delta"}) check(reasons.contains(name), std::string("the capture header does not count the hold reason ") + name + ": " + header);
+    check(header.find("\"read_depths\":[") != std::string::npos, "the capture header has no read_depths: " + header);
+    check(jsonCount(reasons, "title_wait_unpassed", header) >= 1, "the capture did not count the gate the parked submission waits on as an unpassed wait on title memory: " + header);
+    const auto parkedMask = [&](bool title) {
+        return std::any_of(masks.begin(), masks.end(), [&](const auto& mask) {
+            const auto names = "+" + mask.first + "+";
+            return names.find("+parked+") != std::string::npos && (names.find("+parked_on_title+") != std::string::npos) == title;
+        });
+    };
+    check(parkedMask(true) && parkedMask(false), "the hold masks do not tell a queue parked on the title's gate from one parked on a label that a submission in flight writes: " + header);
 
     const auto result = capture / "hold diagnostics.json";
     const auto dump = capture / "hold diagnostics.bin";
