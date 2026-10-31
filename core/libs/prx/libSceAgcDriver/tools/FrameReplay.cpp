@@ -1461,15 +1461,20 @@ int main(int argc, char** argv) {
     if (options.directory.empty()) return usage();
     configureEnvironment(options);
     int code = 2;
+    const bool listing = options.shaders || options.submits != 0;
     try {
-        const bool listing = options.shaders || options.submits != 0;
         code = options.shaders ? listShaders(options) : options.submits != 0 ? listSubmits(options) : run(options);
-        if (code == 0 && !listing) {
-            AgcDriverShutdown_nid_postfix();
-            return 0;
-        }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
+    }
+    if (!listing) {
+        try {
+            AgcDriverShutdown_nid_postfix();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
+            if (code == 0) code = 2;
+        }
+        if (code == 0) return 0;
     }
     std::fflush(stdout);
     std::fflush(stderr);
