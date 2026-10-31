@@ -284,6 +284,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 running.Start();
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
+            retireLabelTakes(id, submission.received);
             {
                 const GuestMemory::StoreSerialScope storing(submission.serial);
                 execute(submission);
