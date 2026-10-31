@@ -52,6 +52,11 @@ bool DrawProfiled() {
     return profiled;
 }
 
+std::uint64_t completionStoreSerial() {
+    const auto serial = GuestMemory::CurrentStoreSerial();
+    return serial == GuestMemory::TitleCallStoreSerial ? 0 : serial;
+}
+
 std::uint64_t syncCounts[5] = {};
 // Fence wait time by sync source (APS5_PROFILE_DRAW), and the source CountSync announced for the
 // Sync/SyncThrough that follows it on this thread.
@@ -2993,7 +2998,7 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
 
 void Recorder::OnComplete(std::function<void()> action) {
     ensureOpen();
-    if (const auto serial = GuestMemory::CurrentStoreSerial(); serial != 0 && GuestMemory::DriverStoreObserved()) {
+    if (const auto serial = completionStoreSerial(); serial != 0 && GuestMemory::DriverStoreObserved()) {
         open->completions.push_back([action = std::move(action), serial] {
             const GuestMemory::StoreSerialScope stores(serial);
             action();
@@ -3559,7 +3564,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         std::lock_guard ringLock(writtenBackMutex);
         return writtenBackSequence;
     }();
-    batch.completions.push_back([this, address, copy = std::move(copy), sequence, storedOnGpu, serial = GuestMemory::CurrentStoreSerial()] {
+    batch.completions.push_back([this, address, copy = std::move(copy), sequence, storedOnGpu, serial = completionStoreSerial()] {
         const GuestMemory::StoreSerialScope stores(serial);
         if (storedOnGpu && !always && !writtenBackSince(sequence, address, address + copy.size())) {
             completionStoresSkipped.fetch_add(1, std::memory_order_relaxed);
@@ -3596,7 +3601,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
 bool Recorder::AfterRecordedWork(std::function<void()> action) {
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
-    if (const auto serial = GuestMemory::CurrentStoreSerial(); serial != 0 && GuestMemory::DriverStoreObserved()) {
+    if (const auto serial = completionStoreSerial(); serial != 0 && GuestMemory::DriverStoreObserved()) {
         batch.completions.push_back([action = std::move(action), serial] {
             const GuestMemory::StoreSerialScope stores(serial);
             action();

@@ -1542,6 +1542,40 @@ void afterRecordedWorkTests(const Device& device, Recorder& recorder) {
     Require(seen == 1, "an action ran before the completion label recorded ahead of it");
 }
 
+std::mutex observedStoresMutex;
+std::vector<std::pair<std::uint64_t, std::uint64_t>> observedStores;
+
+void observeStore(std::uint64_t begin, std::uint64_t, std::uint64_t serial) {
+    std::lock_guard lock(observedStoresMutex);
+    observedStores.emplace_back(begin, serial);
+}
+
+void titleCallClosureTests(const Device& device, Recorder& recorder) {
+    alignas(64) static std::uint32_t memory[16];
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const std::array<std::byte, 4> value{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    recorder.Sync();
+    observedStores.clear();
+    AgcDriver::GuestMemory::SetDriverStoreObserver(&observeStore);
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope titleCall(AgcDriver::GuestMemory::TitleCallStoreSerial);
+        recorder.OnComplete([&] { AgcDriver::GuestMemory::StoreOwnBytes(base, value); });
+        recorder.AfterCompletions(base + 16, value, 9, 0, false);
+        Require(recorder.AfterRecordedWork([&] { AgcDriver::GuestMemory::StoreOwnBytes(base + 32, value); }), "an action after recorded work was refused");
+    }
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    AgcDriver::GuestMemory::SetDriverStoreObserver(nullptr);
+    std::lock_guard lock(observedStoresMutex);
+    for (const auto address : {base, base + 16, base + 32}) {
+        const auto stored = std::count_if(observedStores.begin(), observedStores.end(), [&](const auto& store) { return store.first == address; });
+        Require(stored != 0, "a completion registered under a title call made no observed driver store");
+        Require(std::all_of(observedStores.begin(), observedStores.end(), [&](const auto& store) { return store.first != address || store.second == 0; }), "a completion registered under a title call stored under the title-call serial, which the frame recorder exempts from its hazard check, instead of as unattributed");
+    }
+    Require(memory[0] == 1 && memory[4] == 1 && memory[8] == 1, "the completions registered under a title call did not store");
+}
+
 int gpuTimingCompletionTests(const Device& device, bool incomplete) {
     const auto& context = device.GetContext();
     if (!device.Timestamps()) {
@@ -12483,6 +12517,11 @@ int main(int argc, char** argv) {
             lateLabelTests(recorder);
             largeLabelTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--title-call-closure-only") {
+            titleCallClosureTests(device, recorder);
+            std::cout << "title-call completion attribution tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bda-staging-only") {
