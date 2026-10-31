@@ -59,14 +59,20 @@ public:
 private:
     enum class State { Waiting, Recording, Done };
 
+    static constexpr std::size_t StaleClasses = 5;
     struct StoreOwner {
         std::uint64_t group = 0;
         std::uint64_t accepted = 0;
+        std::uint64_t completed = 0;
+        std::uint32_t mask = 0;
+        bool read = false;
+        bool same = false;
     };
     struct StoreHazard {
         std::uint64_t group = 0;
         std::uint64_t page = 0;
         std::uint64_t serial = 0;
+        std::size_t kind = 0;
     };
     struct UnwatchedPage {
         std::uint64_t hash = 0;
@@ -82,8 +88,7 @@ private:
     std::uint32_t holdMask(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks);
     void countUnwatched(std::vector<std::pair<std::uint64_t, std::uint64_t>>& unwatched, std::vector<std::pair<std::uint64_t, std::uint64_t>>& blocks);
     void recordUnwatched(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stores);
-    void arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted);
-    bool stopOnHazard();
+    void arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted, std::uint64_t completed, std::span<const std::uint64_t> started, std::uint32_t mask);
     void awaitLateStores();
 
     struct Range {
@@ -167,6 +172,7 @@ private:
     std::uint64_t lateRanges = 0;
     std::array<std::uint64_t, 17> submitDepths{};
     std::array<std::uint64_t, 17> readDepths{};
+    std::array<std::uint64_t, 17> readDepthsLabelParked{};
     mutable std::mutex storeMutex;
     std::unordered_map<std::uint64_t, std::uint64_t> driverPages;
     std::uint64_t driverStores = 0;
@@ -175,11 +181,17 @@ private:
     std::uint64_t fullDeltaStores = 0;
     std::unordered_map<std::uint64_t, StoreOwner> storeOwners;
     StoreHazard storeHazard;
+    std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> armedStarted;
+    std::array<std::array<std::array<std::uint64_t, 4>, StaleClasses>, 2> wouldBeStale{};
+    std::uint64_t staleStores = 0;
+    std::unordered_map<std::uint64_t, std::uint64_t> recordedPages;
+    std::uint64_t endSkippedAtStart = 0;
+    std::uint64_t endSkipped = 0;
     std::uint64_t unattributedStores = 0;
     std::uint64_t unverifiedDeltas = 0;
     std::uint64_t inFlightDeltas = 0;
     std::uint64_t heldDeltas = 0;
-    std::array<std::uint64_t, 17> holdReasons{};
+    std::array<std::uint64_t, 19> holdReasons{};
     std::map<std::uint32_t, std::uint64_t> holdMasks;
     std::unordered_map<std::uint64_t, UnwatchedPage> unwatchedPages;
     std::map<std::pair<std::uint64_t, std::uint64_t>, UnwatchedCounts> unwatchedCounts;

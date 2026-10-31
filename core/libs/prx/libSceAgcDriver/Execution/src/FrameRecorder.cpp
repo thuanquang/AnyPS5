@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/State/include/Configuration.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -138,7 +139,18 @@ std::uint64_t contentHash(std::span<const std::byte> bytes) {
     return hash == 0 ? 1 : hash;
 }
 
-constexpr std::array<const char*, 17> HoldReasonNames{"", "unwatched", "late_or_host", "threads", "parked", "driver_page", "label", "snapshot", "storage", "shadow", "queue0", "queued", "awaits_title", "parked_on_title", "driver_page_since_full", "title_wait_unpassed", "wait_dword_in_delta"};
+constexpr std::array<const char*, 19> HoldReasonNames{"", "unwatched", "late_or_host", "threads", "parked", "driver_page", "label", "snapshot", "storage", "shadow", "queue0", "queued", "awaits_title", "parked_on_title", "driver_page_since_full", "title_wait_unpassed", "wait_dword_in_delta", "label_started", "wait_dword_finished"};
+
+constexpr std::array<const char*, 5> StaleClassNames{"queued", "started", "completed", "zero", "title_call"};
+
+std::uint64_t pageHash(std::span<const std::byte> bytes) {
+    const auto hash = static_cast<std::uint64_t>(std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size())));
+    return hash == 0 ? 1 : hash;
+}
+
+std::uint64_t endSkips() {
+    return DriverDetail::submissionCosts(0).endSkipped.load(std::memory_order_relaxed);
+}
 
 }
 
@@ -171,12 +183,31 @@ void FrameRecorder::noteDriverStore(std::uint64_t begin, std::uint64_t end, std:
     std::lock_guard lock(storeMutex);
     if (serial == 0) ++unattributedStores;
     ++driverStores;
+    std::array<std::array<std::uint32_t, StaleClasses>, 2> landed{};
     for (auto page = begin & ~std::uint64_t{HostPageBytes - 1}; page < end; page += HostPageBytes) {
         driverPages[page] = driverStores;
-        if (storeHazard.group != 0 || serial == GuestMemory::TitleCallStoreSerial) continue;
         const auto found = storeOwners.find(page);
-        if (found != storeOwners.end() && (serial == 0 || serial <= found->second.accepted)) storeHazard = {found->second.group, page, serial};
+        if (found == storeOwners.end() || (serial != 0 && serial != GuestMemory::TitleCallStoreSerial && serial > found->second.accepted)) continue;
+        const auto& owner = found->second;
+        const auto started = armedStarted.find(owner.group);
+        const std::size_t kind = serial == GuestMemory::TitleCallStoreSerial ? 4 : serial == 0 ? 3 : serial <= owner.completed ? 2 : (started != armedStarted.end() && std::find(started->second.begin(), started->second.end(), serial) != started->second.end()) ? 1 : 0;
+        landed[(owner.mask >> 4) & 1u][kind] |= (!owner.read ? 4u : owner.same ? 1u : 2u) | (owner.mask == 0 ? 8u : 0u);
+        if (storeHazard.group == 0) storeHazard = {owner.group, page, serial, kind};
     }
+    bool hit = false;
+    for (std::size_t parked = 0; parked < landed.size(); ++parked) {
+        for (std::size_t kind = 0; kind < StaleClasses; ++kind) {
+            const auto flags = landed[parked][kind];
+            if (flags == 0) continue;
+            auto& counts = wouldBeStale[parked][kind];
+            ++counts[0];
+            if ((flags & 7u) == 1u) ++counts[1];
+            if ((flags & 7u) == 4u) ++counts[2];
+            if ((flags & 8u) != 0) ++counts[3];
+            hit = true;
+        }
+    }
+    if (hit) ++staleStores;
 }
 
 std::uint32_t FrameRecorder::holdMask(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks) {
@@ -201,6 +232,16 @@ std::uint32_t FrameRecorder::holdMask(std::span<const std::pair<std::uint64_t, s
     for (const auto& [begin, end] : blocks) {
         if ((mask & (1u << 6)) == 0 && driver.UnfinishedLabelOverlaps(begin, end)) mask |= 1u << 6;
         if ((mask & (1u << 7)) == 0 && Graphics::Recorder::SnapshotWriteOverlaps(begin, static_cast<std::size_t>(end - begin))) mask |= 1u << 7;
+    }
+    if ((mask & (1u << 6)) != 0) {
+        const auto labels = driver.StartedLabelDwords();
+        for (const auto& [begin, end] : blocks) {
+            const auto found = labels.lower_bound(begin - std::min<std::uint64_t>(begin, 3));
+            if (found != labels.end() && *found < end) {
+                mask |= 1u << 17;
+                break;
+            }
+        }
     }
     if (Graphics::StorageTexture::AnyPendingOverlaps(blocks)) mask |= 1u << 8;
     if (Graphics::AnyShadowedOverlaps(blocks)) mask |= 1u << 9;
@@ -249,27 +290,12 @@ void FrameRecorder::recordUnwatched(std::uint64_t address, std::span<const std::
     }
 }
 
-void FrameRecorder::arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted) {
+void FrameRecorder::arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted, std::uint64_t completed, std::span<const std::uint64_t> started, std::uint32_t mask) {
     std::lock_guard lock(storeMutex);
+    armedStarted[group].assign(started.begin(), started.end());
     for (const auto& [begin, end] : blocks) {
-        for (auto page = begin & ~std::uint64_t{HostPageBytes - 1}; page < end; page += HostPageBytes) storeOwners[page] = {group, accepted};
+        for (auto page = begin & ~std::uint64_t{HostPageBytes - 1}; page < end; page += HostPageBytes) storeOwners[page] = {group, accepted, completed, mask, false, false};
     }
-}
-
-bool FrameRecorder::stopOnHazard() {
-    StoreHazard hazard;
-    {
-        std::lock_guard lock(storeMutex);
-        hazard = storeHazard;
-    }
-    if (hazard.group == 0) return false;
-    const auto reason = "stopped: memory delta " + std::to_string(hazard.group) + " was read while submission " + (hazard.serial == 0 ? std::string("(unknown)") : std::to_string(hazard.serial)) + ", in flight at its read, stored into its page 0x" + [&] {
-        char text[32];
-        std::snprintf(text, sizeof text, "%llx", static_cast<unsigned long long>(hazard.page));
-        return std::string(text);
-    }();
-    stop(reason.c_str());
-    return true;
 }
 
 void FrameRecorder::awaitLateStores() {
@@ -379,7 +405,7 @@ void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
         if (reservations.size() > ReservationHistory) reservations.pop_front();
         return;
     }
-    if (state != State::Recording || stopOnHazard()) return;
+    if (state != State::Recording) return;
     callThreads.insert(call.thread);
     const auto entry = DriverDetail::Driver::Get().StartedProgress();
     {
@@ -463,7 +489,7 @@ bool FrameRecorder::recordLocked(FrameCall& call, bool prologueCall, std::span<c
         prologue.push_back(std::move(call));
         return false;
     }
-    if (state != State::Recording || stopOnHazard()) return false;
+    if (state != State::Recording) return false;
     callThreads.insert(call.thread);
     const auto entry = DriverDetail::Driver::Get().StartedProgress();
     const struct Released {
@@ -623,11 +649,12 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         const auto holdsWait = [&](std::span<const std::pair<std::uint64_t, std::uint64_t>> waits) {
             return std::any_of(waits.begin(), waits.end(), [&](const auto& wait) { return std::any_of(blocks.begin(), blocks.end(), [&](const auto& block) { return wait.first < block.second && block.first < wait.second; }); });
         };
-        const auto awaitsTitle = (awaited.title ? 1u << 15 : 0u) | (holdsWait(awaited.unfinished) || holdsWait(finishedWaitDwords) ? 1u << 16 : 0u);
-        const auto mask = holdMask(blocks) | (unwatched.empty() ? 0u : 1u << 1) | (!added.empty() || !hostPages.empty() ? 1u << 2 : 0u) | (callThreads.size() > 1 ? 1u << 3 : 0u) | (entry.queued != 0 ? 1u << 11 : 0u) | (awaitsTitle != 0 ? awaitsTitle | (1u << 12) : 0u);
+        const bool finishedWait = holdsWait(finishedWaitDwords);
+        const auto awaitsTitle = (awaited.title ? 1u << 15 : 0u) | (holdsWait(awaited.unfinished) || finishedWait ? 1u << 16 : 0u);
+        const auto mask = holdMask(blocks) | (unwatched.empty() ? 0u : 1u << 1) | (!added.empty() || !hostPages.empty() ? 1u << 2 : 0u) | (callThreads.size() > 1 ? 1u << 3 : 0u) | (entry.queued != 0 ? 1u << 11 : 0u) | (awaitsTitle != 0 ? awaitsTitle | (1u << 12) : 0u) | (finishedWait ? 1u << 18 : 0u);
         ++holdMasks[mask];
         for (std::size_t reason = 1; reason < holdReasons.size(); ++reason) holdReasons[reason] += (mask >> reason) & 1u;
-        if (mask != 0) {
+        if ((mask & ~((1u << 4) | (1u << 11))) != 0) {
             driver.ReleaseForRecorder();
             if (!driver.WaitSettledFor(std::chrono::seconds(10))) {
                 stop("stopped: the GPU work submitted before a memory delta neither finished nor waited for the title within 10 s");
@@ -636,11 +663,13 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             std::tie(accepted, completed) = driver.SerialProgress();
             ++heldDeltas;
         } else {
-            arm(blocks, group, accepted);
+            arm(blocks, group, accepted, completed, entry.started, mask);
             started = entry.started;
             inFlightRead = true;
             ++inFlightDeltas;
-            ++readDepths[static_cast<std::size_t>(std::min<std::uint64_t>(accepted - completed, readDepths.size() - 1))];
+            const auto depth = static_cast<std::size_t>(std::min<std::uint64_t>(accepted - completed, readDepths.size() - 1));
+            ++readDepths[depth];
+            if ((mask & (1u << 4)) != 0) ++readDepthsLabelParked[depth];
         }
     }
     std::uint64_t stores = 0;
@@ -660,6 +689,23 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             any = true;
         }
     };
+    const auto notePages = [&](std::uint64_t address) {
+        std::unique_lock lock(storeMutex, std::defer_lock);
+        if (inFlightRead) lock.lock();
+        const auto last = address + bytes.size();
+        for (auto page = address & ~std::uint64_t{HostPageBytes - 1}; page < last; page += HostPageBytes) {
+            const auto first = std::max(page, address);
+            const auto hash = pageHash(std::span<const std::byte>(bytes).subspan(first - address, std::min<std::uint64_t>(page + HostPageBytes, last) - first));
+            auto& previous = recordedPages[page];
+            if (inFlightRead) {
+                if (const auto owner = storeOwners.find(page); owner != storeOwners.end() && owner->second.group == group) {
+                    owner->second.read = true;
+                    owner->second.same = previous == hash;
+                }
+            }
+            previous = hash;
+        }
+    };
     for (const auto& range : added) {
         writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
         ranges.push_back(range);
@@ -671,6 +717,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         for (std::uint64_t at = 0; at < range.bytes;) {
             bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
             readGuest(range.address + at, bytes);
+            notePages(range.address + at);
             writeTitleWords(range.address + at, std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; }));
             if (!GuestMemory::Watched(range.address + at, bytes.size())) recordUnwatched(range.address + at, bytes, stores);
             at += bytes.size();
@@ -691,6 +738,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     for (const auto& [begin, end] : blocks) {
         bytes.resize(static_cast<std::size_t>(end - begin));
         readGuest(begin, bytes);
+        notePages(begin);
         if (!GuestMemory::Watched(begin, bytes.size())) {
             const auto key = std::pair{begin, static_cast<std::uint64_t>(bytes.size())};
             if (accepted == completed) {
@@ -843,13 +891,9 @@ bool FrameRecorder::abandonIfDiskLow() {
 void FrameRecorder::stop(const char* reason) {
     warnings.push_back(reason);
     std::fprintf(stderr, "[frame-capture] %s\n", reason);
-    bool hazard = false;
-    {
-        std::lock_guard lock(storeMutex);
-        hazard = storeHazard.group != 0;
-    }
+    if (state == State::Recording) endSkipped = endSkips() - endSkippedAtStart;
     try {
-        if (!hazard) awaitLateStores();
+        awaitLateStores();
         writer->Finish(header());
     } catch (const std::exception& failure) {
         std::fprintf(stderr, "[frame-capture] %s\n", failure.what());
@@ -913,6 +957,7 @@ void FrameRecorder::start() {
     auto begin = make(FrameCallKind::FrameStart);
     begin.ordinal = ++ordinal;
     std::tie(begin.accepted, begin.completed) = driver.SerialProgress();
+    endSkippedAtStart = endSkips();
     begin.values = {boundaries};
     writer->WriteCall(begin);
     state = State::Recording;
@@ -935,9 +980,9 @@ void FrameRecorder::finish() {
     end.ordinal = ++ordinal;
     std::tie(end.accepted, end.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(end);
+    endSkipped = endSkips() - endSkippedAtStart;
     awaitLateStores();
     writeReferenceFrames();
-    if (stopOnHazard()) return;
     writer->Finish(header());
     GuestMemory::SetDriverStoreObserver(nullptr);
     std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
@@ -965,7 +1010,10 @@ std::string FrameRecorder::header() const {
     for (std::size_t depth = 0; depth < submitDepths.size(); ++depth) text += (depth == 0 ? "" : ",") + std::to_string(submitDepths[depth]);
     text += "],\"read_depths\":[";
     for (std::size_t depth = 0; depth < readDepths.size(); ++depth) text += (depth == 0 ? "" : ",") + std::to_string(readDepths[depth]);
-    text += "]";
+    text += "],\"read_depths_label_parked\":[";
+    for (std::size_t depth = 0; depth < readDepthsLabelParked.size(); ++depth) text += (depth == 0 ? "" : ",") + std::to_string(readDepthsLabelParked[depth]);
+    text += "],\"end_skipped\":" + (std::getenv("APS5_PROFILE_DRAW") != nullptr ? std::string("null") : std::to_string(endSkipped));
+    std::string census;
     {
         std::lock_guard lock(storeMutex);
         text += ",\"in_flight_deltas\":" + std::to_string(inFlightDeltas) + ",\"held_deltas\":" + std::to_string(heldDeltas) + ",\"hold_reasons\":{" + [&] {
@@ -989,6 +1037,20 @@ std::string FrameRecorder::header() const {
             }
             return list + "]";
         }() + ",\"stale_delta\":" + std::to_string(storeHazard.group) + ",\"unverified_deltas\":" + std::to_string(unverifiedDeltas) + ",\"unattributed_stores\":" + std::to_string(unattributedStores);
+        static_assert(StaleClassNames.size() == StaleClasses);
+        static_assert(HoldReasonNames.size() == std::tuple_size_v<decltype(holdReasons)>);
+        for (std::size_t parked = 0; parked < wouldBeStale.size(); ++parked) {
+            text += parked == 0 ? ",\"would_be_stale\":{" : ",\"would_be_stale_label_parked\":{";
+            for (std::size_t kind = 0; kind < StaleClasses; ++kind) {
+                const auto& counts = wouldBeStale[parked][kind];
+                text += std::string(kind == 0 ? "\"" : ",\"") + StaleClassNames[kind] + "\":{\"stores\":" + std::to_string(counts[0]) + ",\"same_bytes\":" + std::to_string(counts[1]) + ",\"before_read\":" + std::to_string(counts[2]) + ",\"mask_none\":" + std::to_string(counts[3]) + "}";
+            }
+            text += "}";
+        }
+        text += ",\"would_be_stale_stores\":" + std::to_string(staleStores);
+        char page[32];
+        std::snprintf(page, sizeof page, "%llx", static_cast<unsigned long long>(storeHazard.page));
+        census = "diagnostic: this capture's hold rule ignores queued submissions and queues parked on labels, and " + std::to_string(staleStores) + " stores that landed in memory deltas read in flight were counted in would_be_stale and would_be_stale_label_parked instead of stopping the capture" + (staleStores == 0 ? std::string() : ", the first by submission " + std::to_string(storeHazard.serial) + " (" + StaleClassNames[storeHazard.kind] + ") into page 0x" + page + " of memory delta " + std::to_string(storeHazard.group)) + "; its replay is not trusted unless would_be_stale_stores is 0";
     }
     text += ",\"env\":{";
     bool first = true;
@@ -1002,6 +1064,8 @@ std::string FrameRecorder::header() const {
         text += (first ? "" : ",") + jsonString(warning);
         first = false;
     }
+    text += (first ? "" : ",") + jsonString(census);
+    first = false;
     if (hostOnlySampleBytes != 0) text += (first ? "" : ",") + jsonString(std::to_string(hostOnlySampleBytes) + " bytes under multisampled targets whose samples are only on the host are zero in the capture, so replay starts those targets without their earlier contents");
     return text + "]}\n";
 }

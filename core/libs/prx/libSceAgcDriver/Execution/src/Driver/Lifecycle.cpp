@@ -369,6 +369,22 @@ bool Driver::UnfinishedLabelOverlaps(std::uint64_t begin, std::uint64_t end) {
     return false;
 }
 
+std::set<std::uint64_t> Driver::StartedLabelDwords() {
+    std::lock_guard lock(mutex);
+    std::set<std::uint64_t> labels;
+    for (const auto& [id, worker] : workers) {
+        std::unordered_map<std::uint64_t, std::uint32_t> queued;
+        for (const auto& submission : worker.pending) {
+            for (const auto dword : submission.labelWrites) ++queued[dword];
+        }
+        for (const auto& [dword, count] : worker.unfinishedWrites) {
+            const auto found = queued.find(dword);
+            if (count > (found != queued.end() ? found->second : 0u)) labels.insert(dword);
+        }
+    }
+    return labels;
+}
+
 void Driver::CheckFailure() {
     if (failed.load(std::memory_order_acquire)) {
         std::lock_guard lock(mutex);

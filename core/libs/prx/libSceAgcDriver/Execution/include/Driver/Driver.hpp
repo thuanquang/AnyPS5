@@ -78,6 +78,7 @@ public:
     std::pair<std::uint64_t, std::uint64_t> SerialProgress();
     StartedProgressSnapshot StartedProgress();
     bool UnfinishedLabelOverlaps(std::uint64_t begin, std::uint64_t end);
+    std::set<std::uint64_t> StartedLabelDwords();
     AwaitedDwordsSnapshot TakeAwaitedDwords();
     void TrackAwaitedDwords(bool tracking);
     bool SerialDone(std::uint64_t serial);
