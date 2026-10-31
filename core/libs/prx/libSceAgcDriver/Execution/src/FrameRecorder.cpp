@@ -899,7 +899,14 @@ void FrameRecorder::start() {
 }
 
 void FrameRecorder::finish() {
-    emitDelta();
+    {
+        const auto entry = DriverDetail::Driver::Get().StartedProgress();
+        const struct Released {
+            Released() { DriverDetail::Driver::Get().HoldForRecorder(); }
+            ~Released() { DriverDetail::Driver::Get().ReleaseForRecorder(); }
+        } released;
+        emitDelta(&entry);
+    }
     if (!writer) return;
     auto end = make(FrameCallKind::End);
     end.ordinal = ++ordinal;
