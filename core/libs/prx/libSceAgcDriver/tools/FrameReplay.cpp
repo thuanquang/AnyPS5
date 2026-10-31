@@ -489,6 +489,7 @@ struct Replay {
             const SettledHold hold{pacing};
             paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
             if (!settled && options.strict) throw std::runtime_error("frame replay: the replay did not settle before memory delta " + std::to_string(call.ordinal));
+            if (pacing) waitCompletedOnGpu(call);
             restoreGroup(call.values.at(0));
             return;
         }
@@ -504,6 +505,14 @@ struct Replay {
         return wait.function == 0 && wait.bytes == 0;
     }
 
+    void waitCompletedOnGpu(const FrameCall& call) {
+        const auto began = Clock::now();
+        const auto completed = progress().second;
+        const bool ran = AgcDriverWaitSerialsOnGpuFor_nid_postfix(&completed, 1, options.busyTimeout.count());
+        memoryGpuWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+        if (!ran) throw std::runtime_error("frame replay: the GPU work of submission " + std::to_string(completed) + " did not finish before memory delta " + std::to_string(call.ordinal));
+    }
+
     void restoreGroup(std::uint64_t group) {
         const auto found = groups.find(group);
         if (found == groups.end()) return;
@@ -514,24 +523,38 @@ struct Replay {
             if (rewindWait(awaited[slot])) parked.push_back(awaited[slot].address);
         }
         std::vector<std::pair<std::uint32_t*, std::uint32_t>> controls;
-        for (const auto* chunk : found->second) {
-            if (skipped.Overlaps(*chunk)) continue;
-            auto bytes = reader.Read(*chunk);
-            auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk->address));
-            for (auto at = static_cast<std::size_t>((4 - chunk->address % 4) % 4); at + 4 <= bytes.size(); at += 4) {
-                std::uint32_t value = 0;
-                std::memcpy(&value, bytes.data() + at, sizeof(value));
-                if ((value & AgcDriver::Pm4::RewindValid) == 0) continue;
-                std::uint32_t header = 0;
-                if (at >= 4) std::memcpy(&header, bytes.data() + at - 4, sizeof(header));
-                const bool rewind = (header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x59u;
-                if (!rewind && std::find(parked.begin(), parked.end(), chunk->address + at) == parked.end()) continue;
-                controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
-                std::memcpy(bytes.data() + at, target + at, sizeof(value));
+        const auto& chunks = found->second;
+        for (std::size_t first = 0; first < chunks.size();) {
+            if (skipped.Overlaps(*chunks[first])) {
+                ++first;
+                continue;
             }
-            AgcDriverPrepareCommandWrite_nid_no_patch(chunk->address, static_cast<std::size_t>(chunk->bytes));
-            std::memcpy(target, bytes.data(), bytes.size());
-            deltaBytes += chunk->bytes;
+            auto last = first + 1;
+            auto end = chunks[first]->address + chunks[first]->bytes;
+            while (last < chunks.size() && chunks[last]->address == end && !skipped.Overlaps(*chunks[last])) {
+                end += chunks[last]->bytes;
+                ++last;
+            }
+            AgcDriverPrepareGuestStore_nid_postfix(chunks[first]->address, static_cast<std::size_t>(end - chunks[first]->address));
+            for (auto index = first; index < last; ++index) {
+                const auto* const chunk = chunks[index];
+                auto bytes = reader.Read(*chunk);
+                auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk->address));
+                for (auto at = static_cast<std::size_t>((4 - chunk->address % 4) % 4); at + 4 <= bytes.size(); at += 4) {
+                    std::uint32_t value = 0;
+                    std::memcpy(&value, bytes.data() + at, sizeof(value));
+                    if ((value & AgcDriver::Pm4::RewindValid) == 0) continue;
+                    std::uint32_t header = 0;
+                    if (at >= 4) std::memcpy(&header, bytes.data() + at - 4, sizeof(header));
+                    const bool rewind = (header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x59u;
+                    if (!rewind && std::find(parked.begin(), parked.end(), chunk->address + at) == parked.end()) continue;
+                    controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
+                    std::memcpy(bytes.data() + at, target + at, sizeof(value));
+                }
+                std::memcpy(target, bytes.data(), bytes.size());
+                deltaBytes += chunk->bytes;
+            }
+            first = last;
         }
         for (const auto& [control, value] : controls) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
     }
@@ -547,6 +570,7 @@ struct Replay {
             std::memcpy(&value, bytes.data() + (wait.address - chunk->address), sizeof(value));
             if ((value & AgcDriver::Pm4::RewindValid) == 0 || !AgcDriverHoldSettled_nid_postfix(0)) return false;
             const SettledHold hold{true};
+            waitCompletedOnGpu(call);
             restoreGroup(call.values.at(0));
             return true;
         }
