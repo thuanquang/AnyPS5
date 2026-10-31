@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -49,14 +51,40 @@ FrameTiming* Driver::includeTimingSubmission(const Submission& submission, bool 
     return frame;
 }
 
-void Driver::markCompleted(std::uint64_t serial) {
+void Driver::markCompleted(std::uint64_t serial, std::uint64_t epoch) {
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f completed serial=%llu (in order up to %llu)\n", TraceMs(), static_cast<unsigned long long>(serial), static_cast<unsigned long long>(completed));
     completedOutOfOrder.insert(serial);
+    outOfOrderEpochs[serial] = epoch;
     while (!completedOutOfOrder.empty() && *completedOutOfOrder.begin() == completed + 1) {
         completed = *completedOutOfOrder.begin();
         completedOutOfOrder.erase(completedOutOfOrder.begin());
+        const auto found = outOfOrderEpochs.find(completed);
+        completedEpochPrefix.push_back(std::max(completedEpochPrefix.empty() ? std::uint64_t{0} : completedEpochPrefix.back(), found->second));
+        outOfOrderEpochs.erase(found);
+        if (completedEpochPrefix.size() > CompletedEpochHistory) completedEpochPrefix.pop_front();
     }
+}
+
+std::uint64_t Driver::coveringEpoch() {
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    auto* const recorder = Graphics::Recorder::Active();
+    if (recorder == nullptr) return 0;
+    if (const auto open = recorder->OpenBatchSerial(); open != 0) return open;
+    return recorder->NewestSubmitted();
+}
+
+std::uint64_t Driver::completedEpoch(std::uint64_t serial) const {
+    if (serial == 0) return 0;
+    if (serial > completed) {
+        const auto found = outOfOrderEpochs.find(serial);
+        if (found == outOfOrderEpochs.end()) throw std::runtime_error("the GPU order of unfinished submission " + std::to_string(serial) + " is not known");
+        return found->second;
+    }
+    const auto behind = completed - serial;
+    if (behind >= completedEpochPrefix.size()) throw std::runtime_error("the GPU order of submission " + std::to_string(serial) + " is no longer known");
+    return completedEpochPrefix[completedEpochPrefix.size() - 1 - static_cast<std::size_t>(behind)];
 }
 
 bool& Driver::completionDeferred() {
@@ -104,11 +132,12 @@ void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, st
         Driver& driver;
         std::uint64_t serial, received;
         std::span<const std::uint64_t> labelWrites;
+        std::uint64_t epoch = 0;
         ~Complete() {
             bool notify = true;
             {
                 std::lock_guard lock(driver.mutex);
-                driver.markCompleted(serial);
+                driver.markCompleted(serial, epoch);
                 driver.forgetUnfinishedWrites(driver.workers.at(0), labelWrites);
                 const auto found = std::find(driver.queue0Uncommitted.begin(), driver.queue0Uncommitted.end(), received);
                 if (found != driver.queue0Uncommitted.end()) driver.queue0Uncommitted.erase(found);
@@ -116,8 +145,9 @@ void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, st
             }
             if (notify) driver.changed.notify_all();
         }
-    } complete{*this, serial, received, labelWrites};
+    } complete{*this, serial, received, labelWrites, 0};
     submitOpenWork(progress);
+    complete.epoch = coveringEpoch();
 }
 
 const std::atomic<std::uint64_t>*& Driver::workerQueued() {
@@ -288,12 +318,13 @@ void Driver::run(std::uint32_t id) noexcept {
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             PerformanceContext completionContext(id == 0 ? frameTiming() : FrameTiming::Async());
             PerformanceTimer completionTiming("Driver.Completion");
+            const std::uint64_t epoch = completionDeferred() ? 0 : coveringEpoch();
             bool notify = true;
             {
                 std::lock_guard lock(mutex);
                 rethrowFailure();
                 if (!std::exchange(completionDeferred(), false)) {
-                    markCompleted(submission.serial);
+                    markCompleted(submission.serial, epoch);
                     forgetUnfinishedWrites(workers.at(id), submission);
                 }
                 if (id == 0) queue0Executing = 0;

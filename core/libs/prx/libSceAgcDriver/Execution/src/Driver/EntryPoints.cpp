@@ -173,6 +173,15 @@ extern "C" bool AgcDriverSettled_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().Settled();
 }
 
+extern "C" bool AgcDriverWaitSerialsOnGpuFor_nid_postfix(const std::uint64_t* serials, std::size_t count, std::int64_t milliseconds) {
+    return AgcDriver::DriverDetail::Driver::Get().WaitSerialsOnGpuFor(std::span<const std::uint64_t>(serials, count), std::chrono::milliseconds(milliseconds));
+}
+
+extern "C" void AgcDriverPrepareGuestStore_nid_postfix(std::uint64_t address, std::size_t bytes) {
+    const AgcDriver::GuestMemory::ReadSiteScope site(AgcDriver::GuestMemory::ReadSite::Store);
+    AgcDriver::GuestMemory::FlushGpuWrites(address, bytes);
+}
+
 extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {
     auto* const recorder = AgcDriver::FrameRecorder::Active();
     if (recorder == nullptr) {

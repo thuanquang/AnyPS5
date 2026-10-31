@@ -82,6 +82,7 @@ public:
     bool WaitSettledFor(std::chrono::milliseconds timeout);
     void ReleaseSettled();
     bool Settled();
+    bool WaitSerialsOnGpuFor(std::span<const std::uint64_t> serials, std::chrono::milliseconds timeout);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void AttachWindow(const PresentationWindow& window);
@@ -377,7 +378,9 @@ private:
     void execute(const Submission& submission);
     void deliverGuestEopInterrupt(std::uint32_t queue);
     void deliverFlipEopInterrupt(std::uint32_t queue);
-    void markCompleted(std::uint64_t serial);
+    void markCompleted(std::uint64_t serial, std::uint64_t epoch);
+    std::uint64_t coveringEpoch();
+    std::uint64_t completedEpoch(std::uint64_t serial) const;
     static const std::atomic<std::uint64_t>*& workerQueued();
     void reapCompletionLabels();
     void run(std::uint32_t id) noexcept;
@@ -472,6 +475,9 @@ private:
     std::uint64_t accepted = 0;
     std::uint64_t completed = 0;
     std::set<std::uint64_t> completedOutOfOrder;
+    static constexpr std::size_t CompletedEpochHistory = 4096;
+    std::map<std::uint64_t, std::uint64_t> outOfOrderEpochs;
+    std::deque<std::uint64_t> completedEpochPrefix;
     std::exception_ptr failure;
 
     std::atomic<bool> failed{false};

@@ -16,12 +16,14 @@
 #include "ShaderDiskCache.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cerrno>
 #include <exception>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 #ifdef _WIN32
@@ -294,6 +296,35 @@ void Driver::ReleaseSettled() {
         captureHold.store(false, std::memory_order_relaxed);
     }
     changed.notify_all();
+}
+
+bool Driver::WaitSerialsOnGpuFor(std::span<const std::uint64_t> serials, std::chrono::milliseconds timeout) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::uint64_t epoch = 0;
+    {
+        std::unique_lock lock(mutex);
+        const auto done = [&](std::uint64_t serial) { return serial <= completed || completedOutOfOrder.contains(serial); };
+        ++idleWaiters;
+        const bool finished = changed.wait_until(lock, deadline, [&] { return failure != nullptr || stopping || std::all_of(serials.begin(), serials.end(), done); });
+        --idleWaiters;
+        rethrowFailure();
+        checkStopping();
+        if (!finished) return false;
+        for (const auto serial : serials) epoch = std::max(epoch, completedEpoch(serial));
+    }
+    if (epoch == 0) return true;
+    const auto localDevice = device.Load();
+    if (localDevice == nullptr) throw std::runtime_error("GPU batch " + std::to_string(epoch) + " of a completed submission has no device");
+    if (localDevice->SubmittedEpoch() < epoch) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (localDevice->SubmittedEpoch() < epoch) localDevice->SubmitRecorded(false);
+    }
+    if (localDevice->SubmittedEpoch() < epoch) throw std::runtime_error("GPU batch " + std::to_string(epoch) + " of a completed submission was never submitted");
+    if (!localDevice->CanWaitUnlocked()) throw std::runtime_error("waiting for GPU batch " + std::to_string(epoch) + " of a completed submission needs timeline semaphores");
+    const auto remaining = std::max(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
+    return localDevice->WaitRecordedFor(epoch, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count()));
 }
 
 std::vector<AwaitedWait> Driver::AwaitedWaits() {
