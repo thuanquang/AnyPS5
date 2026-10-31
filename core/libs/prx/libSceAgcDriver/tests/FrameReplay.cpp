@@ -1296,14 +1296,45 @@ bool awaits(const std::uint32_t* word) {
     return std::any_of(waits.begin(), waits.begin() + static_cast<std::ptrdiff_t>(count), [&](const auto& wait) { return wait.address == at(word); });
 }
 
-Packet awaitingCopy(const Layout& busy, const Layout& layout, const std::uint32_t* flag, bool waitFirst) {
+enum class WaitKind { Wait32, Wait64, Semaphore, Rewind };
+
+std::uint32_t* emitAwait(CommandBuffer& buffer, WaitKind kind, std::byte* flag) {
+    switch (kind) {
+    case WaitKind::Wait32:
+        sceAgcDcbWaitRegMem(&buffer, 0, 3, 0, 0, flag, Done, 0xffffffffu, 0);
+        return reinterpret_cast<std::uint32_t*>(flag);
+    case WaitKind::Wait64:
+        sceAgcDcbWaitRegMem(&buffer, 1, 3, 0, 0, flag, Done, ~std::uint64_t{0}, 0);
+        return reinterpret_cast<std::uint32_t*>(flag);
+    case WaitKind::Semaphore:
+        sceAgcDcbMemSemaphore(&buffer, flag, 0, 0, 7);
+        return reinterpret_cast<std::uint32_t*>(flag);
+    case WaitKind::Rewind:
+        return sceAgcDcbRewind(&buffer, 0) + 1;
+    }
+    throw std::logic_error("unknown wait kind");
+}
+
+void passAwait(WaitKind kind, std::uint32_t* word) {
+    if (kind == WaitKind::Rewind) release(word);
+    else if (kind == WaitKind::Wait32) std::atomic_ref<std::uint32_t>(*word).store(Done, std::memory_order_release);
+    else std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(word)).store(Done, std::memory_order_release);
+}
+
+Packet awaitingCopy(const Layout& busy, const Layout& layout, const std::function<void(CommandBuffer&)>& wait, bool waitFirst) {
     auto* const words = reinterpret_cast<std::uint32_t*>(busy.base);
-    CommandBuffer buffer{words, words + BlockBytes / sizeof(std::uint32_t), words, words + BlockBytes / sizeof(std::uint32_t), nullptr, nullptr, 0};
-    if (waitFirst) sceAgcDcbWaitRegMem(&buffer, 0, 3, 0, 0, flag, Done, 0xffffffffu, 0);
-    for (std::uint32_t index = 0; index < BusyWrites; ++index) writeDone(buffer, layout.label);
-    if (!waitFirst) sceAgcDcbWaitRegMem(&buffer, 0, 3, 0, 0, flag, Done, 0xffffffffu, 0);
+    auto* const end = reinterpret_cast<std::uint32_t*>(busy.base + BusyLabels);
+    CommandBuffer buffer{words, end, words, end, nullptr, nullptr, 0};
+    const auto* const label = reinterpret_cast<const std::uint32_t*>(busy.base + BusyLabels);
+    if (waitFirst) wait(buffer);
+    for (std::uint32_t index = 0; index < BusyWrites; ++index) writeDone(buffer, label);
+    if (!waitFirst) wait(buffer);
     sceAgcDcbDmaData(&buffer, 0, DmaMemory, 0, at(layout.firstTarget), DmaMemory, 0, at(layout.source), DataBytes, 0, 1, 0);
     return Packet{words, static_cast<std::uint32_t>(buffer.cursor_up - words), 0, {}};
+}
+
+Packet warmingPacket(const Layout& busy) {
+    return labelPacket(reinterpret_cast<std::uint32_t*>(busy.base + BusyLabels + CommandBytes), reinterpret_cast<const std::uint32_t*>(busy.base + BusyLabels) + 1);
 }
 
 void submitLabel(std::uint32_t* words, const std::uint32_t* label) {
@@ -1331,41 +1362,79 @@ void checkTitleWaitsHeld(const std::filesystem::path& tool, const Packet& awaiti
     check(replayed(tool, capture, target, DataBytes, " --no-release") == copied, "the replay did not copy the title's store after the submission passed its wait on the title's flag");
 }
 
-void testWaitAfterRead(const std::filesystem::path& tool) {
+void checkNeverReadInFlight(const Packet& awaiting) {
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    const auto& header = reader.Header();
+    const auto& calls = reader.Calls();
+    const auto submit = std::find_if(calls.begin(), calls.end(), [&](const auto& call) { return call.kind == FrameCallKind::Submit && call.address == at(awaiting.addr); });
+    check(submit != calls.end(), "the capture does not hold the submission that waits on the title's semaphore");
+    const auto serial = submit->accepted + 1;
+    check(std::none_of(calls.begin(), calls.end(), [&](const auto& call) { return call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0 && std::find(call.values.begin() + 1, call.values.end(), serial) != call.values.end(); }), "the capture read a memory delta in flight while submission " + std::to_string(serial) + ", in flight at the read, still waited on the semaphore the title signals: " + header);
+    check(jsonCount(jsonCounts(jsonObject(header, "hold_reasons")), "awaits_title", header) >= 1, "the capture did not count the submission's semaphore wait as a hold reason: " + header);
+}
+
+void checkAwaitAfterRead(const std::filesystem::path& tool, WaitKind kind, std::uint8_t seed) {
     const auto layout = allocate();
     const auto busy = allocate();
-    auto* const flag = reinterpret_cast<std::uint32_t*>(layout.secondTarget);
-    const auto copied = pattern(83);
-    const auto awaiting = awaitingCopy(busy, layout, flag, false);
+    for (const auto* touched : {&layout, &busy}) std::memset(touched->base, 0, BlockBytes);
+    std::uint32_t* word = nullptr;
+    const auto awaiting = awaitingCopy(busy, layout, [&](CommandBuffer& buffer) { word = emitAwait(buffer, kind, layout.secondTarget); }, false);
+    const auto warming = warmingPacket(busy);
+    const auto copied = pattern(seed);
     auto output = std::make_shared<Output>();
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
 
     flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
     check(sceAgcDriverSubmitDcb(&awaiting) == 0, "the submission that waits on the title's flag failed");
     awaitStarted();
-    if (awaits(flag)) throw Inconclusive("the submission reached its wait on the title's flag before the title's next call; raise BusyWrites");
+    if (awaits(word)) throw Inconclusive("the submission reached its wait on the title's flag before the title's next call; raise BusyWrites");
     std::memcpy(layout.source, copied.data(), copied.size());
     submitLabel(layout.firstCommands, layout.label + 2);
-    std::atomic_ref<std::uint32_t>(*flag).store(Done, std::memory_order_release);
+    passAwait(kind, word);
     submitLabel(layout.secondCommands, layout.label + 3);
     AgcDriverWaitIdle_nid_postfix();
     check(equal(layout.firstTarget, copied), "the driver did not copy the title's store after the title stored the flag");
     flip();
     flip();
     AgcDriverWaitIdle_nid_postfix();
-    checkTitleWaitsHeld(tool, awaiting, layout.firstTarget, copied);
+    if (kind == WaitKind::Semaphore) checkNeverReadInFlight(awaiting);
+    else checkTitleWaitsHeld(tool, awaiting, layout.firstTarget, copied);
+}
+
+void testWaitAfterRead(const std::filesystem::path& tool) {
+    checkAwaitAfterRead(tool, WaitKind::Wait32, 83);
+}
+
+void testWait64AfterRead(const std::filesystem::path& tool) {
+    checkAwaitAfterRead(tool, WaitKind::Wait64, 101);
+}
+
+void testSemaphoreAfterRead(const std::filesystem::path& tool) {
+    checkAwaitAfterRead(tool, WaitKind::Semaphore, 103);
+}
+
+void testRewindAfterRead(const std::filesystem::path& tool) {
+    checkAwaitAfterRead(tool, WaitKind::Rewind, 107);
 }
 
 void testWaitBeforeRead(const std::filesystem::path& tool) {
     const auto layout = allocate();
     const auto busy = allocate();
+    for (const auto* touched : {&layout, &busy}) std::memset(touched->base, 0, BlockBytes);
     auto* const flag = reinterpret_cast<std::uint32_t*>(layout.secondTarget);
     const auto copied = pattern(89);
-    const auto awaiting = awaitingCopy(busy, layout, flag, true);
+    const auto awaiting = awaitingCopy(busy, layout, [&](CommandBuffer& buffer) { emitAwait(buffer, WaitKind::Wait32, layout.secondTarget); }, true);
+    const auto warming = warmingPacket(busy);
     auto output = std::make_shared<Output>();
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
 
     flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
     check(sceAgcDriverSubmitDcb(&awaiting) == 0, "the submission that waits on the title's flag failed");
     waitUntil([&] { return awaits(flag); }, "the submission never waited on the title's flag");
     std::memcpy(layout.source, copied.data(), copied.size());
@@ -1493,9 +1562,9 @@ void testFillClearedBeforeRange(const std::filesystem::path& tool) {
 int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
-        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}};
+        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}, {"wait64_after_read", testWait64AfterRead}, {"semaphore_after_read", testSemaphoreAfterRead}, {"rewind_after_read", testRewindAfterRead}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|in_flight_gate]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read]\n");
         return 2;
     }
     int status = 0;
