@@ -2,7 +2,9 @@
 #include "../tools/FrameReplay.cpp"
 #undef main
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <barrier>
 #include <new>
@@ -16,6 +18,10 @@ constexpr std::uint32_t ReadWrite = 0x04;
 void check(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
 }
+
+struct Inconclusive : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 std::uint64_t address(const void* pointer) {
     return reinterpret_cast<std::uintptr_t>(pointer);
@@ -452,6 +458,121 @@ void writeInspectionCapture(const std::filesystem::path& directory) {
     writer.Finish("{}");
 }
 
+std::uint32_t low(const void* pointer) {
+    return static_cast<std::uint32_t>(address(pointer));
+}
+
+std::uint32_t high(const void* pointer) {
+    return static_cast<std::uint32_t>(address(pointer) >> 32u);
+}
+
+bool copySourcePending(std::uint64_t source, std::size_t bytes) {
+    using AgcDriver::Graphics::Recorder;
+    constexpr auto kind = static_cast<std::size_t>(Recorder::ReadKind::CopySource);
+    const auto before = Recorder::ReadCounts().hits[kind];
+    std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+    const auto* const recorder = Recorder::Active();
+    return recorder != nullptr && recorder->PendingReadOverlaps(source, bytes) && Recorder::ReadCounts().hits[kind] > before;
+}
+
+void testGpuGate(const std::filesystem::path& directory) {
+    constexpr std::size_t BulkBytes = std::size_t{48} << 20u;
+    constexpr std::size_t Bulks = 4;
+    constexpr std::size_t CopyBytes = 128u * 1024u;
+    constexpr std::uint32_t DmaHeader = 0xc0055000u;
+    constexpr std::uint32_t DmaMemoryToMemory = 0x80000000u;
+    AgcDriverWaitForPipelineJournal_nid_postfix();
+    auto* bulk = allocate(BulkBytes * (Bulks + 1));
+    auto* source = allocate(CopyBytes);
+    auto* target = allocate(CopyBytes);
+    auto* words = reinterpret_cast<std::uint32_t*>(allocate(65536, false));
+    std::fill_n(bulk, BulkBytes, std::byte{0x33});
+    std::fill_n(source, CopyBytes, std::byte{0x11});
+    std::fill_n(target, CopyBytes, std::byte{0});
+    std::size_t used = 0;
+    const auto dma = [&](const std::byte* from, const std::byte* to, std::size_t bytes) {
+        const std::array<std::uint32_t, 7> packet{DmaHeader, DmaMemoryToMemory, low(from), high(from), low(to), high(to), static_cast<std::uint32_t>(bytes)};
+        std::copy(packet.begin(), packet.end(), words + used);
+        used += packet.size();
+    };
+    for (std::size_t copy = 1; copy <= Bulks; ++copy) dma(bulk, bulk + copy * BulkBytes, BulkBytes);
+    dma(source, target, CopyBytes);
+    const std::vector<std::byte> rewritten(CopyBytes, std::byte{0x22});
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(source), rewritten);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    FrameCall submit;
+    submit.kind = FrameCallKind::Submit;
+    submit.thread = 1;
+    submit.address = address(words);
+    submit.size = used;
+    replay.execute(submit);
+    check(AgcDriverHoldSettled_nid_postfix(10000), "the copies did not complete on the CPU");
+    const bool pending = copySourcePending(address(source), CopyBytes);
+    AgcDriverReleaseSettled_nid_postfix();
+    if (!pending) {
+        AgcDriverWaitIdle_nid_postfix();
+        throw Inconclusive("inconclusive: no GPU copy read the restored range in place after its submission completed on the CPU");
+    }
+    replay.execute(memoryCall(1, 1));
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::equal(rewritten.begin(), rewritten.end(), source), "the held delta was not restored");
+    check(std::all_of(target, target + CopyBytes, [](std::byte value) { return value == std::byte{0x11}; }), "the held delta was restored before the GPU copy that reads its range ran");
+    check(replay.memoryGpuWaitedNs.load() > 0, "the held delta did not wait for the GPU");
+}
+
+struct PendingResults {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::byte value{};
+    std::atomic<bool> pending{false};
+};
+
+PendingResults& pendingResults() {
+    static PendingResults results;
+    return results;
+}
+
+void storePendingResults(std::uint64_t access, std::size_t bytes) {
+    auto& results = pendingResults();
+    if (access >= results.address + results.bytes || results.address >= access + bytes || !results.pending.exchange(false)) return;
+    std::fill_n(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(results.address)), results.bytes, results.value);
+}
+
+void testRestorePendingStore(const std::filesystem::path& directory) {
+    constexpr std::size_t Page = 4096;
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* page = bytes + Page;
+    std::fill_n(bytes, FrameCaptureWriter::BlockBytes, std::byte{0x11});
+    const std::vector<std::byte> rewritten(Page, std::byte{0x22});
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(page), rewritten);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    auto& results = pendingResults();
+    results.address = address(page);
+    results.bytes = Page;
+    results.value = std::byte{0x5a};
+    results.pending.store(true);
+    AgcDriver::GuestMemory::SetFlushHook(&storePendingResults);
+    replay.execute(memoryCall(1, 1));
+    AgcDriver::GuestMemory::FlushGpuWrites(address(page), Page);
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+    check(!results.pending.load(), "the results pending over the restored page were never stored");
+    check(std::equal(rewritten.begin(), rewritten.end(), page), "results pending over a held restore landed after it");
+}
+
 void testColdPipelines() {
     const auto* inherited = std::getenv("APS5_HEADLESS_PIPELINE_CACHE");
     check(inherited != nullptr && std::string_view(inherited) == "1", "pipeline cache setting was not inherited");
@@ -495,10 +616,16 @@ int main(int argc, char** argv) {
         else if (mode == "blocking") testBlockingSubmission(directory);
         else if (mode == "environment") testColdPipelines();
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
+        else if (mode == "gpu_gate") testGpuGate(directory);
+        else if (mode == "restore_pending_store") testRestorePendingStore(directory);
         else throw std::runtime_error("unknown test");
         if (mode != "reservation_failure") AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");
         return 0;
+    } catch (const Inconclusive& error) {
+        std::puts(error.what());
+        try { AgcDriverShutdown_nid_postfix(); } catch (...) {}
+        return 77;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         try { AgcDriverShutdown_nid_postfix(); } catch (...) {}
