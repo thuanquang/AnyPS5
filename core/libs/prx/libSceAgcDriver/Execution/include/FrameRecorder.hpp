@@ -82,6 +82,7 @@ private:
     void recordUnwatched(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stores);
     void arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted);
     bool stopOnHazard();
+    void awaitLateStores();
 
     struct Range {
         std::uint64_t address = 0;
@@ -170,6 +171,7 @@ private:
     std::unordered_map<std::uint64_t, StoreOwner> storeOwners;
     StoreHazard storeHazard;
     std::uint64_t unattributedStores = 0;
+    std::uint64_t unverifiedDeltas = 0;
     std::uint64_t inFlightDeltas = 0;
     std::uint64_t heldDeltas = 0;
     std::array<std::uint64_t, 12> holdReasons{};

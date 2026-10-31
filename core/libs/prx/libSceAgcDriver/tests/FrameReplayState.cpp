@@ -420,6 +420,8 @@ void testUnverifiedDeltas(const std::filesystem::path& directory) {
     check(verified.empty(), ("the replay refused a capture whose memory delta read in flight was verified: " + verified).c_str());
     const auto held = refusal("held", false, arena + ",\"unverified_deltas\":1,\"warnings\":[\"stopped: less than 4 GiB free on the capture volume\"]}");
     check(held.empty(), ("the replay refused a capture without memory deltas read in flight: " + held).c_str());
+    const auto unheaded = refusal("unheaded", false, std::nullopt);
+    check(unheaded.find("capture.json is missing") != std::string::npos, ("the replay did not refuse capture unheaded, which has no memory delta read in flight but no capture.json either, so its last records may name memory that was never written: " + unheaded).c_str());
 }
 
 void testShaderCode(const std::filesystem::path& directory, bool host) {

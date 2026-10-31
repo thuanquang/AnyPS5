@@ -1120,6 +1120,68 @@ void testHoldDiagnostics(const std::filesystem::path& tool) {
     check(line.find("\"in_flight_max\":2,") != std::string::npos, "the replay did not report the two submissions in flight behind the parked gate: " + line);
 }
 
+void testStoreAfterLastFrame(const std::filesystem::path& tool) {
+    constexpr std::uint32_t ComputeQueue = 0x20;
+    constexpr std::size_t Labels = 20000;
+    constexpr std::size_t Copied = DataBytes / 2;
+    const auto layout = allocate();
+    const auto stream = allocate();
+    const auto page = allocate();
+    const auto copied = pattern(29);
+    const auto stored = pattern(61);
+    std::memcpy(layout.source, copied.data(), copied.size());
+    const std::array<std::uint32_t, 2> nop{0xc0001000u, 0u};
+    std::memcpy(layout.firstCommands, nop.data(), sizeof(nop));
+    std::memcpy(layout.secondCommands, nop.data(), sizeof(nop));
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    Packet warm{layout.firstCommands, static_cast<std::uint32_t>(nop.size()), 0, {}};
+    for (int pass = 0; pass < 2; ++pass) {
+        check(sceAgcDriverSubmitDcb(&warm) == 0, "the empty graphics submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+    }
+    auto* const words = reinterpret_cast<std::uint32_t*>(stream.base);
+    CommandBuffer slow{words, words + BlockBytes / sizeof(std::uint32_t), words, words + BlockBytes / sizeof(std::uint32_t), nullptr, nullptr, 0};
+    for (std::size_t index = 0; index < Labels; ++index) writeDone(slow, layout.label);
+    sceAgcDcbDmaData(&slow, 0, DmaMemory, 0, at(page.source), DmaMemory, 0, at(layout.source), Copied, 0, 1, 0);
+    Packet labels{words, static_cast<std::uint32_t>(slow.cursor_up - words), 0, {}};
+    check(sceAgcDriverSubmitDcb(&labels) == 0, "the submission of labels followed by a copy failed");
+    awaitStarted();
+    std::memcpy(page.source + Copied, stored.data() + Copied, DataBytes - Copied);
+    Packet empty{layout.secondCommands, static_cast<std::uint32_t>(nop.size()), 0, {}};
+    check(sceAgcDriverSubmitAcb(ComputeQueue, &empty) == 0, "the empty compute submission failed");
+    awaitStarted();
+    flip();
+    const bool observed = AgcDriver::GuestMemory::DriverStoreObserved();
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::memcmp(page.source, copied.data(), Copied) == 0 && std::memcmp(page.source + Copied, stored.data() + Copied, DataBytes - Copied) == 0, "the driver did not copy into the half of the page the title did not store into");
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    const auto& header = reader.Header();
+    check(!header.empty(), "the capture has no capture.json");
+    std::vector<std::uint64_t> flagged;
+    for (const auto& call : reader.Calls()) {
+        if (call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0 && !call.values.empty()) flagged.push_back(call.values.front());
+    }
+    if (flagged.empty()) throw Inconclusive("the labels finished before a delta holding the title's half of the page was read, or the capture held every such delta: " + header);
+    const auto number = [&](const std::string& key) -> std::uint64_t {
+        const auto found = header.find("\"" + key + "\":");
+        return found == std::string::npos ? 0 : std::stoull(header.substr(found + key.size() + 3));
+    };
+    check(std::find(flagged.begin(), flagged.end(), number("stale_delta")) != flagged.end() || number("unverified_deltas") != 0, "the copy behind the labels stored into the page of a delta read while it was in flight, after the capture's last frame, and the capture was kept with no delta stale or unverified: " + header);
+    const auto log = std::filesystem::path(directory) / "late store.log";
+    auto command = "\"" + tool.string() + "\" \"" + std::string(directory) + "\" > \"" + (std::filesystem::path(directory) / "late store.json").string() + "\" 2> \"" + log.string() + "\"";
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+#endif
+    check(std::system(command.c_str()) != 0, "the replay accepted a capture whose delta read in flight was never checked against the stores that landed after its last frame");
+    check(!observed, "the frame recorder still observed the driver's stores after the capture ended");
+}
+
 void testFillClearedBeforeRange(const std::filesystem::path& tool) {
     constexpr std::uint32_t Filled = 0x5a5a5a5au;
     const auto layout = allocate();
@@ -1154,9 +1216,9 @@ void testFillClearedBeforeRange(const std::filesystem::path& tool) {
 int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
-        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}};
+        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|in_flight_store|hold_diagnostics]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|in_flight_store|hold_diagnostics|late_store]\n");
         return 2;
     }
     int status = 0;
