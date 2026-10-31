@@ -1026,6 +1026,100 @@ void testStoreIntoDeltaReadInFlight(const std::filesystem::path& tool) {
     check(std::system(command.c_str()) != 0, "the replay accepted a capture with a stale delta");
 }
 
+std::string jsonObject(const std::string& text, const std::string& name) {
+    const auto key = text.find("\"" + name + "\":{");
+    check(key != std::string::npos, "the JSON has no object " + name + ": " + text);
+    const auto open = key + name.size() + 4;
+    const auto close = text.find('}', open);
+    check(close != std::string::npos, "the JSON object " + name + " is not closed: " + text);
+    return text.substr(open, close - open);
+}
+
+std::map<std::string, std::uint64_t> jsonCounts(const std::string& members) {
+    std::map<std::string, std::uint64_t> counts;
+    for (std::size_t cursor = 0; cursor < members.size();) {
+        const auto colon = members.find("\":", cursor);
+        check(members[cursor] == '"' && colon != std::string::npos, "not a list of JSON counts: " + members);
+        const auto end = std::min(members.find(',', colon), members.size());
+        counts[members.substr(cursor + 1, colon - cursor - 1)] = std::stoull(members.substr(colon + 2, end - colon - 2));
+        cursor = end + 1;
+    }
+    return counts;
+}
+
+std::uint64_t jsonCount(const std::map<std::string, std::uint64_t>& counts, const std::string& key, const std::string& text) {
+    const auto found = counts.find(key);
+    check(found != counts.end(), "the JSON has no count " + key + ": " + text);
+    return found->second;
+}
+
+void testHoldDiagnostics(const std::filesystem::path& tool) {
+    constexpr std::uint32_t Stored = 0x77u;
+    const auto layout = allocate();
+    const auto bulk = allocate();
+    auto* const word = reinterpret_cast<std::uint32_t*>(bulk.base);
+    AgcDriver::GuestMemory::Unwatch(at(bulk.base), 4096);
+    check(!AgcDriver::GuestMemory::Watched(at(bulk.base), 4096), "the test buffer did not lose write-watch coverage");
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    auto* const gate = layout.label + 1;
+    auto gated = commands(layout.firstCommands);
+    sceAgcDcbWaitRegMem(&gated, 0, 3, 0, 0, gate, Done, 0xffffffffu, 0);
+    writeDone(gated, layout.label);
+    Packet first{layout.firstCommands, static_cast<std::uint32_t>(gated.cursor_up - layout.firstCommands), 0, {}};
+    check(sceAgcDriverSubmitDcb(&first) == 0, "the gated submission failed");
+    waitUntil([&] {
+        std::array<AgcDriver::AwaitedWait, 8> waits{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(waits.data(), waits.size());
+        return std::any_of(waits.begin(), waits.begin() + static_cast<std::ptrdiff_t>(count), [&](const auto& wait) { return wait.address == at(gate); });
+    }, "the gated submission never waited on its gate");
+    auto behind = commands(layout.secondCommands);
+    writeDone(behind, layout.label + 2);
+    Packet queued{layout.secondCommands, static_cast<std::uint32_t>(behind.cursor_up - layout.secondCommands), 0, {}};
+    check(sceAgcDriverSubmitDcb(&queued) == 0, "the submission behind the gate failed");
+    std::atomic_ref<std::uint32_t>(*word).store(Stored, std::memory_order_release);
+    check(sceAgcDriverSubmitDcb(&queued) == 0, "the second submission behind the gate failed");
+    std::atomic_ref<std::uint32_t>(*gate).store(Done, std::memory_order_release);
+    AgcDriverWaitIdle_nid_postfix();
+    check(*layout.label == Done && layout.label[2] == Done, "the driver did not run the submissions behind the gate");
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const auto capture = checkCapture(2);
+    const FrameCaptureReader reader(capture);
+    const auto& header = reader.Header();
+    const auto reasons = jsonCounts(jsonObject(header, "hold_reasons"));
+    check(jsonCount(reasons, "unwatched", header) >= 2 && jsonCount(reasons, "queued", header) >= 1, "the capture did not count both the unwatched block and the submission queued behind the gate of the delta read while both were in flight: " + header);
+    const auto masks = jsonCounts(jsonObject(header, "hold_masks"));
+    check(std::any_of(masks.begin(), masks.end(), [](const auto& mask) {
+        const auto names = "+" + mask.first + "+";
+        return names.find("+unwatched+") != std::string::npos && names.find("+queued+") != std::string::npos;
+    }), "no hold mask of the capture holds both the unwatched block and the queued submission: " + header);
+    const auto entry = header.find("{\"address\":" + std::to_string(at(bulk.base)) + ",\"bytes\":" + std::to_string(AgcDriver::FrameCaptureWriter::BlockBytes) + ",");
+    check(entry != std::string::npos, "the capture header does not list the unwatched block: " + header);
+    const auto block = jsonCounts(header.substr(entry + 1, header.find('}', entry) - entry - 1));
+    check(jsonCount(block, "deltas", header) >= 2 && jsonCount(block, "changed", header) == 1 && jsonCount(block, "driver_stored", header) == 0, "the unwatched block's counters do not show one CPU store and no driver store between the deltas read while the gate was closed: " + header);
+
+    const auto result = capture / "hold diagnostics.json";
+    const auto dump = capture / "hold diagnostics.bin";
+    auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --no-release --dump " + std::to_string(at(word)) + ":4:\"" + dump.string() + "\" > \"" + result.string() + "\"";
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+#endif
+    const auto code = std::system(command.c_str());
+    check(code == 0, "agc_frame_replay exited with " + std::to_string(code));
+    check(readFile(dump) == std::vector<std::byte>{std::byte{Stored}, std::byte{0}, std::byte{0}, std::byte{0}}, "the replay did not restore the CPU store into the unwatched block");
+    const auto json = readFile(result);
+    const std::string line(reinterpret_cast<const char*>(json.data()), json.size());
+    for (const char* field : {"\"memory_held_wait_s\":", "\"memory_in_flight_wait_s\":", "\"restore_s\":", "\"in_flight_mean\":"}) check(line.find(field) != std::string::npos, std::string("the replay JSON has no ") + field + " " + line);
+    check(line.find("\"in_flight_max\":2,") != std::string::npos, "the replay did not report the two submissions in flight behind the parked gate: " + line);
+}
+
 void testFillClearedBeforeRange(const std::filesystem::path& tool) {
     constexpr std::uint32_t Filled = 0x5a5a5a5au;
     const auto layout = allocate();
@@ -1060,9 +1154,9 @@ void testFillClearedBeforeRange(const std::filesystem::path& tool) {
 int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
-        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"in_flight_store", testStoreIntoDeltaReadInFlight}};
+        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|in_flight_store]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|in_flight_store|hold_diagnostics]\n");
         return 2;
     }
     int status = 0;
