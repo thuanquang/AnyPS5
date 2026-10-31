@@ -737,7 +737,7 @@ struct Replay {
             const std::size_t bytes = wait.bytes == 8 ? 8 : 4;
             if (wait.function != 0 && satisfies(wait, load(wait.address, bytes))) continue;
             if (rewindWait(wait)) {
-                for (auto index = from; index < calls.size() && !released; ++index) released = releaseRewind(calls[index], wait);
+                for (auto index = from; reader.Version() < 2 && index < calls.size() && !released; ++index) released = releaseRewind(calls[index], wait);
                 if (released) ++earlyReleases;
                 continue;
             }
@@ -774,7 +774,7 @@ struct Replay {
         sequenced.store(0);
         stalled.store(false);
         std::thread breaker([&] {
-            if (!options.release || reader.Version() >= 2) return;
+            if (!options.release) return;
             auto lastSeen = progress();
             auto lastProgress = Clock::now();
             while (!finished.load()) {
@@ -888,7 +888,7 @@ int usage() {
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
                          "  --pace-timeout-ms   milliseconds a call waits for the captured in-flight depth once no queue runs (10000)\n"
-                         "  --no-release        never copies recorded CPU stores early to release a GPU wait; a version 2 capture never does\n"
+                         "  --no-release        never copies recorded CPU stores early to release a GPU wait; a version 2 capture never applies a later delta early\n"
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
