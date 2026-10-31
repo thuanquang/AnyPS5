@@ -25,6 +25,8 @@
 
 namespace AgcDriver {
 
+struct StartedProgressSnapshot;
+
 class FrameRecorder {
 public:
     static constexpr std::uint64_t DefaultFrames = 10;
@@ -109,9 +111,9 @@ private:
     FrameCall make(FrameCallKind kind);
     void record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders = {}, const std::function<void()>& accept = {});
     void recordLocked(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders);
-    void emitDelta();
-    void emitShaderDelta(std::span<const Shader* const> shaders);
-    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {});
+    void emitDelta(const StartedProgressSnapshot* decision = nullptr);
+    void emitShaderDelta(std::span<const Shader* const> shaders, const StartedProgressSnapshot* decision = nullptr);
+    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {}, const StartedProgressSnapshot* decision = nullptr);
     bool triggered();
     void start();
     void finish();
@@ -174,10 +176,11 @@ private:
     std::uint64_t unverifiedDeltas = 0;
     std::uint64_t inFlightDeltas = 0;
     std::uint64_t heldDeltas = 0;
-    std::array<std::uint64_t, 12> holdReasons{};
+    std::array<std::uint64_t, 13> holdReasons{};
     std::map<std::uint32_t, std::uint64_t> holdMasks;
     std::unordered_map<std::uint64_t, UnwatchedPage> unwatchedPages;
     std::map<std::pair<std::uint64_t, std::uint64_t>, UnwatchedCounts> unwatchedCounts;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> finishedWaitDwords;
     std::set<std::uint64_t> callThreads;
     static std::atomic<FrameRecorder*> observing;
     std::vector<std::string> warnings;

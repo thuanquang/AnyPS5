@@ -78,6 +78,8 @@ public:
     std::pair<std::uint64_t, std::uint64_t> SerialProgress();
     StartedProgressSnapshot StartedProgress();
     bool UnfinishedLabelOverlaps(std::uint64_t begin, std::uint64_t end);
+    AwaitedDwordsSnapshot TakeAwaitedDwords();
+    void TrackAwaitedDwords(bool tracking);
     bool SerialDone(std::uint64_t serial);
     void HoldForRecorder();
     void ReleaseForRecorder();
@@ -155,6 +157,9 @@ private:
     void noteHeldAtSubmit(Submission& submission, std::size_t cursor);
     static void forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission);
     static void forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites);
+    void passAwaited(const Submission& submission, std::span<const std::uint32_t> packet);
+    void passAwaitedLocked(std::uint64_t serial, std::uint64_t address);
+    void finishAwaited(std::uint64_t serial);
     static bool& completionDeferred();
     void deferCompletion(const Submission& submission);
     void submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress = {});
@@ -485,6 +490,9 @@ private:
     std::uint64_t completed = 0;
     std::set<std::uint64_t> completedOutOfOrder;
     std::set<std::uint64_t> startedAhead;
+    std::map<std::uint64_t, std::vector<AwaitedDword>> unfinishedWaits;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> finishedWaits;
+    std::atomic<bool> awaitedTracking{false};
     std::exception_ptr failure;
 
     std::atomic<bool> failed{false};

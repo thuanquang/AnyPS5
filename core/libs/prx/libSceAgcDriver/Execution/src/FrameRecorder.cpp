@@ -138,7 +138,7 @@ std::uint64_t contentHash(std::span<const std::byte> bytes) {
     return hash == 0 ? 1 : hash;
 }
 
-constexpr std::array<const char*, 12> HoldReasonNames{"", "unwatched", "late_or_host", "threads", "parked", "driver_page", "label", "snapshot", "storage", "shadow", "queue0", "queued"};
+constexpr std::array<const char*, 13> HoldReasonNames{"", "unwatched", "late_or_host", "threads", "parked", "driver_page", "label", "snapshot", "storage", "shadow", "queue0", "queued", "awaits_title"};
 
 }
 
@@ -376,7 +376,7 @@ void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
             Released() { DriverDetail::Driver::Get().HoldForRecorder(); }
             ~Released() { DriverDetail::Driver::Get().ReleaseForRecorder(); }
         } released;
-        emitDelta();
+        emitDelta(&entry);
     }
     if (state != State::Recording) return;
     call.ordinal = ++ordinal;
@@ -444,8 +444,8 @@ void FrameRecorder::recordLocked(FrameCall call, bool prologueCall, std::span<co
         Released() { DriverDetail::Driver::Get().HoldForRecorder(); }
         ~Released() { DriverDetail::Driver::Get().ReleaseForRecorder(); }
     } released;
-    if (prologueCall) emitShaderDelta(shaders);
-    else emitDelta();
+    if (prologueCall) emitShaderDelta(shaders, &entry);
+    else emitDelta(&entry);
     if (state != State::Recording) return;
     call.ordinal = ++ordinal;
     call.accepted = entry.accepted;
@@ -477,16 +477,17 @@ bool FrameRecorder::triggered() {
     return boundaries >= std::max<std::uint64_t>(atBoundary, 1);
 }
 
-void FrameRecorder::emitDelta() {
+void FrameRecorder::emitDelta(const StartedProgressSnapshot* decision) {
     std::vector<Span> spans;
     for (const auto& range : ranges) {
         if (range.readable && ((range.access & FrameRangeAccess::Writable) != 0 || range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched)) spans.push_back({range.address, range.bytes, generation});
     }
     const auto mark = GuestMemory::WriteGeneration();
     const auto added = newRanges();
-    writeDelta(spans, {}, added);
+    writeDelta(spans, {}, added, decision);
     generation = mark;
     shaderMarks.clear();
+    finishedWaitDwords.clear();
 }
 
 std::vector<FrameRecorder::Range> FrameRecorder::newRanges() {
@@ -517,7 +518,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::newRanges() {
     return added;
 }
 
-void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
+void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders, const StartedProgressSnapshot* decision) {
     std::set<std::uint64_t> blocks;
     std::set<std::uint64_t> hostPages;
     std::uintptr_t arenaBase = 0;
@@ -555,18 +556,20 @@ void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders) {
         spans.push_back({block, FrameCaptureWriter::BlockBytes, found != shaderMarks.end() ? std::max(found->second, generation) : generation});
     }
     const std::vector<std::uint64_t> pages(hostPages.begin(), hostPages.end());
-    writeDelta(spans, pages);
+    writeDelta(spans, pages, {}, decision);
     for (const auto block : blocks) shaderMarks[block] = mark;
 }
 
-void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added) {
+void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added, const StartedProgressSnapshot* decision) {
     if (abandonIfDiskLow()) return;
     auto& driver = DriverDetail::Driver::Get();
     const struct Hold {
         DriverDetail::Driver& driver;
         ~Hold() { driver.ReleaseSettled(); }
     } hold{driver};
-    const auto entry = driver.StartedProgress();
+    const auto entry = decision != nullptr ? *decision : driver.StartedProgress();
+    const auto awaited = driver.TakeAwaitedDwords();
+    finishedWaitDwords.insert(finishedWaitDwords.end(), awaited.finished.begin(), awaited.finished.end());
     auto accepted = entry.accepted;
     auto completed = entry.completed;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> blocks;
@@ -590,7 +593,11 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     std::vector<std::uint64_t> started;
     bool inFlightRead = false;
     if (completed < accepted && (!added.empty() || !blocks.empty() || !hostPages.empty())) {
-        const auto mask = holdMask(blocks) | (unwatched.empty() ? 0u : 1u << 1) | (!added.empty() || !hostPages.empty() ? 1u << 2 : 0u) | (callThreads.size() > 1 ? 1u << 3 : 0u) | (entry.queued != 0 ? 1u << 11 : 0u);
+        const auto holdsWait = [&](std::span<const std::pair<std::uint64_t, std::uint64_t>> waits) {
+            return std::any_of(waits.begin(), waits.end(), [&](const auto& wait) { return std::any_of(blocks.begin(), blocks.end(), [&](const auto& block) { return wait.first < block.second && block.first < wait.second; }); });
+        };
+        const bool awaitsTitle = awaited.title || holdsWait(awaited.unfinished) || holdsWait(finishedWaitDwords);
+        const auto mask = holdMask(blocks) | (unwatched.empty() ? 0u : 1u << 1) | (!added.empty() || !hostPages.empty() ? 1u << 2 : 0u) | (callThreads.size() > 1 ? 1u << 3 : 0u) | (entry.queued != 0 ? 1u << 11 : 0u) | (awaitsTitle ? 1u << 12 : 0u);
         ++holdMasks[mask];
         for (std::size_t reason = 1; reason < holdReasons.size(); ++reason) holdReasons[reason] += (mask >> reason) & 1u;
         countUnwatched(unwatched);
@@ -693,6 +700,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
 
 void FrameRecorder::endGpuStores() {
     notingGpuStores = false;
+    DriverDetail::Driver::Get().TrackAwaitedDwords(false);
     std::lock_guard lock(gpuStoresMutex);
     gpuWords.clear();
     gpuFills.clear();
@@ -842,6 +850,8 @@ void FrameRecorder::start() {
     ranges = committedRanges();
     writer = std::make_unique<FrameCaptureWriter>(directory);
     notingGpuStores = true;
+    finishedWaitDwords.clear();
+    driver.TrackAwaitedDwords(true);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     for (const auto& range : ranges) {
         if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) GuestMemory::CollectWrittenBlocks(range.address, static_cast<std::size_t>(range.bytes), std::numeric_limits<std::uint64_t>::max(), written);

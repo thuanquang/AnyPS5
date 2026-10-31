@@ -19,6 +19,13 @@
 
 namespace AgcDriver::DriverDetail {
 
+struct AwaitedDword {
+    std::uint64_t address = 0;
+    std::uint32_t bytes = 0;
+    bool satisfied = false;
+    bool passed = false;
+};
+
 struct Submission {
     std::uint64_t serial;
     std::uint32_t queue;
@@ -37,6 +44,7 @@ struct Submission {
     std::uint64_t received = 0;
     std::vector<std::uint64_t> labelWrites;
     std::set<std::size_t> heldAtSubmit;
+    std::vector<AwaitedDword> awaitedDwords;
     std::chrono::steady_clock::time_point receivedAt{};
     std::chrono::steady_clock::time_point copiedAt{};
     std::chrono::steady_clock::time_point validatedAt{};
