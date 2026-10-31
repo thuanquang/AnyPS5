@@ -506,8 +506,8 @@ struct Replay {
                 waited();
                 stalled.store(true);
                 stalledAt.store(completed);
-                std::fprintf(stderr, "[frame-replay] pacing gave up at call %llu (%s): serials %llu/%llu, the capture had %llu in flight\n", static_cast<unsigned long long>(call.ordinal),
-                             std::string(AgcDriver::FrameCallName(call.kind)).c_str(), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(inFlight));
+                std::fprintf(stderr, "[frame-replay] pacing gave up at call %llu (%s): serials %llu/%llu, the capture had %llu in flight, blocked on%s\n", static_cast<unsigned long long>(call.ordinal),
+                             std::string(AgcDriver::FrameCallName(call.kind)).c_str(), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(inFlight), describeBlocked().c_str());
                 ++paceTimeouts;
                 if (options.strict) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " waited longer than the pacing timeout");
                 return;
@@ -774,7 +774,7 @@ struct Replay {
         sequenced.store(0);
         stalled.store(false);
         std::thread breaker([&] {
-            if (!options.release) return;
+            if (!options.release || reader.Version() >= 2) return;
             auto lastSeen = progress();
             auto lastProgress = Clock::now();
             while (!finished.load()) {
@@ -888,7 +888,7 @@ int usage() {
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
                          "  --pace-timeout-ms   milliseconds a call waits for the captured in-flight depth once no queue runs (10000)\n"
-                         "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
+                         "  --no-release        never copies recorded CPU stores early to release a GPU wait; a version 2 capture never does\n"
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
