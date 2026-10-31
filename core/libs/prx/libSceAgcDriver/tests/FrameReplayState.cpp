@@ -424,6 +424,58 @@ void testVersion2Breaker(const std::filesystem::path& directory) {
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
 }
 
+void testSerialDiverged(const std::filesystem::path& directory) {
+    constexpr std::uint64_t Base = 40;
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* commands = reinterpret_cast<std::uint32_t*>(bytes);
+    const std::array<std::uint32_t, 2> nop{0xc0001000u, 0u};
+    std::copy(nop.begin(), nop.end(), commands);
+    const std::uint32_t stored = 7;
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(bytes + 8192), std::as_bytes(std::span(&stored, 1)));
+    FrameCall start;
+    start.kind = FrameCallKind::FrameStart;
+    start.accepted = Base;
+    start.completed = Base;
+    writer.WriteCall(start);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.busyTimeout = std::chrono::milliseconds(3000);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    const auto replayWindow = [&](std::uint64_t taken) {
+        FrameCall submit;
+        submit.kind = FrameCallKind::Submit;
+        submit.ordinal = 1;
+        submit.thread = 1;
+        submit.address = address(commands);
+        submit.size = nop.size();
+        submit.accepted = Base;
+        submit.completed = Base;
+        submit.values = {taken};
+        auto delta = memoryCall(1, 1);
+        delta.ordinal = 2;
+        delta.flags = AgcDriver::InFlightDeltaFlag;
+        delta.accepted = taken;
+        delta.completed = Base;
+        delta.values = {1, taken};
+        const std::array calls{submit, delta};
+        try {
+            replay.runWindow(calls);
+        } catch (const std::runtime_error& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    const auto mapped = replayWindow(Base + 1);
+    check(mapped.empty(), ("the replay refused a submission recorded as taking the serial after the frame start: " + mapped).c_str());
+    const auto diverged = replayWindow(Base + 2);
+    check(diverged.find("took replay serial") != std::string::npos, ("the replay ran a submission recorded as taking the second serial after the frame start, which no recorded call before it took, so the delta read in flight behind it waited on another submission than the title's: " + diverged).c_str());
+}
+
 void testUnverifiedDeltas(const std::filesystem::path& directory) {
     auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
     const std::uint32_t stored = 7;
@@ -651,6 +703,7 @@ int main(int argc, char** argv) {
         else if (mode == "gate_failure") testGateFailure(directory);
         else if (mode == "v2_breaker") testVersion2Breaker(directory);
         else if (mode == "unverified") testUnverifiedDeltas(directory);
+        else if (mode == "serial_diverged") testSerialDiverged(directory);
         else if (mode == "environment") testColdPipelines();
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else throw std::runtime_error("unknown test");
