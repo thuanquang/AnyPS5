@@ -1,0 +1,335 @@
+UpdateCTestConfiguration  from :D:/dev/wt-contact-alias/build/DartConfiguration.tcl
+Test project D:/dev/wt-contact-alias/build
+Constructing a list of tests
+Done constructing a list of tests
+Updating test list for fixtures
+Added 0 tests to meet fixture requirements
+Checking test dependency graph...
+Checking test dependency graph end
+test 1078
+    Start 1078: agc_driver_graphics
+
+1078: Test command: D:\dev\wt-contact-alias\build\tests\agc_driver_graphics_tests.exe
+1078: Working Directory: D:/dev/wt-contact-alias
+1078: Environment variables: 
+1078:  ANYPS5_NO_SHADER_CACHE=1
+1078:  APS5_NO_PIPELINE_JOURNAL=1
+1078: Environment variable modifications: 
+1078:  PATH=path_list_prepend:D:/dev/wt-contact-alias/build/core/libs/libs/unpatched
+1078: Test timeout computed to be: 600
+1078: [time] scheduler tick raised to 0.5 ms (was 0.50 ms, now 0.50 ms, timed waits fine)
+1078: [src\HostCpu.cpp:220 operator()] host CPU AMD Ryzen 5 5600X 6-Core Processor: has SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, LZCNT, BMI1, BMI2, MOVBE, CMPXCHG16B, LAHF/SAHF, AVX, AVX2, FMA, F16C, AES, PCLMULQDQ, RDRAND, RDSEED, ADX, SHA, CLFLUSHOPT, CLWB, RDPID, XSAVEOPT, XSAVEC, SSE4A, PREFETCHW, CLZERO, OS AVX state (XCR0); lacks none
+1078: [gpu] always-pass depth/stencil state is rendered without a depth target (DB_DEPTH_CONTROL=0x007007b3)
+1078: [gpu] viewport depth clamp bounds [-1, 2] on a float depth target are clipped to [0, 1]: the device has no VK_EXT_depth_range_unrestricted
+1078: [gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x01240000)
+1078: [gpu] DCC keys of mipmapped array and 3D color targets are ignored
+1078: [gpu] no 2x2 sample location grid at sample count 2 on this device: sample locations varying between pixels take pixel (0,0)'s in every pixel (the device lacks sampleRateShading)
+1078: [gpu] no 2x2 sample location grid at sample count 1 on this device: sample locations varying between pixels take pixel (0,0)'s in every pixel (its pixels hold different locations)
+1078: [gpu] no 2x2 sample location grid at sample count 2 on this device: pixel (0,0)'s sample locations stand in for every pixel, and each pixel's samples are put in the guest's order at the bounds of its render passes
+1078: [gpu] host import of 0x179a2ae0000+0x20000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import of 0x179a2ae0000+0x20000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import of 0x179a2ae0000+0x20000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import budget: 0 MiB live of 0 MiB (APS5_HOST_IMPORT_MIB); 1 imports (0 MiB) refused so far, 0 of them remembered, last 0x179a30f0000+0x30000 by build
+1078: [gpu] host import of 0x179a30a0000+0x60000 failed at vkAllocateMemory (-2); falling back to copies, requested by join
+1078: [gpu] host import budget lowered to the 0.0 MiB live after vkAllocateMemory failed within an eighth of the budget
+1078: [gpu] host import of 0x179a4d50000+0x20000 failed at vkAllocateMemory (-1000072003); falling back to copies, requested by map
+1078: [gpu] host import of 0x179a4d50000+0x20000 failed at vkAllocateMemory (-1000072003); falling back to copies, requested by access
+1078: [gpu] host import of 0x179a50b0000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import of 0x179ab000000+0x800000 failed at vkAllocateMemory (-2); falling back to copies, requested by build
+1078: [gpu] host import of 0x179ab000000+0x800000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa980000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9e0000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aaa00000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import budget lowered to the 0.1 MiB live after vkAllocateMemory failed 3 times in a row
+1078: [gpu] host import of 0x179aa980000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import budget lowered to the 0.1 MiB live after vkAllocateMemory failed within an eighth of the budget
+1078: [gpu] host import of 0x179aa980000+0x10000 failed at vkAllocateMemory (-1); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9a0000+0x10000 failed at vkAllocateMemory (-1); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-1); falling back to copies, requested by access
+1078: [gpu] host import budget lowered to the 0.1 MiB live after vkAllocateMemory failed 3 times in a row
+1078: [gpu] host import of 0x179aa980000+0x10000 failed at vkAllocateMemory (-1); falling back to copies, requested by access
+1078: [gpu] host import budget lowered to the 0.1 MiB live after vkAllocateMemory failed within an eighth of the budget
+1078: [gpu] host import of 0x179aa980000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9a0000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import budget lowered to the 0.1 MiB live after vkAllocateMemory failed 3 times in a row
+1078: [gpu] host import of 0x179aa980000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import budget lowered to the 0.1 MiB live after vkAllocateMemory failed within an eighth of the budget
+1078: [gpu] host import of 0x179aa980000+0x10000 failed at vkAllocateMemory (-1000072003); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9a0000+0x10000 failed at vkAllocateMemory (-1000072003); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-1000072003); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa980000+0x10000 failed at vkAllocateMemory (-1000072003); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9a0000+0x10000 failed at vkAllocateMemory (-1000072003); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-1000072003); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa980000+0x10000 failed at vkAllocateMemory (-13); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9a0000+0x10000 failed at vkAllocateMemory (-13); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-13); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa980000+0x10000 failed at vkAllocateMemory (-13); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9a0000+0x10000 failed at vkAllocateMemory (-13); falling back to copies, requested by access
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-13); falling back to copies, requested by access
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 4 MiB APS5_HOST_IMPORT_MIB sets; the setting stays, as the report never lowers it
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-1); falling back to copies, requested by access
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 8192 MiB of the default; the default stays until an import's vkAllocateMemory fails
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-1); falling back to copies, requested by access
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 8192 MiB of the default; imports are held to it since an import's vkAllocateMemory failed
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 4 MiB APS5_HOST_IMPORT_MIB sets; the setting stays, as the report never lowers it
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 8192 MiB of the default; the default stays until an import's vkAllocateMemory fails
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 8192 MiB of the default; imports are held to it since an import's vkAllocateMemory failed
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 4 MiB APS5_HOST_IMPORT_MIB sets; the setting stays, as the report never lowers it
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-1000072003); falling back to copies, requested by access
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 8192 MiB of the default; the default stays until an import's vkAllocateMemory fails
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-1000072003); falling back to copies, requested by access
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 8192 MiB of the default; imports are held to it since an import's vkAllocateMemory failed
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 4 MiB APS5_HOST_IMPORT_MIB sets; the setting stays, as the report never lowers it
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-13); falling back to copies, requested by access
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 8192 MiB of the default; the default stays until an import's vkAllocateMemory fails
+1078: [gpu] host import of 0x179aa9c0000+0x10000 failed at vkAllocateMemory (-13); falling back to copies, requested by access
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 8192 MiB of the default; imports are held to it since an import's vkAllocateMemory failed
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 8192 MiB of the default; the default stays until an import's vkAllocateMemory fails
+1078: [gpu] host import of 0x179aa960000+0x10000 failed at vkAllocateMemory (-2); falling back to copies, requested by access
+1078: [gpu] host import budget: host heap 1 reports a VK_EXT_memory_budget budget of 8 MiB and a usage of 8 MiB with 0 MiB of imports live, which leaves imports 0 MiB of the 8192 MiB of the default; imports are held to it since an import's vkAllocateMemory failed
+1078: [gpu] texture 0x79669fcf00 (format 74) has single DCC keys at 0x79669fcd40; its texels are read as stored
+1078: [gpu] texture 0x79669fcf00 (format 56) has mixed DCC keys at 0x79669fcd40; its texels are read as stored
+1078: [gpu] texture streaming feedback (LOD warning / mip statistics) is not reported
+1078: [gpu] texture 0x27c000000 (format 22) has unreadable DCC keys at 0x91b002040000; its texels are read as stored
+1078: [gpu] texture DCC color transform is ignored (word6=0x01980000 word7=0x00000000)
+1078: [gpu] depth plane 0xa0000000+0x40000 was unmapped with GPU results pending; they are dropped
+1078: content-key count=0 data=0 movable=0 words=70 capacity=70 hash=12276112778106431680
+1078: content-key count=0 data=0 movable=1 words=70 capacity=70 hash=16547703523611771548
+1078: content-key count=0 data=1 movable=0 words=327 capacity=327 hash=18195637788575597601
+1078: content-key count=0 data=1 movable=1 words=70 capacity=70 hash=6884676608767608045
+1078: content-key count=1 data=0 movable=0 words=89 capacity=89 hash=3582826753038562111
+1078: content-key count=1 data=0 movable=1 words=89 capacity=89 hash=9518511843953525419
+1078: content-key count=1 data=1 movable=0 words=346 capacity=346 hash=3684355951081846730
+1078: content-key count=1 data=1 movable=1 words=89 capacity=89 hash=8486460719680651956
+1078: content-key count=31 data=0 movable=0 words=389 capacity=389 hash=2872353339945041207
+1078: content-key count=31 data=0 movable=1 words=389 capacity=389 hash=11292844791518677155
+1078: content-key count=31 data=1 movable=0 words=646 capacity=646 hash=16275665856175105250
+1078: content-key count=31 data=1 movable=1 words=389 capacity=389 hash=4084850990441387724
+1078: content-key count=32 data=0 movable=0 words=399 capacity=399 hash=9001008430028590267
+1078: content-key count=32 data=0 movable=1 words=399 capacity=399 hash=5471292191449946447
+1078: content-key count=32 data=1 movable=0 words=656 capacity=656 hash=9565516749443825062
+1078: content-key count=32 data=1 movable=1 words=399 capacity=399 hash=15118118974702537264
+1078: content-key count=33 data=0 movable=0 words=418 capacity=418 hash=10382587997612106155
+1078: content-key count=33 data=0 movable=1 words=418 capacity=418 hash=11706275810969384511
+1078: content-key count=33 data=1 movable=0 words=675 capacity=675 hash=1776364597915029880
+1078: content-key count=33 data=1 movable=1 words=418 capacity=418 hash=13690582611633829486
+1078: content-key count=16384 data=0 movable=0 words=168518 capacity=168518 hash=15297671208421994211
+1078: content-key count=16384 data=0 movable=1 words=168518 capacity=168518 hash=8322610684387165047
+1078: content-key count=16384 data=1 movable=0 words=168775 capacity=168775 hash=13444188082477402620
+1078: content-key count=16384 data=1 movable=1 words=168518 capacity=168518 hash=6566449801145079954
+1078: Unused stencil reference sample equivalence passed: 22 accepted states, 12 dependent countermodels
+1078: Stencil logic operations matched AND, OR, XOR and XNOR under the write mask for 310 register states
+1078: All 256 MSAA CMASK byte classifications passed
+1078: Graphics validation tests passed
+1/3 Test #1078: agc_driver_graphics ..................   Passed   49.89 sec
+test 1558
+    Start 1558: agc_driver_storage_one_slice_alias
+
+1558: Test command: D:\dev\wt-contact-alias\build\tests\agc_driver_storage_one_slice_alias_tests.exe
+1558: Working Directory: D:/dev/wt-contact-alias
+1558: Environment variables: 
+1558:  ANYPS5_NO_SHADER_CACHE=1
+1558:  APS5_NO_PIPELINE_JOURNAL=1
+1558: Environment variable modifications: 
+1558:  PATH=path_list_prepend:D:/dev/wt-contact-alias/build/core/libs/libs/unpatched
+1558: Test timeout computed to be: 600
+1558: [time] scheduler tick raised to 0.5 ms (was 0.50 ms, now 0.50 ms, timed waits fine)
+1558: [src\HostCpu.cpp:220 operator()] host CPU AMD Ryzen 5 5600X 6-Core Processor: has SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, LZCNT, BMI1, BMI2, MOVBE, CMPXCHG16B, LAHF/SAHF, AVX, AVX2, FMA, F16C, AES, PCLMULQDQ, RDRAND, RDSEED, ADX, SHA, CLFLUSHOPT, CLWB, RDPID, XSAVEOPT, XSAVEC, SSE4A, PREFETCHW, CLZERO, OS AVX state (XCR0); lacks none
+1558: [src\VulkanDevice.cpp:1171 VulkanDevice] VulkanDevice constructor window=0000000000000000
+1558: [src\VulkanDevice.cpp:1180 VulkanDevice] Vulkan loader loaded library=00007ffb45910000
+1558: [Vulkan Loader] LAYER:          Checking for Layer Manifest files in Registry at HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers
+1558: [Vulkan Loader] INFO | LAYER:   Located json file "C:\Program Files (x86)\Epic Games\Epic Online Services\managedArtifacts\98bc04bc842e4906993fd6d6644ffb8d\EOSOverlayVkLayer-Win64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1558: [Vulkan Loader] INFO | LAYER:   Located json file "D:\Bandicam.v5.4.3.1923_LinkNeverDie.Com\Bandicam.v5.4.3.1923_LinkNeverDie.Com\App\Bandicam\bdcamvk64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1558: [Vulkan Loader] INFO | LAYER:   Located json file "C:\Program Files (x86)\Overwolf\0.311.0.6\ow-vulkan-overlay64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1558: [Vulkan Loader] INFO | LAYER:   Located json file "C:\Program Files (x86)\Overwolf\0.311.0.6\ow-graphics-vulkan64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1558: [Vulkan Loader] INFO | LAYER:   Located json file "D:\1\Bandicam.v5.4.3.1923_LinkNeverDie.Com\Bandicam.v5.4.3.1923_LinkNeverDie.Com\App\Bandicam\bdcamvk64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1558: [Vulkan Loader] INFO | LAYER:   Located json file "C:\Program Files (x86)\Steam\SteamOverlayVulkanLayer64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1558: [Vulkan Loader] INFO | LAYER:   Located json file "C:\Program Files (x86)\Steam\SteamFossilizeVulkanLayer64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1558: [Vulkan Loader] LAYER:          Searching for explicit layer manifest files
+1558: [Vulkan Loader] LAYER:             In following locations:
+1558: [Vulkan Loader] LAYER:                D:\dev\vvl\Vulkan-ValidationLayers\build\layers
+1558: [Vulkan Loader] LAYER:             Found the following files:
+1558: [Vulkan Loader] LAYER:                D:\dev\vvl\Vulkan-ValidationLayers\build\layers\VkLayer_khronos_validation.json
+1558: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_AMD_switchable_graphics" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1558: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_EOS_Overlay" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1558: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_OW_OVERLAY" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1558: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_OW_OBS_HOOK" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1558: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_bandicam_helper" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1558: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_VALVE_steam_overlay" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1558: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_VALVE_steam_fossilize" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1558: [Vulkan Loader] WARNING | LAYER: env var 'VK_INSTANCE_LAYERS' defined and adding layers "VK_LAYER_KHRONOS_validation"
+1558: [Vulkan Loader] WARNING | LAYER: env var 'VK_INSTANCE_LAYERS' defined and adding layers "VK_LAYER_KHRONOS_validation"
+1558: [Vulkan Loader] DEBUG | LAYER:  Loading layer library D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll
+1558: [Vulkan Loader] INFO | LAYER:   Insert instance layer "VK_LAYER_KHRONOS_validation" (D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll)
+1558: [Vulkan Loader] LAYER:          vkCreateInstance layer callstack setup to:
+1558: [Vulkan Loader] LAYER:             <Application>
+1558: [Vulkan Loader] LAYER:               ||
+1558: [Vulkan Loader] LAYER:             <Loader>
+1558: [Vulkan Loader] LAYER:               ||
+1558: [Vulkan Loader] LAYER:             VK_LAYER_KHRONOS_validation
+1558: [Vulkan Loader] LAYER:                     Type: Explicit
+1558: [Vulkan Loader] LAYER:                     Enabled By: Environment Variable VK_INSTANCE_LAYERS
+1558: [Vulkan Loader] LAYER:                     Manifest: D:\dev\vvl\Vulkan-ValidationLayers\build\layers\VkLayer_khronos_validation.json
+1558: [Vulkan Loader] LAYER:                     Library:  D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll
+1558: [Vulkan Loader] LAYER:               ||
+1558: [Vulkan Loader] LAYER:             <Drivers>
+1558: [src\VulkanDevice.cpp:1220 VulkanDevice] Vulkan instance created instance=000001bd0f93be20
+1558: [src\VulkanDevice.cpp:1231 VulkanDevice] Physical device count=1
+1558: [src\VulkanDevice.cpp:1265 VulkanDevice] Physical device candidate=000001bd08431870 name=AMD Radeon RX 6700 XT api=0x40413b type=2
+1558: [src\VulkanDevice.cpp:1313 VulkanDevice] Physical device selected physical=000001bd08431870 queueFamily=0
+1558: [src\VulkanDevice.cpp:1327 VulkanDevice] Selected GPU name=AMD Radeon RX 6700 XT vendor=0x1002 device=0x73df subgroup=64
+1558: [src\VulkanDevice.cpp:1329 VulkanDevice] Memory heap 0 size=16345.1 MiB flags=0x0
+1558: [src\VulkanDevice.cpp:1329 VulkanDevice] Memory heap 1 size=12272.0 MiB flags=0x3
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 0 heap=1 flags=0x1
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 1 heap=0 flags=0x6
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 2 heap=1 flags=0x7
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 3 heap=0 flags=0xe
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 4 heap=1 flags=0xc1
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 5 heap=0 flags=0xc6
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 6 heap=1 flags=0xc7
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 7 heap=0 flags=0xce
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 8 heap=1 flags=0x1
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 9 heap=0 flags=0x6
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 10 heap=1 flags=0x7
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 11 heap=0 flags=0xe
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 12 heap=1 flags=0xc1
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 13 heap=0 flags=0xc6
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 14 heap=1 flags=0xc7
+1558: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 15 heap=0 flags=0xce
+1558: [src\VulkanDevice.cpp:1434 VulkanDevice] Shader clock driver=1 narrowSubgroupClock=0
+1558: [gpu] largest sample location grids (vkGetPhysicalDeviceMultisamplePropertiesEXT): 1 samples 2x2, 2 samples 2x2, 4 samples 2x2, 8 samples 2x2; maxSampleLocationGridSize for every count 2x2
+1558: [src\VulkanDevice.cpp:1811 VulkanDevice] Vulkan features tessellationAvailable=1 mesh=1 depthClip=1 depthRangeUnrestricted=1 pipelineLibrary=1
+1558: [src\VulkanDevice.cpp:2073 VulkanDevice] Wave32 programs run on subgroups of 32: compute 1, mesh 0
+1558: [Vulkan Loader] INFO | LAYER:   Inserted device layer "VK_LAYER_KHRONOS_validation" (D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll)
+1558: [Vulkan Loader] DRIVER:         vkCreateDevice layer callstack setup to:
+1558: [Vulkan Loader] DRIVER:            <Application>
+1558: [Vulkan Loader] DRIVER:              ||
+1558: [Vulkan Loader] DRIVER:            <Loader>
+1558: [Vulkan Loader] DRIVER:              ||
+1558: [Vulkan Loader] LAYER:             VK_LAYER_KHRONOS_validation
+1558: [Vulkan Loader] LAYER:                     Type: Explicit
+1558: [Vulkan Loader] LAYER:                     Enabled By: Environment Variable VK_INSTANCE_LAYERS
+1558: [Vulkan Loader] LAYER:                     Manifest: D:\dev\vvl\Vulkan-ValidationLayers\build\layers\VkLayer_khronos_validation.json
+1558: [Vulkan Loader] LAYER:                     Library:  D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll
+1558: [Vulkan Loader] LAYER:               ||
+1558: [Vulkan Loader] DRIVER:            <Device>
+1558: [Vulkan Loader] DRIVER:                Using "AMD Radeon RX 6700 XT" with driver: "C:\windows\System32\DriverStore\FileRepository\u0205305.inf_amd64_0a0a37c758a0b24b\B026653\.\amdvlk64.dll"
+1558: [src\VulkanDevice.cpp:2226 VulkanDevice] Vulkan device ready device=000001bd08546740 queue=000001bd085fc1f0 family=0
+1558: [write-watch] host imports of write-watched memory keep the write watch: yes (4096 of 4096 scratch pages reported written at the import, 0 by its 4-byte settle read, 0 after it, 0 after a full GPU read, 0 after a second, 0 after a GPU write, 1 after a CPU store); direct host imports of private memory are settled and stay watched, separate shared aliases retain guest write tracking
+1558: [float-controls] f32 denormal flush: hardware (0 of 5472 probe results differ from the emulated flush, 327 ms)
+1558: [gpu] sampled texture cache budget 6931 MiB: device-local heap 1 has a VK_EXT_memory_budget budget of 11474 MiB and uses 40 MiB, 0 MiB of it sampled textures (0 MiB in the cache) and 0 MiB cached storage images; storage image cache budget 5737 MiB
+1558: [Vulkan Loader] DEBUG | LAYER:  Unloading layer library D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll
+1558: the imported block is compared, not watched: taking the results on the device is not checked
+1558: storage one-slice alias tests passed
+2/3 Test #1558: agc_driver_storage_one_slice_alias ...   Passed    1.39 sec
+test 1559
+    Start 1559: agc_driver_storage_one_slice_array
+
+1559: Test command: D:\dev\wt-contact-alias\build\tests\agc_driver_storage_one_slice_array_tests.exe
+1559: Working Directory: D:/dev/wt-contact-alias
+1559: Environment variables: 
+1559:  ANYPS5_NO_SHADER_CACHE=1
+1559:  APS5_NO_PIPELINE_JOURNAL=1
+1559: Environment variable modifications: 
+1559:  PATH=path_list_prepend:D:/dev/wt-contact-alias/build/core/libs/libs/unpatched
+1559: Test timeout computed to be: 600
+1559: [time] scheduler tick raised to 0.5 ms (was 0.50 ms, now 0.50 ms, timed waits fine)
+1559: [src\HostCpu.cpp:220 operator()] host CPU AMD Ryzen 5 5600X 6-Core Processor: has SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, LZCNT, BMI1, BMI2, MOVBE, CMPXCHG16B, LAHF/SAHF, AVX, AVX2, FMA, F16C, AES, PCLMULQDQ, RDRAND, RDSEED, ADX, SHA, CLFLUSHOPT, CLWB, RDPID, XSAVEOPT, XSAVEC, SSE4A, PREFETCHW, CLZERO, OS AVX state (XCR0); lacks none
+1559: [src\VulkanDevice.cpp:1171 VulkanDevice] VulkanDevice constructor window=0000000000000000
+1559: [src\VulkanDevice.cpp:1180 VulkanDevice] Vulkan loader loaded library=00007ffb449d0000
+1559: [Vulkan Loader] LAYER:          Checking for Layer Manifest files in Registry at HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers
+1559: [Vulkan Loader] INFO | LAYER:   Located json file "C:\Program Files (x86)\Epic Games\Epic Online Services\managedArtifacts\98bc04bc842e4906993fd6d6644ffb8d\EOSOverlayVkLayer-Win64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1559: [Vulkan Loader] INFO | LAYER:   Located json file "D:\Bandicam.v5.4.3.1923_LinkNeverDie.Com\Bandicam.v5.4.3.1923_LinkNeverDie.Com\App\Bandicam\bdcamvk64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1559: [Vulkan Loader] INFO | LAYER:   Located json file "C:\Program Files (x86)\Overwolf\0.311.0.6\ow-vulkan-overlay64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1559: [Vulkan Loader] INFO | LAYER:   Located json file "C:\Program Files (x86)\Overwolf\0.311.0.6\ow-graphics-vulkan64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1559: [Vulkan Loader] INFO | LAYER:   Located json file "D:\1\Bandicam.v5.4.3.1923_LinkNeverDie.Com\Bandicam.v5.4.3.1923_LinkNeverDie.Com\App\Bandicam\bdcamvk64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1559: [Vulkan Loader] INFO | LAYER:   Located json file "C:\Program Files (x86)\Steam\SteamOverlayVulkanLayer64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1559: [Vulkan Loader] INFO | LAYER:   Located json file "C:\Program Files (x86)\Steam\SteamFossilizeVulkanLayer64.json" from registry "HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+1559: [Vulkan Loader] LAYER:          Searching for explicit layer manifest files
+1559: [Vulkan Loader] LAYER:             In following locations:
+1559: [Vulkan Loader] LAYER:                D:\dev\vvl\Vulkan-ValidationLayers\build\layers
+1559: [Vulkan Loader] LAYER:             Found the following files:
+1559: [Vulkan Loader] LAYER:                D:\dev\vvl\Vulkan-ValidationLayers\build\layers\VkLayer_khronos_validation.json
+1559: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_AMD_switchable_graphics" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1559: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_EOS_Overlay" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1559: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_OW_OVERLAY" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1559: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_OW_OBS_HOOK" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1559: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_bandicam_helper" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1559: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_VALVE_steam_overlay" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1559: [Vulkan Loader] WARNING | LAYER: Layer "VK_LAYER_VALVE_steam_fossilize" forced disabled because name matches filter of env var 'VK_LOADER_LAYERS_DISABLE'.
+1559: [Vulkan Loader] WARNING | LAYER: env var 'VK_INSTANCE_LAYERS' defined and adding layers "VK_LAYER_KHRONOS_validation"
+1559: [Vulkan Loader] WARNING | LAYER: env var 'VK_INSTANCE_LAYERS' defined and adding layers "VK_LAYER_KHRONOS_validation"
+1559: [Vulkan Loader] DEBUG | LAYER:  Loading layer library D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll
+1559: [Vulkan Loader] INFO | LAYER:   Insert instance layer "VK_LAYER_KHRONOS_validation" (D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll)
+1559: [Vulkan Loader] LAYER:          vkCreateInstance layer callstack setup to:
+1559: [Vulkan Loader] LAYER:             <Application>
+1559: [Vulkan Loader] LAYER:               ||
+1559: [Vulkan Loader] LAYER:             <Loader>
+1559: [Vulkan Loader] LAYER:               ||
+1559: [Vulkan Loader] LAYER:             VK_LAYER_KHRONOS_validation
+1559: [Vulkan Loader] LAYER:                     Type: Explicit
+1559: [Vulkan Loader] LAYER:                     Enabled By: Environment Variable VK_INSTANCE_LAYERS
+1559: [Vulkan Loader] LAYER:                     Manifest: D:\dev\vvl\Vulkan-ValidationLayers\build\layers\VkLayer_khronos_validation.json
+1559: [Vulkan Loader] LAYER:                     Library:  D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll
+1559: [Vulkan Loader] LAYER:               ||
+1559: [Vulkan Loader] LAYER:             <Drivers>
+1559: [src\VulkanDevice.cpp:1220 VulkanDevice] Vulkan instance created instance=000002876b171830
+1559: [src\VulkanDevice.cpp:1231 VulkanDevice] Physical device count=1
+1559: [src\VulkanDevice.cpp:1265 VulkanDevice] Physical device candidate=000002870063c660 name=AMD Radeon RX 6700 XT api=0x40413b type=2
+1559: [src\VulkanDevice.cpp:1313 VulkanDevice] Physical device selected physical=000002870063c660 queueFamily=0
+1559: [src\VulkanDevice.cpp:1327 VulkanDevice] Selected GPU name=AMD Radeon RX 6700 XT vendor=0x1002 device=0x73df subgroup=64
+1559: [src\VulkanDevice.cpp:1329 VulkanDevice] Memory heap 0 size=16345.1 MiB flags=0x0
+1559: [src\VulkanDevice.cpp:1329 VulkanDevice] Memory heap 1 size=12272.0 MiB flags=0x3
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 0 heap=1 flags=0x1
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 1 heap=0 flags=0x6
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 2 heap=1 flags=0x7
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 3 heap=0 flags=0xe
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 4 heap=1 flags=0xc1
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 5 heap=0 flags=0xc6
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 6 heap=1 flags=0xc7
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 7 heap=0 flags=0xce
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 8 heap=1 flags=0x1
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 9 heap=0 flags=0x6
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 10 heap=1 flags=0x7
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 11 heap=0 flags=0xe
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 12 heap=1 flags=0xc1
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 13 heap=0 flags=0xc6
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 14 heap=1 flags=0xc7
+1559: [src\VulkanDevice.cpp:1330 VulkanDevice] Memory type 15 heap=0 flags=0xce
+1559: [src\VulkanDevice.cpp:1434 VulkanDevice] Shader clock driver=1 narrowSubgroupClock=0
+1559: [gpu] largest sample location grids (vkGetPhysicalDeviceMultisamplePropertiesEXT): 1 samples 2x2, 2 samples 2x2, 4 samples 2x2, 8 samples 2x2; maxSampleLocationGridSize for every count 2x2
+1559: [src\VulkanDevice.cpp:1811 VulkanDevice] Vulkan features tessellationAvailable=1 mesh=1 depthClip=1 depthRangeUnrestricted=1 pipelineLibrary=1
+1559: [src\VulkanDevice.cpp:2073 VulkanDevice] Wave32 programs run on subgroups of 32: compute 1, mesh 0
+1559: [Vulkan Loader] INFO | LAYER:   Inserted device layer "VK_LAYER_KHRONOS_validation" (D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll)
+1559: [Vulkan Loader] DRIVER:         vkCreateDevice layer callstack setup to:
+1559: [Vulkan Loader] DRIVER:            <Application>
+1559: [Vulkan Loader] DRIVER:              ||
+1559: [Vulkan Loader] DRIVER:            <Loader>
+1559: [Vulkan Loader] DRIVER:              ||
+1559: [Vulkan Loader] LAYER:             VK_LAYER_KHRONOS_validation
+1559: [Vulkan Loader] LAYER:                     Type: Explicit
+1559: [Vulkan Loader] LAYER:                     Enabled By: Environment Variable VK_INSTANCE_LAYERS
+1559: [Vulkan Loader] LAYER:                     Manifest: D:\dev\vvl\Vulkan-ValidationLayers\build\layers\VkLayer_khronos_validation.json
+1559: [Vulkan Loader] LAYER:                     Library:  D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll
+1559: [Vulkan Loader] LAYER:               ||
+1559: [Vulkan Loader] DRIVER:            <Device>
+1559: [Vulkan Loader] DRIVER:                Using "AMD Radeon RX 6700 XT" with driver: "C:\windows\System32\DriverStore\FileRepository\u0205305.inf_amd64_0a0a37c758a0b24b\B026653\.\amdvlk64.dll"
+1559: [src\VulkanDevice.cpp:2226 VulkanDevice] Vulkan device ready device=00000287006687e0 queue=00000287090d9830 family=0
+1559: [write-watch] host imports of write-watched memory keep the write watch: yes (4096 of 4096 scratch pages reported written at the import, 0 by its 4-byte settle read, 0 after it, 0 after a full GPU read, 0 after a second, 0 after a GPU write, 1 after a CPU store); direct host imports of private memory are settled and stay watched, separate shared aliases retain guest write tracking
+1559: [float-controls] f32 denormal flush: hardware (0 of 5472 probe results differ from the emulated flush, 179 ms)
+1559: [Vulkan Loader] DEBUG | LAYER:  Unloading layer library D:\dev\vvl\Vulkan-ValidationLayers\build\layers\.\VkLayer_khronos_validation.dll
+1559: storage one-slice array tests passed
+3/3 Test #1559: agc_driver_storage_one_slice_array ...   Passed    1.84 sec
+
+The following tests passed:
+	agc_driver_graphics
+	agc_driver_storage_one_slice_alias
+	agc_driver_storage_one_slice_array
+
+100% tests passed, 0 tests failed out of 3
+
+Total Test time (real) =  53.37 sec
