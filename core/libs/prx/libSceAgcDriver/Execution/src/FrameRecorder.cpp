@@ -958,7 +958,7 @@ void FrameRecorder::start() {
         fullDeltaWalkStores = driverStores;
     }
     GuestMemory::SetDriverStoreObserver(&FrameRecorder::observeDriverStore);
-    generation = GuestMemory::WriteGeneration();
+    generation = GuestMemory::TrackerGeneration();
     for (const auto& range : ranges) {
         snapshot(range);
         if (!writer) return;
