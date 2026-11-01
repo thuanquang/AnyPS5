@@ -521,8 +521,14 @@ void FrameRecorder::emitDelta(const StartedProgressSnapshot* decision) {
         spans.push_back({range.address, range.bytes, range.since.data()});
     }
     const auto added = newRanges();
+    std::uint64_t walkStores = 0;
+    {
+        std::lock_guard lock(storeMutex);
+        walkStores = driverStores;
+    }
     writeDelta(spans, {}, added, decision);
     fullDeltaStores = readStores;
+    fullDeltaWalkStores = walkStores;
     shaderMarks.clear();
     finishedWaitDwords.clear();
 }
@@ -647,7 +653,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     auto accepted = entry.accepted;
     auto completed = entry.completed;
     const auto mark = GuestMemory::WriteGeneration();
-    const auto previousStores = readStores;
+    const auto previousStores = fullDeltaWalkStores;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> blocks;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwatched;
@@ -949,6 +955,7 @@ void FrameRecorder::start() {
         driverPages.clear();
         startStores = driverStores;
         fullDeltaStores = driverStores;
+        fullDeltaWalkStores = driverStores;
     }
     GuestMemory::SetDriverStoreObserver(&FrameRecorder::observeDriverStore);
     generation = GuestMemory::WriteGeneration();

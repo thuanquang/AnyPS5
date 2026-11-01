@@ -176,6 +176,7 @@ private:
     std::uint64_t startStores = 0;
     std::uint64_t readStores = 0;
     std::uint64_t fullDeltaStores = 0;
+    std::uint64_t fullDeltaWalkStores = 0;
     std::unordered_map<std::uint64_t, StoreOwner> storeOwners;
     StoreHazard storeHazard;
     std::uint64_t unattributedStores = 0;
