@@ -29,18 +29,32 @@
 #include <string>
 #include <vector>
 
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
+
 namespace {
 
+using AgcDriver::Graphics::GuestTextureResource;
 using AgcDriver::Graphics::Require;
 using AgcDriver::Graphics::StorageTexture;
+using AgcDriver::Graphics::Texture;
 using ShaderRecompiler::ShaderStage;
 
 constexpr std::uint32_t Threads = 32;
 constexpr std::uint32_t Format32Float = 22;
+constexpr std::uint32_t Format32_32UInt = 62;
+constexpr std::uint32_t FormatBc1 = 169;
 constexpr std::uint32_t TileR64KBX = 0x1b;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type2DArray = 13;
 constexpr std::uint32_t Side = 256;
+constexpr std::uint32_t Ps4Side = 128;
+constexpr std::uint32_t Ps4Corner = 124;
 constexpr std::size_t BlockBytes = 2u << 20u;
 
 alignas(256) constexpr std::array<std::uint32_t, 5> Store2DCode{
@@ -51,8 +65,21 @@ alignas(256) constexpr std::array<std::uint32_t, 6> Store2DArrayCode{
     0x7e020280, 0x7e040280, 0x7e06020c, 0xf0201128, 0x00010300, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 14> SampleArrayCode{
+    0x7e020d00, 0x060202f0, 0x100202ff, 0x3b800000, 0x7e0402ff, 0x3b000000, 0x7e060280, 0xf09c0128,
+    0x00610401, 0x340a0082, 0xbf8c3f70, 0xe0701000, 0x80000405, 0xbf810000,
+};
+
+alignas(256) std::array<std::uint32_t, Threads> Output{};
+
 std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
+}
+
+std::string Hex(std::uint32_t value) {
+    char text[16];
+    std::snprintf(text, sizeof(text), "0x%08x", value);
+    return text;
 }
 
 class GuestBlock {
@@ -99,18 +126,23 @@ private:
     std::uint8_t* block = nullptr;
 };
 
-std::array<std::uint32_t, 8> TextureDescriptor(const std::uint8_t* texels, std::uint32_t type) {
+std::array<std::uint32_t, 8> TextureDescriptor(const std::uint8_t* texels, std::uint32_t type, std::uint32_t format = Format32Float, std::uint32_t width = Side, std::uint32_t height = Side) {
     const auto address = AddressOf(texels);
     return {
         static_cast<std::uint32_t>(address >> 8u),
-        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32Float << 20u) | (((Side - 1u) & 3u) << 30u),
-        ((Side - 1u) >> 2u) | ((Side - 1u) << 14u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format << 20u) | (((width - 1u) & 3u) << 30u),
+        ((width - 1u) >> 2u) | ((height - 1u) << 14u),
         0xfacu | (TileR64KBX << 20u) | (type << 28u),
         0u,
         0u,
         0u,
         0u,
     };
+}
+
+std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
+    const auto address = AddressOf(data);
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
 ShaderRecompiler::RecompileResult Compile(const AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData) {
@@ -137,6 +169,20 @@ void Store(AgcDriver::VulkanDevice& device, const std::uint8_t* texels, bool arr
     device.WaitIdle();
 }
 
+void SampleArray(AgcDriver::VulkanDevice& device, const std::uint8_t* texels) {
+    Output.fill(0xdeadbeefu);
+    std::vector<std::uint32_t> userData(16, 0u);
+    const auto buffer = BufferDescriptor(Output.data(), static_cast<std::uint32_t>(Output.size() * 4u));
+    const auto texture = TextureDescriptor(texels, Type2DArray);
+    const std::array<std::uint32_t, 4> pointSampler{0u, 0xfffu << 12u, 1u << 26u, 0u};
+    std::copy(buffer.begin(), buffer.end(), userData.begin());
+    std::copy(texture.begin(), texture.end(), userData.begin() + 4);
+    std::copy(pointSampler.begin(), pointSampler.end(), userData.begin() + 12);
+    const auto result = Compile(device, SampleArrayCode, userData);
+    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(SampleArrayCode.data()));
+    device.WaitIdle();
+}
+
 std::size_t Occurrences(const std::uint8_t* bytes, std::size_t size, std::uint32_t value) {
     std::size_t count = 0;
     for (std::size_t offset = 0; offset + 4u <= size; offset += 4u) {
@@ -147,7 +193,7 @@ std::size_t Occurrences(const std::uint8_t* bytes, std::size_t size, std::uint32
     return count;
 }
 
-void Run(AgcDriver::VulkanDevice& device, const std::string& name, bool arrayFirst, bool flatCode) {
+void Run(AgcDriver::VulkanDevice& device, const std::string& name, bool arrayFirst, bool flatCode, bool sample) {
     GuestBlock block;
     auto* texels = block.Data();
     const auto surface = AddressOf(texels);
@@ -165,11 +211,50 @@ void Run(AgcDriver::VulkanDevice& device, const std::string& name, bool arrayFir
         Require(image->Descriptor().dimension == AgcDriver::Graphics::TextureDimension::k2D, name + ": the surface's storage image is not a 2D image");
         const auto store = (array ? std::string(flatCode ? "one-slice 2D array through a 2D image instruction" : "one-slice 2D array") : std::string("2D")) + " store " + std::to_string(step);
         Require(pending == image, name + ": the " + store + " wrote another image than the surface's first store, so the surface has two storage images");
+        if (sample) {
+            SampleArray(device, texels);
+            for (std::uint32_t x = 0; x < Threads; ++x) Require(Output[x] == values[step], name + ": the one-slice 2D array sampled after the " + store + " reads " + Hex(Output[x]) + " at texel (" + std::to_string(x) + ", 0), expected " + Hex(values[step]));
+            Require(StorageTexture::FindPending(surface, bytes) == image, name + ": sampling the one-slice 2D array after the " + store + " wrote the results back instead of viewing the surface's storage image");
+        }
         StorageTexture::FlushPending(surface, bytes, nullptr, "test");
         device.WaitIdle();
         Require(Occurrences(texels, bytes, values[step]) == Threads, name + ": guest memory does not hold the " + store + " in every written texel");
         Require(step == 0u || Occurrences(texels, bytes, values[step - 1u]) == 0u, name + ": guest memory still holds the store before the " + store);
     }
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+}
+
+void BlockCopies(AgcDriver::VulkanDevice& device, const std::string& name) {
+    GuestBlock block;
+    auto* texels = block.Data();
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    for (const bool arrayStorage : {false, true}) {
+        const auto image = AgcDriver::Graphics::CachedStorageSurface(context, AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(texels, arrayStorage ? Type2DArray : Type2D, Format32_32UInt, Side / 4u, Side / 4u)));
+        for (const bool arrayTexture : {false, true}) {
+            const auto texture = AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(texels, arrayTexture ? Type2DArray : Type2D, FormatBc1));
+            Require(Texture::CanBlockCopyFrom(*image, texture), name + ": a BC1 " + (arrayTexture ? "one-slice 2D array" : "2D") + " texture cannot block-copy from the storage image made through the surface's " + (arrayStorage ? "one-slice 2D array" : "2D") + " T#");
+        }
+    }
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+}
+
+GuestTextureResource Ps4Surface(const std::uint8_t* texels, std::uint32_t type, std::uint32_t side) {
+    auto resource = AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(texels, type, Format32Float, side, side));
+    resource.tileMode = AgcDriver::Graphics::TextureTileMode::kGcnThin1D;
+    resource.gcnPitch = Ps4Side;
+    return resource;
+}
+
+void PitchCopies(AgcDriver::VulkanDevice& device, const std::string& name) {
+    GuestBlock block;
+    auto* texels = block.Data();
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto image = AgcDriver::Graphics::CachedStorageSurface(context, Ps4Surface(texels, Type2DArray, Ps4Side));
+    const auto corner = Ps4Surface(texels, Type2D, Ps4Corner);
+    Require(AgcDriver::Graphics::DescribeSurface(corner).guestBytes == image->GuestBytes(), name + ": the PS4 surface and its padded corner do not cover the same bytes");
+    Require(Texture::CanBlockCopyFrom(*image, corner), name + ": a 2D PS4 texture over the surface's padded corner cannot block-copy from the storage image made through the surface's one-slice 2D array T#");
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
 }
 
@@ -181,16 +266,23 @@ int main(int argc, char** argv) {
 #else
     setenv("APS5_TEMPLATE_AUDIT_MS", "0", 0);
 #endif
+    enum class Kind { Stores, BlockCopies, PitchCopies };
     struct Case {
         const char* key;
         const char* name;
+        Kind kind;
         bool arrayFirst;
         bool flatCode;
+        bool sample;
     };
-    constexpr std::array<Case, 3> cases{{
-        {"flat-first", "2D store first", false, false},
-        {"array-first", "one-slice 2D array store first", true, false},
-        {"array-flat-code", "one-slice 2D array T# through a 2D image instruction first", true, true},
+    constexpr std::array<Case, 7> cases{{
+        {"flat-first", "2D store first", Kind::Stores, false, false, false},
+        {"array-first", "one-slice 2D array store first", Kind::Stores, true, false, false},
+        {"array-flat-code", "one-slice 2D array T# through a 2D image instruction first", Kind::Stores, true, true, false},
+        {"flat-first-sampled", "2D store first, sampled through a one-slice 2D array", Kind::Stores, false, false, true},
+        {"array-first-sampled", "one-slice 2D array store first, sampled through a one-slice 2D array", Kind::Stores, true, false, true},
+        {"block-copy", "block-compressed copy", Kind::BlockCopies, false, false, false},
+        {"ps4-pitch-copy", "PS4 pitch copy", Kind::PitchCopies, false, false, false},
     }};
     try {
         const std::string only = argc == 2 ? argv[1] : "";
@@ -201,7 +293,9 @@ int main(int argc, char** argv) {
         for (const auto& entry : cases) {
             if (!only.empty() && only != entry.key) continue;
             try {
-                Run(*device, entry.name, entry.arrayFirst, entry.flatCode);
+                if (entry.kind == Kind::BlockCopies) BlockCopies(*device, entry.name);
+                else if (entry.kind == Kind::PitchCopies) PitchCopies(*device, entry.name);
+                else Run(*device, entry.name, entry.arrayFirst, entry.flatCode, entry.sample);
             } catch (const std::exception& error) {
                 AgcDriver::Graphics::ClearCachedTextures(device->Device());
                 std::cerr << error.what() << '\n';
