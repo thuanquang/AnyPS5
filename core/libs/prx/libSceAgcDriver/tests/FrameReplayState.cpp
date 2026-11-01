@@ -568,6 +568,161 @@ void testVersion2Breaker(const std::filesystem::path& directory) {
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
 }
 
+void testSerialDiverged(const std::filesystem::path& directory) {
+    constexpr std::uint64_t Base = 40;
+    check(std::getenv("APS5_CPU_FLIP_IN_ORDER") == nullptr && std::getenv("APS5_SYNC_FLIP") == nullptr && std::getenv("APS5_DUMP_SUBMITS") == nullptr, "the environment orders CPU flips or captures submissions, so the replay's CPU flip would take a serial");
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* commands = reinterpret_cast<std::uint32_t*>(bytes);
+    const std::array<std::uint32_t, 2> nop{0xc0001000u, 0u};
+    std::copy(nop.begin(), nop.end(), commands);
+    const std::uint32_t stored = 7;
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(bytes + 8192), std::as_bytes(std::span(&stored, 1)));
+    FrameCall start;
+    start.kind = FrameCallKind::FrameStart;
+    start.accepted = Base;
+    start.completed = Base;
+    writer.WriteCall(start);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.busyTimeout = std::chrono::milliseconds(3000);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    auto output = std::make_shared<ReplayOutput>(replay.frames);
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    const auto submit = [&](std::uint32_t queue, std::vector<std::uint64_t> taken) {
+        FrameCall call;
+        call.kind = FrameCallKind::Submit;
+        call.ordinal = 1;
+        call.thread = 1;
+        call.queue = queue;
+        call.address = address(commands);
+        call.size = nop.size();
+        call.accepted = Base;
+        call.completed = Base;
+        call.values = std::move(taken);
+        return call;
+    };
+    const auto delta = [&](std::uint64_t ordinal, std::uint64_t accepted, std::uint64_t listed) {
+        auto call = memoryCall(1, 1);
+        call.ordinal = ordinal;
+        call.flags = AgcDriver::InFlightDeltaFlag;
+        call.accepted = accepted;
+        call.completed = Base;
+        call.values = {1, listed};
+        return call;
+    };
+    const auto refusal = [&](std::span<const FrameCall> calls) {
+        std::string error;
+        try {
+            replay.runWindow(calls);
+        } catch (const std::runtime_error& failure) {
+            error = failure.what();
+        }
+        AgcDriverWaitIdle_nid_postfix();
+        return error;
+    };
+    const std::array mapped{submit(0, {Base + 1}), delta(2, Base + 1, Base + 1)};
+    const auto replayed = refusal(mapped);
+    check(replayed.empty(), ("the replay refused a submission recorded as taking the serial after the frame start: " + replayed).c_str());
+    FrameCall flip;
+    flip.kind = FrameCallKind::Flip;
+    flip.ordinal = 2;
+    flip.thread = 1;
+    flip.cpuFlip = true;
+    flip.accepted = Base + 1;
+    flip.completed = Base;
+    flip.values = {7, static_cast<std::uint64_t>(-1), 1, 0, Base + 2};
+    const std::array flipped{submit(0x20, {Base + 1}), flip, delta(3, Base + 2, Base + 1)};
+    const auto skipped = refusal(flipped);
+    check(skipped.find("took no replay serial") != std::string::npos, ("the replay ran a CPU flip that took a serial in the capture and none in the replay, so the delta read in flight behind it waited on an earlier submission than the compute submission it lists: " + skipped).c_str());
+    const std::array diverged{submit(0, {Base + 2}), delta(2, Base + 2, Base + 2)};
+    const auto unmapped = refusal(diverged);
+    check(unmapped.find("took replay serial") != std::string::npos, ("the replay ran a submission recorded as taking the second serial after the frame start, which no recorded call before it took, and did not refuse the delta read in flight behind it: " + unmapped).c_str());
+    const std::array unrecorded{submit(0, {}), delta(2, Base + 1, Base + 1)};
+    const auto missing = refusal(unrecorded);
+    check(missing.find("has no recorded serial") != std::string::npos, ("the replay ran a submission that recorded no serial before a delta read in flight: " + missing).c_str());
+    const auto unrecordedCapture = directory / "unrecorded";
+    {
+        FrameCaptureWriter unrecordedWriter(unrecordedCapture);
+        unrecordedWriter.WriteCall(start);
+        for (const auto& call : unrecorded) unrecordedWriter.WriteCall(call);
+        unrecordedWriter.Finish("{}");
+    }
+    std::string early;
+    try {
+        requireRecordedSerials(FrameCaptureReader(unrecordedCapture));
+    } catch (const std::runtime_error& failure) {
+        early = failure.what();
+    }
+    check(early.find("has no recorded serial") != std::string::npos, ("the replay did not refuse before its restore a capture whose submission before a delta read in flight recorded no serial: " + early).c_str());
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+}
+
+void testSerialFlipInOrder(const std::filesystem::path& directory) {
+    constexpr std::uint64_t Base = 40;
+    check(std::getenv("APS5_CPU_FLIP_IN_ORDER") != nullptr, "serial_flip_in_order needs APS5_CPU_FLIP_IN_ORDER");
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* commands = reinterpret_cast<std::uint32_t*>(bytes);
+    const std::array<std::uint32_t, 2> nop{0xc0001000u, 0u};
+    std::copy(nop.begin(), nop.end(), commands);
+    const std::uint32_t stored = 7;
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(bytes + 8192), std::as_bytes(std::span(&stored, 1)));
+    FrameCall start;
+    start.kind = FrameCallKind::FrameStart;
+    start.accepted = Base;
+    start.completed = Base;
+    writer.WriteCall(start);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.busyTimeout = std::chrono::milliseconds(3000);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    auto output = std::make_shared<ReplayOutput>(replay.frames);
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    FrameCall compute;
+    compute.kind = FrameCallKind::Submit;
+    compute.ordinal = 1;
+    compute.thread = 1;
+    compute.queue = 0x20;
+    compute.address = address(commands);
+    compute.size = nop.size();
+    compute.accepted = Base;
+    compute.completed = Base;
+    compute.values = {Base + 1};
+    FrameCall flip;
+    flip.kind = FrameCallKind::Flip;
+    flip.ordinal = 2;
+    flip.thread = 1;
+    flip.cpuFlip = true;
+    flip.accepted = Base + 1;
+    flip.completed = Base;
+    flip.values = {7, static_cast<std::uint64_t>(-1), 1, 0, 0};
+    auto delta = memoryCall(1, 1);
+    delta.ordinal = 3;
+    delta.flags = AgcDriver::InFlightDeltaFlag;
+    delta.accepted = Base + 1;
+    delta.completed = Base;
+    delta.values = {1, Base + 1};
+    const std::array calls{compute, flip, delta};
+    std::string refusal;
+    try {
+        replay.runWindow(calls);
+    } catch (const std::runtime_error& error) {
+        refusal = error.what();
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+    check(refusal.find("the capture's call took none") != std::string::npos, ("the replay ran a CPU flip that took a serial in the replay and none in the capture, so the delta read in flight behind it waited on the flip instead of the compute submission it lists: " + refusal).c_str());
+}
+
 void testUnverifiedDeltas(const std::filesystem::path& directory) {
     auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
     const std::uint32_t stored = 7;
@@ -906,6 +1061,8 @@ int main(int argc, char** argv) {
         else if (mode == "gate_failure") testGateFailure(directory);
         else if (mode == "v2_breaker") testVersion2Breaker(directory);
         else if (mode == "unverified") testUnverifiedDeltas(directory);
+        else if (mode == "serial_diverged") testSerialDiverged(directory);
+        else if (mode == "serial_flip_in_order") testSerialFlipInOrder(directory);
         else if (mode == "environment") testColdPipelines();
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else if (mode == "shader_hole") testShaderBlockHole(directory);
