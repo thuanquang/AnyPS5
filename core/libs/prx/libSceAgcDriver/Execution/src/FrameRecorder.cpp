@@ -276,17 +276,23 @@ void FrameRecorder::awaitLateStores() {
     auto& driver = DriverDetail::Driver::Get();
     driver.ReleaseForRecorder();
     const GuestMemory::StoreSerialScope unattributed(0);
-    if (!driver.WaitIdleFor(std::chrono::seconds(10))) {
+    std::uint64_t newest = 0;
+    {
+        std::lock_guard lock(storeMutex);
+        if (storeOwners.empty()) return;
+        for (const auto& [page, owner] : storeOwners) newest = std::max(newest, owner.accepted);
+    }
+    if (!driver.WaitCompletedFor(newest, std::chrono::seconds(10))) {
         std::set<std::uint64_t> groups;
         {
             std::lock_guard lock(storeMutex);
             for (const auto& [page, owner] : storeOwners) groups.insert(owner.group);
         }
         unverifiedDeltas = groups.size();
-        if (unverifiedDeltas != 0) warnings.push_back(std::to_string(unverifiedDeltas) + " memory deltas read while submissions were in flight were never verified: the driver did not go idle within 10 s after the capture");
+        warnings.push_back(std::to_string(unverifiedDeltas) + " memory deltas read while submissions were in flight were never verified: the submissions in flight at their reads did not complete within 10 s after the capture");
         return;
     }
-    driver.WaitIdle();
+    driver.WaitDeviceIdle();
     std::vector<std::uint64_t> pages;
     {
         std::lock_guard lock(storeMutex);

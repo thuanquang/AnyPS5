@@ -88,6 +88,8 @@ public:
     std::vector<AwaitedWait> AwaitedWaits();
     void WaitForPipelineJournal();
     bool WaitIdleFor(std::chrono::milliseconds timeout);
+    bool WaitCompletedFor(std::uint64_t serial, std::chrono::milliseconds timeout);
+    void WaitDeviceIdle();
     bool WaitSettledFor(std::chrono::milliseconds timeout);
     void ReleaseSettled();
     bool Settled();
