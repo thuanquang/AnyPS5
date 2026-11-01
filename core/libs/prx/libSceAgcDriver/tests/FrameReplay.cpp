@@ -1460,6 +1460,7 @@ void checkAwaitAfterRead(const std::filesystem::path& tool, WaitKind kind, std::
     check(sceAgcDriverSubmitDcb(&awaiting) == 0, "the submission that waits on the title's flag failed");
     awaitStarted();
     if (awaits(word)) throw Inconclusive("the submission reached its wait on the title's flag before the title's next call; raise BusyWrites");
+    std::memcpy(layout.source, copied.data(), copied.size());
     if (kind == WaitKind::Semaphore && std::atomic_ref<std::uint32_t>(*marker).load(std::memory_order_acquire) == Done) throw Inconclusive("the submission reached its semaphore before the title's next call; raise BusyWrites");
     bool reached = false;
     std::jthread signaller;
@@ -1471,7 +1472,6 @@ void checkAwaitAfterRead(const std::filesystem::path& tool, WaitKind kind, std::
             passAwait(kind, word);
         });
     }
-    std::memcpy(layout.source, copied.data(), copied.size());
     submitLabel(layout.firstCommands, layout.label + 2);
     if (kind == WaitKind::Semaphore) {
         signaller.join();
