@@ -869,11 +869,11 @@ constexpr unsigned ImportHashThreads = 4;
 
 enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow, Fresh };
 
-thread_local std::uint64_t storeSerial = 0;
+struct StoreSerialSlot {};
 std::atomic<DriverStoreObserver> driverStoreObserver{nullptr};
 
 void reportDriverStore(std::uint64_t begin, std::uint64_t end) {
-    if (const auto observer = driverStoreObserver.load(std::memory_order_acquire)) observer(begin, end, storeSerial);
+    if (const auto observer = driverStoreObserver.load(std::memory_order_acquire)) observer(begin, end, HostThreadSlot<std::uint64_t, StoreSerialSlot>::Get());
 }
 
 std::uint64_t HashPage(const std::byte* page) {
@@ -1665,15 +1665,15 @@ std::uint64_t WriteGeneration() {
 }
 
 std::uint64_t CurrentStoreSerial() {
-    return storeSerial;
+    return HostThreadSlot<std::uint64_t, StoreSerialSlot>::Get();
 }
 
-StoreSerialScope::StoreSerialScope(std::uint64_t serial) : previous(storeSerial) {
-    storeSerial = serial;
+StoreSerialScope::StoreSerialScope(std::uint64_t serial) : previous(HostThreadSlot<std::uint64_t, StoreSerialSlot>::Get()) {
+    HostThreadSlot<std::uint64_t, StoreSerialSlot>::Set(serial);
 }
 
 StoreSerialScope::~StoreSerialScope() {
-    storeSerial = previous;
+    HostThreadSlot<std::uint64_t, StoreSerialSlot>::Set(previous);
 }
 
 void SetDriverStoreObserver(DriverStoreObserver observer) {
