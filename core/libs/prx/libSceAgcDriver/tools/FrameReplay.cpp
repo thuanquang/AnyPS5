@@ -775,6 +775,11 @@ struct Replay {
         std::atomic<bool> finished{false};
         sequenced.store(0);
         stalled.store(false);
+        if (pass == 1) {
+            depthSamples.store(0);
+            depthTotal.store(0);
+            depthMax.store(0);
+        }
         std::thread breaker([&] {
             if (!options.release) return;
             auto lastSeen = progress();
