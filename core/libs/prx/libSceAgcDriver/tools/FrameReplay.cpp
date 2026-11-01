@@ -209,6 +209,23 @@ void requireVerifiedDeltas(const FrameCaptureReader& reader) {
     }
 }
 
+void requireRecordedSerials(const FrameCaptureReader& reader) {
+    if (reader.Version() < 2) return;
+    const auto& calls = reader.Calls();
+    const auto start = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
+    if (start == calls.end()) return;
+    auto last = calls.end();
+    for (auto call = start; call != calls.end(); ++call) {
+        if (call->kind == FrameCallKind::Memory && (call->flags & AgcDriver::InFlightDeltaFlag) != 0) last = call;
+    }
+    if (last == calls.end()) return;
+    for (auto call = start; call != last; ++call) {
+        if (call->kind != FrameCallKind::Submit && call->kind != FrameCallKind::Flip && call->kind != FrameCallKind::Suspend) continue;
+        if (call->values.size() == (call->kind == FrameCallKind::Flip ? 5u : 1u)) continue;
+        throw std::runtime_error("frame replay: call " + std::to_string(call->ordinal) + " (" + std::string(AgcDriver::FrameCallName(call->kind)) + ") has no recorded serial, so the submissions in flight at the memory delta of call " + std::to_string(last->ordinal) + " cannot be mapped to this replay's");
+    }
+}
+
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
     reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
 }
@@ -1265,6 +1282,7 @@ int run(const Options& options) {
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
+    if (options.pace) requireRecordedSerials(reader);
     auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
     Replay replay{options, reader};
