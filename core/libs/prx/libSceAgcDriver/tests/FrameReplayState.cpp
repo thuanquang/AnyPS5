@@ -739,6 +739,43 @@ void testPieceSince(const std::filesystem::path& directory) {
     if (!failures.empty()) throw std::runtime_error(failures);
 }
 
+void testDriverStoreAfterShaderDelta(const std::filesystem::path& directory) {
+    constexpr std::size_t Size = 1u << 20;
+    constexpr std::size_t Page = 4096;
+    constexpr std::size_t Block = FrameCaptureWriter::BlockBytes;
+    auto* bytes = allocate(Size);
+    std::fill_n(bytes, Size, std::byte{0});
+    auto* stored = bytes + Block;
+    auto* other = bytes + 2 * Block;
+    auto* shader = reinterpret_cast<Shader*>(bytes + 4 * Block);
+    *shader = {};
+    shader->file_header = 0x34333231u;
+    shader->version = 0x18u;
+    shader->header_size = sizeof(Shader);
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->FrameBoundary();
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope serial(AgcDriver::GuestMemory::TitleCallStoreSerial);
+        const std::vector<std::byte> driver(Page, std::byte{0x66});
+        AgcDriver::GuestMemory::StoreOwnBytes(address(stored), driver);
+    }
+    std::fill_n(stored, Page, std::byte{0x77});
+    recorder->RegisterShader(shader);
+    AgcDriverSuspendPoint_nid_postfix();
+    std::fill_n(other, Page, std::byte{0x88});
+    AgcDriverSuspendPoint_nid_postfix();
+    recorder->FrameBoundary();
+    const FrameCaptureReader reader(directory);
+    check(reader.Header().find("stopped") == std::string::npos, ("the capture stopped: " + reader.Header()).c_str());
+    const auto first = groupBeforeSuspend(reader, 0);
+    const auto second = groupBeforeSuspend(reader, 1);
+    check(first != 0 && second != 0, "the CPU writes before the first two suspend points are not in memory deltas");
+    std::string failures;
+    expectGroups(reader, failures, stored, {first, second}, "the page the driver stored into and the CPU then overwrote before a shader registration and the first suspend point");
+    if (!failures.empty()) throw std::runtime_error(failures);
+}
+
 void testPendingResultRead(const std::filesystem::path& directory) {
     constexpr std::size_t Size = 1u << 20;
     constexpr std::size_t Page = 4096;
@@ -1021,6 +1058,7 @@ int main(int argc, char** argv) {
         else if (mode == "delta_hole") testDeltaOutsideRanges(directory);
         else if (mode == "once") testPagesCollectedOnce(directory);
         else if (mode == "piece_since") testPieceSince(directory);
+        else if (mode == "driver_store_shader") testDriverStoreAfterShaderDelta(directory);
         else if (mode == "pending_result") testPendingResultRead(directory);
         else if (mode == "partly_covered") testPartlyCoveredBlock(directory);
         else if (mode == "late_clear") testLateClear(directory);
