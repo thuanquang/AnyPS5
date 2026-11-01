@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -7,6 +8,8 @@
 #include <stdexcept>
 #include <span>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -435,12 +438,73 @@ void testAllZero() {
     check(!AgcDriver::AllZero(bytes), "a nonzero word is missed");
 }
 
+void testReusedStreams(const std::filesystem::path& directory) {
+    std::vector<std::vector<std::byte>> deltas;
+    for (std::size_t index = 0; index < 6; ++index) {
+        std::vector<std::byte> delta(index % 2 == 0 ? FrameCaptureWriter::ChunkBytes : 4096 + 8 * index);
+        for (std::size_t at = 0; at < delta.size(); ++at) delta[at] = static_cast<std::byte>((((at + 1) * (index + 3) * 2654435761ull) >> 13) & 0xff);
+        deltas.push_back(std::move(delta));
+    }
+    {
+        FrameCaptureWriter writer(directory);
+        for (std::size_t index = 0; index < deltas.size(); ++index) writer.WriteDelta(index + 1, 0, 0x1000000ull * (index + 1), deltas[index]);
+        writer.Finish("{}");
+    }
+    const FrameCaptureReader reader(directory);
+    const auto& chunks = reader.Chunks();
+    check(chunks.size() == deltas.size(), "a delta of at most one chunk was split");
+    for (std::size_t step = 0; step < 2 * chunks.size(); ++step) {
+        const auto index = step < chunks.size() ? step : 2 * chunks.size() - 1 - step;
+        check(reader.Read(chunks[index]) == deltas[index], "a chunk read after a larger or a smaller one does not round-trip");
+    }
+    constexpr std::size_t Workers = 4;
+    std::atomic<std::size_t> started{0};
+    std::atomic<std::size_t> reading{0};
+    std::atomic<std::size_t> overlapped{0};
+    std::atomic<bool> differs{false};
+    std::vector<std::thread> workers;
+    for (std::size_t worker = 0; worker < Workers; ++worker) {
+        workers.emplace_back([&, worker] {
+            ++started;
+            while (started.load() < Workers) std::this_thread::yield();
+            for (std::size_t step = 0; step < 4 * chunks.size(); ++step) {
+                const auto index = (worker + step) % chunks.size();
+                if (++reading > 1) ++overlapped;
+                try {
+                    if (reader.Read(chunks[index]) != deltas[index]) differs = true;
+                } catch (const std::exception&) {
+                    differs = true;
+                }
+                --reading;
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    check(!differs.load(), "chunks read on several threads at once do not round-trip");
+    check(overlapped.load() > 0, "no two chunk reads ran at the same time");
+    auto past = chunks[1];
+    past.offset = std::filesystem::file_size(directory / FrameCaptureWriter::MemoryName) - 1;
+    checkThrows([&] { reader.Read(past); }, "a chunk that ends past the memory file does not throw");
+    check(reader.Read(chunks[1]) == deltas[1], "a read after a failed file read does not round-trip");
+    auto shifted = chunks[1];
+    ++shifted.offset;
+    checkThrows([&] { reader.Read(shifted); }, "a chunk that does not start a zstd frame does not throw");
+    check(reader.Read(chunks[1]) == deltas[1], "a read after a failed decompression does not round-trip");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     const auto root = std::filesystem::temp_directory_path() / ("aps5-frame-capture-test-" + std::to_string(getpid()));
     std::filesystem::remove_all(root);
     try {
+        if (argc > 1) {
+            check(argc == 2 && std::string_view(argv[1]) == "reuse", std::string("unknown test ") + argv[1]);
+            testReusedStreams(root / "reuse");
+            std::filesystem::remove_all(root);
+            std::puts("frame capture stream reuse test passed");
+            return 0;
+        }
         testAllZero();
         testReadAroundRanges();
         testRoundTrip(root / "capture");

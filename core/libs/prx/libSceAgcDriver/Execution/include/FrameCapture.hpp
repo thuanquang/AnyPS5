@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -145,6 +146,7 @@ private:
 class FrameCaptureReader {
 public:
     explicit FrameCaptureReader(const std::filesystem::path& directory);
+    ~FrameCaptureReader();
 
     const std::vector<FrameCall>& Calls() const;
     const std::vector<FrameMemoryChunk>& Chunks() const;
@@ -155,7 +157,15 @@ public:
     std::vector<std::byte> Read(const FrameMemoryChunk& chunk) const;
 
 private:
+    struct Stream;
+
+    std::unique_ptr<Stream> takeStream() const;
+    void returnStream(std::unique_ptr<Stream> stream) const;
+
     std::filesystem::path directory;
+    std::filesystem::path memoryPath;
+    mutable std::mutex streamMutex;
+    mutable std::vector<std::unique_ptr<Stream>> streams;
     std::vector<FrameCall> calls;
     std::vector<FrameMemoryChunk> chunks;
     std::string header;
