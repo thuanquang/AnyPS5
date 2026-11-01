@@ -3992,7 +3992,7 @@ if(BUILD_TESTING)
                     SKIP_RETURN_CODE 77 TIMEOUT 120)
             if(mode STREQUAL "late_store" OR mode STREQUAL "late_wait")
                 set_tests_properties(agc_driver_frame_replay_${mode} PROPERTIES ENVIRONMENT
-                        "ANYPS5_NO_SHADER_CACHE=1;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-${mode}-capture;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=1")
+                        "ANYPS5_NO_SHADER_CACHE=1;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-${mode}-capture;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=1;APS5_FRAME_CAPTURE_MIN_FREE_BYTES=0")
             endif()
             if(WIN32)
                 set_tests_properties(agc_driver_frame_replay_${mode} PROPERTIES ENVIRONMENT_MODIFICATION
