@@ -1514,6 +1514,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         trackedLayerBytes = blockUnits ? 65536 : guestBytes / trackedLayers;
         layerGeneration.assign(trackedLayers, 0);
         layerPending.assign(trackedLayers, false);
+        unitWriters.assign(trackedLayers, 0);
         layerOriginal.assign(trackedLayers, true);
         layerWrittenSinceFill.assign(trackedLayers, false);
         savedTicket.assign(trackedLayers, 0);
@@ -3941,11 +3942,14 @@ void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t la
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
+    const auto serial = GuestMemory::CurrentStoreSerial();
+    const auto writer = serial == GuestMemory::TitleCallStoreSerial ? std::uint64_t{0} : serial;
     if (layerWrittenSinceFill.size() != trackedLayers) layerWrittenSinceFill.assign(trackedLayers, false);
     for (std::uint32_t layer = first; layer < first + count && layer < layerWrittenSinceFill.size(); ++layer) {
         layerWrittenSinceFill[layer] = true;
     }
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    for (std::uint32_t layer = first; layer < first + count; ++layer) unitWriters[layer] = layerPending[layer] ? std::min(unitWriters[layer], writer) : writer;
     if (!layerPending.AllIn(first, count)) {
         std::vector<bool> unsaved;
         bool anyUnsaved = false;
@@ -6192,6 +6196,15 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    const GuestMemory::StoreSerialScope storing([&] {
+        std::uint64_t writer = 0;
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (!layers[layer] || !layerPending[layer]) continue;
+            if (unitWriters[layer] == 0) return std::uint64_t{0};
+            writer = writer == 0 ? unitWriters[layer] : std::min(writer, unitWriters[layer]);
+        }
+        return writer;
+    }());
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
