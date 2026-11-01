@@ -319,6 +319,7 @@ void Driver::releaseFlipHold() {
 }
 
 void Driver::reserveOutputs(Submission& submission) {
+    const bool tracking = awaitedTracking.load(std::memory_order_relaxed);
     std::set<std::uint32_t> eopTokens;
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         const auto* words = submission.commands.data() + cursor;
@@ -338,7 +339,7 @@ void Driver::reserveOutputs(Submission& submission) {
                 submission.flips.emplace(cursor, flip->second.request);
             }
         }
-        noteHeldAtSubmit(submission, cursor);
+        noteHeldAtSubmit(submission, cursor, tracking);
         if (words[0] == FlipPacketHeader) {
             const auto output = outputs.find(words[1]);
             require(output != outputs.end(), "flip references an unregistered video output");
@@ -350,7 +351,7 @@ void Driver::reserveOutputs(Submission& submission) {
         cursor += Pm4::PacketWords(words[0]);
     }
     for (const auto token : eopTokens) eopFlips.erase(token);
-    if (submission.rewindTail != nullptr) submission.awaitedDwords.push_back(AwaitedDword{reinterpret_cast<std::uint64_t>(submission.rewindTail - 1), 4, false, false});
+    if (tracking && submission.rewindTail != nullptr) submission.awaitedDwords.push_back(AwaitedDword{reinterpret_cast<std::uint64_t>(submission.rewindTail - 1), 4, false, false});
 }
 
 void Driver::executeRewindTail(const Submission& stalled) {
@@ -658,7 +659,7 @@ void Driver::enqueue(Submission submission) {
     });
 }
 
-void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
+void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor, bool tracking) {
     const auto packet = std::span<const std::uint32_t>(submission.commands).subspan(cursor, std::min<std::size_t>(Pm4::PacketWords(submission.commands[cursor]), submission.commands.size() - cursor));
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     if ((packet[0] >> 30u) != 3u) return;
@@ -671,12 +672,17 @@ void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
         }
         return;
     }
-    if (const auto awaited = decodeAwaited(packet); awaited && awaited->address % 4 == 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(awaited->address), awaited->bytes)) submission.awaitedDwords.push_back(*awaited);
+    if (opcode == 0x39) {
+        if (!tracking) return;
+        if (const auto awaited = decodeAwaited(packet); awaited && awaited->address % 4 == 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(awaited->address), awaited->bytes)) submission.awaitedDwords.push_back(*awaited);
+        return;
+    }
     if ((opcode != 0x3c && opcode != 0x93) || packet.size() < 7 || ((packet[1] >> 4u) & 3u) != 1u) return;
     const auto wait = Pm4::DecodeWait(packet);
     const auto address = wait.address;
     const std::size_t bytes = wait.bytes;
     if (address % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return;
+    if (tracking) submission.awaitedDwords.push_back(AwaitedDword{address, static_cast<std::uint32_t>(bytes), false, false});
     const auto worker = workers.find(submission.queue);
     for (std::size_t offset = 0; offset < bytes; offset += 4) {
         const auto dword = address + offset;
@@ -687,7 +693,7 @@ void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
     if (bytes == 8) value |= static_cast<std::uint64_t>(*reinterpret_cast<const volatile std::uint32_t*>(address + 4)) << 32u;
     if (!Pm4::WaitComparesValue(packet, value)) return;
     submission.heldAtSubmit.insert(cursor);
-    submission.awaitedDwords.back().satisfied = true;
+    if (tracking) submission.awaitedDwords.back().satisfied = true;
 }
 
 void Driver::forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission) {

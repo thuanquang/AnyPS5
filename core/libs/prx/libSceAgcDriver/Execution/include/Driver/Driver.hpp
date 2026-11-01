@@ -154,7 +154,7 @@ private:
     void reserveOutputs(Submission& submission);
     void executeRewindTail(const Submission& stalled);
     void enqueue(Submission submission);
-    void noteHeldAtSubmit(Submission& submission, std::size_t cursor);
+    void noteHeldAtSubmit(Submission& submission, std::size_t cursor, bool tracking);
     static void forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission);
     static void forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites);
     void passAwaited(const Submission& submission, std::span<const std::uint32_t> packet);
