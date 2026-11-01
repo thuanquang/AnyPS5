@@ -1,0 +1,47 @@
+**seconds 95:20** from present 5659: 1199 presents, frame p50 16.7 / p90 16.9 / p99 17.2 / max 17.7 ms, GPU busy 4.3 ms per present
+AMD Radeon RX 6700 XT, AMD proprietary driver 26.10.1 (AMD proprietary shader compiler), Windows 10.0.26200, 1920x1080, commit ba3818375575, dropped: no
+
+```json
+{"commit":"ba3818375575","dirty":false,"env":{"APS5_NO_PAD_INPUT":"1","APS5_PAD_INPUT_FILE":"<path>","APS5_TRACE_SECONDS":"95:20"},"gpu":"AMD Radeon RX 6700 XT","driver":"AMD proprietary driver 26.10.1 (AMD proprietary shader compiler)","os":"Windows 10.0.26200","cpu":"AMD Ryzen 5 5600X 6-Core Processor","cpu_threads":12,"memory_mib":32690,"title_id":"PPSA14363","title":"METAL GEAR SOLID - Master Collection Version","content_version":"03.000.000","resolution":"1920x1080","window":{"spec":"seconds 95:20","first_present":5659,"ms":20003.334},"presents":1199,"frame_ms":{"p50":16.683,"p90":16.896,"p99":17.212,"max":17.719},"gpu_busy_ms_per_present":4.337,"worker_busy_pct":{"queue worker 0x0":4.415},"top_phases_ms_per_frame":{"VideoOut.Flip":14.523,"VideoOut.Flip.vblank_wait":13.458,"VideoOut.Flip.present":0.982,"Driver.Present":0.98,"Driver.Packet":0.733,"Driver.Present.queue_present":0.605,"Vulkan.QueuePresent":0.603,"Vulkan.QueuePresent.queue_present":0.601},"trace_dropped":false,"trace":"aps5-trace-ba3818375575-7124.json.gz"}
+```
+
+**Slowest frames** (largest slices inside each, inclusive)
+
+- present 6646: 17.7 ms at 16466 ms: Driver.WorkerWait (queue worker 0x0) 16.7, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x0) 16.7, VideoOut.Flip (presenter) 15.4, VideoOut.Flip.vblank_wait (presenter) 14.0
+- present 6845: 17.5 ms at 19786 ms: Driver.WorkerWait (queue worker 0x0) 17.2, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x0) 17.2, VideoOut.Flip (presenter) 16.2, VideoOut.Flip.vblank_wait (presenter) 15.3
+- present 6314: 17.4 ms at 10928 ms: Driver.WorkerWait (queue worker 0x0) 16.3, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x0) 16.3, VideoOut.Flip (presenter) 14.8, VideoOut.Flip.vblank_wait (presenter) 13.4
+- present 6260: 17.4 ms at 10027 ms: Driver.WorkerWait (queue worker 0x0) 16.2, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x0) 16.2, VideoOut.Flip (presenter) 14.7, VideoOut.Flip.vblank_wait (presenter) 13.3
+- present 6617: 17.4 ms at 15983 ms: Driver.WorkerWait (queue worker 0x0) 17.0, Driver.WorkerWait.idle_and_completion_poll (queue worker 0x0) 17.0, VideoOut.Flip (presenter) 15.8, VideoOut.Flip.vblank_wait (presenter) 14.5
+
+**Threads** (ms per frame)
+
+| thread | busy | wait | untraced | in slices < 20 us | largest |
+|---|---|---|---|---|---|
+| title | 0.0 (0 %) | 0.0 (0 %) | 16.7 | 0.3 | Shader.ResolveGraphicsStagesAbi 0.0, Shader.ResolveAbi 0.0 |
+| queue worker 0x0 | 0.6 (3 %) | 15.9 (95 %) | 0.2 | 0.5 | Driver.Packet 0.6, Driver.EndSubmission 0.0 |
+| draw committer | 0.4 (2 %) | 0.0 (0 %) | 16.3 | 0.2 | Graphics.Draw 0.3, Vulkan.DrawFromRecipe 0.1 |
+| presenter | 0.9 (5 %) | 13.6 (82 %) | 2.1 | 0.0 | VideoOut.Flip 14.5, Driver.Present 0.0 |
+| gpu | 4.3 (26 %) | 0.0 (0 %) | 12.4 | 0.0 | batch 4.3 |
+
+**Largest slices** (ms per frame, inclusive, all threads): Driver.WorkerWait 15.9, Driver.WorkerWait.idle_and_completion_poll 15.9, VideoOut.Flip 14.5, VideoOut.Flip.vblank_wait 13.5, batch 4.3, VideoOut.Flip.present 1.0, Driver.Present 1.0, Driver.Present.queue_present 0.6, Vulkan.QueuePresent 0.6, Vulkan.QueuePresent.queue_present 0.6
+
+**Longest waits**
+
+- Driver.WorkerWait (queue worker 0x0) 18.2 ms at 19789 ms, present 6845
+- Driver.WorkerWait (queue worker 0x0) 18.1 ms at 3473 ms, present 5867
+- Driver.WorkerWait (queue worker 0x0) 18.0 ms at 14951 ms, present 6555
+- Driver.WorkerWait (queue worker 0x0) 18.0 ms at 3640 ms, present 5877
+- Driver.WorkerWait (queue worker 0x0) 17.9 ms at 8511 ms, present 6169
+- Driver.WorkerWait (queue worker 0x0) 17.9 ms at 19822 ms, present 6847
+- Driver.WorkerWait (queue worker 0x0) 17.9 ms at 11714 ms, present 6361
+- Driver.WorkerWait (queue worker 0x0) 17.8 ms at 18721 ms, present 6781
+- Driver.WorkerWait (queue worker 0x0) 17.8 ms at 4006 ms, present 5899
+- Driver.WorkerWait (queue worker 0x0) 17.8 ms at 19555 ms, present 6831
+
+**Largest GPU batches** (GPU ranges inside, and the CPU slices that recorded each, inclusive)
+
+- batch 1196: 9.1 ms at 19941 ms, present 6854: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.5, Graphics.Draw.draw_and_resource_release (draw committer) 0.5, Vulkan.DrawFromRecipe (draw committer) 0.1, Graphics.DrawWithRecipe (draw committer) 0.1
+- batch 620: 9.1 ms at 10332 ms, present 6278: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.6, Graphics.Draw.draw_and_resource_release (draw committer) 0.5, Vulkan.DrawFromRecipe (draw committer) 0.1, Graphics.DrawWithRecipe (draw committer) 0.1
+- batch 1048: 8.9 ms at 17472 ms, present 6706: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.4, Graphics.Draw.draw_and_resource_release (draw committer) 0.4, Vulkan.DrawFromRecipe (draw committer) 0.0, Graphics.DrawWithRecipe (draw committer) 0.0
+- batch 632: 8.9 ms at 10532 ms, present 6290: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.5, Graphics.Draw.draw_and_resource_release (draw committer) 0.4, Vulkan.DrawFromRecipe (draw committer) 0.1, Graphics.DrawWithRecipe (draw committer) 0.1
+- batch 1054: 8.9 ms at 17572 ms, present 6712: GPU no ranges; recorded by Graphics.Draw (draw committer) 0.5, Graphics.Draw.draw_and_resource_release (draw committer) 0.4, Vulkan.DrawFromRecipe (draw committer) 0.0, Graphics.DrawWithRecipe (draw committer) 0.0
