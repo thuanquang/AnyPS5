@@ -735,7 +735,7 @@ void testPieceSince(const std::filesystem::path& directory) {
     expectGroups(reader, failures, whole, {groups[0]}, "the 64 KiB piece written whole before the first suspend point");
     expectGroups(reader, failures, whole + Block - Page, {groups[0]}, "the last page of the 64 KiB piece written whole before the first suspend point");
     expectGroups(reader, failures, lateC, {groups[2]}, "the page of a range committed during the capture written before the delta that added it");
-    expectGroups(reader, failures, lateD, {groups[3]}, "the page of that range written after the delta that added it");
+    expectGroups(reader, failures, lateD, {groups[2], groups[3]}, "the page of that range written after the delta that added it, which writes every block of the range it adds");
     if (!failures.empty()) throw std::runtime_error(failures);
 }
 
