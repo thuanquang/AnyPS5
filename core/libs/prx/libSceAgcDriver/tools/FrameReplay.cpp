@@ -189,6 +189,23 @@ void requireMemoryInRanges(const FrameCaptureReader& reader) {
     }
 }
 
+void requireRecordedSerials(const FrameCaptureReader& reader) {
+    if (reader.Version() < 2) return;
+    const auto& calls = reader.Calls();
+    const auto start = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
+    if (start == calls.end()) return;
+    auto last = calls.end();
+    for (auto call = start; call != calls.end(); ++call) {
+        if (call->kind == FrameCallKind::Memory && (call->flags & AgcDriver::InFlightDeltaFlag) != 0) last = call;
+    }
+    if (last == calls.end()) return;
+    for (auto call = start; call != last; ++call) {
+        if (call->kind != FrameCallKind::Submit && call->kind != FrameCallKind::Flip && call->kind != FrameCallKind::Suspend) continue;
+        if (call->values.size() == (call->kind == FrameCallKind::Flip ? 5u : 1u)) continue;
+        throw std::runtime_error("frame replay: call " + std::to_string(call->ordinal) + " (" + std::string(AgcDriver::FrameCallName(call->kind)) + ") has no recorded serial, so the submissions in flight at the memory delta of call " + std::to_string(last->ordinal) + " cannot be mapped to this replay's");
+    }
+}
+
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
     reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
 }
@@ -372,6 +389,13 @@ std::pair<std::uint64_t, std::uint64_t> progress() {
     return {accepted, completed};
 }
 
+std::optional<std::uint64_t> frameStartSerial(const FrameCaptureReader& reader) {
+    const auto& calls = reader.Calls();
+    const auto start = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
+    if (start == calls.end()) return std::nullopt;
+    return start->accepted;
+}
+
 struct Replay {
     const Options& options;
     const FrameCaptureReader& reader;
@@ -402,6 +426,9 @@ struct Replay {
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
     std::uint64_t singleThreadOrdinal = 0;
+    std::uint64_t mappedOrdinal = 0;
+    std::uint64_t replayBase = 0;
+    std::optional<std::uint64_t> captureBase = frameStartSerial(reader);
     std::size_t pass = 0;
     bool recording = false;
     Clock::time_point startedAt{};
@@ -534,7 +561,7 @@ struct Replay {
             return;
         case FrameCallKind::Submit: {
             const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
-            traced(call, [&] {
+            issue(call, [&] {
                 if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
                 else sceAgcDriverSubmitAcb(call.queue, &packet);
             });
@@ -542,7 +569,7 @@ struct Replay {
             return;
         }
         case FrameCallKind::Flip:
-            traced(call, [&] { AgcDriverSubmitFlip_nid_postfix(flipInfo(call)); });
+            issue(call, [&] { AgcDriverSubmitFlip_nid_postfix(flipInfo(call)); });
             return;
         case FrameCallKind::ReserveEopFlip: {
             const auto token = static_cast<std::uint32_t>(call.values.at(4));
@@ -558,7 +585,7 @@ struct Replay {
             return;
         }
         case FrameCallKind::Suspend:
-            traced(call, [] { AgcDriverSuspendPoint_nid_postfix(); });
+            issue(call, [] { AgcDriverSuspendPoint_nid_postfix(); });
             return;
         case FrameCallKind::Memory: {
             const std::unique_lock lock(memoryMutex);
@@ -566,6 +593,7 @@ struct Replay {
             const bool pacing = options.pace && recording;
             if (pacing && reader.Version() >= 2 && (call.flags & AgcDriver::InFlightDeltaFlag) != 0) {
                 if (call.ordinal > singleThreadOrdinal) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " was read with submissions in flight after a second thread made calls, which this replay cannot order");
+                if (const auto accepted = progress().first; captureBase && accepted - replayBase != call.accepted - *captureBase) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " was read in flight at capture serial " + std::to_string(call.accepted) + ", which maps to replay serial " + std::to_string(replayBase + (call.accepted - *captureBase)) + ", but this replay had accepted " + std::to_string(accepted));
                 waitStarted(call);
                 memoryWaited(inFlightWaitedNs, began);
                 restoreGroup(call.values.at(0));
@@ -757,6 +785,11 @@ struct Replay {
             singleThreadOrdinal = call.ordinal - 1;
             break;
         }
+        mappedOrdinal = 0;
+        for (const auto& call : calls) {
+            if (options.pace && recording && reader.Version() >= 2 && captureBase && call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0 && call.ordinal <= singleThreadOrdinal) mappedOrdinal = std::max(mappedOrdinal, call.ordinal);
+        }
+        replayBase = progress().first;
         std::mutex mutex;
         std::condition_variable turn;
         std::size_t started = 0;
@@ -846,6 +879,29 @@ struct Replay {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
+    }
+
+    static std::optional<std::uint64_t> takenSerial(const FrameCall& call) {
+        if (call.values.size() != (call.kind == FrameCallKind::Flip ? 5u : 1u)) return std::nullopt;
+        return call.values.back();
+    }
+
+    template <typename TFunction>
+    void issue(const FrameCall& call, TFunction&& function) {
+        if (!recording || call.ordinal >= mappedOrdinal) {
+            traced(call, std::forward<TFunction>(function));
+            return;
+        }
+        const std::string name(AgcDriver::FrameCallName(call.kind));
+        const auto taken = takenSerial(call);
+        if (!taken) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + name + ") has no recorded serial, so the submissions in flight at the memory delta of call " + std::to_string(mappedOrdinal) + " cannot be mapped to this replay's");
+        const auto before = progress().first;
+        traced(call, std::forward<TFunction>(function));
+        const auto after = progress().first;
+        const auto mapped = *taken == 0 ? before : replayBase + (*taken - *captureBase);
+        if (after == mapped) return;
+        throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + name + ") took " + (after == before ? std::string("no replay serial") : "replay serial " + std::to_string(after)) + " where " +
+                                 (*taken == 0 ? std::string("the capture's call took none") : "the capture's serial " + std::to_string(*taken) + " maps to " + std::to_string(mapped)) + ", so the memory delta of call " + std::to_string(mappedOrdinal) + " read in flight cannot be mapped to this replay's submissions");
     }
 
     template <typename TFunction>
@@ -1223,6 +1279,7 @@ int run(const Options& options) {
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
+    if (options.pace) requireRecordedSerials(reader);
     auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
     Replay replay{options, reader};

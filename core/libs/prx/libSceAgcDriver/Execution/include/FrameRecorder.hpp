@@ -110,7 +110,7 @@ private:
 
     FrameCall make(FrameCallKind kind);
     void record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders = {}, const std::function<void()>& accept = {});
-    void recordLocked(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders);
+    bool recordLocked(FrameCall& call, bool prologueCall, std::span<const Shader* const> shaders);
     void emitDelta(const StartedProgressSnapshot* decision = nullptr);
     void emitShaderDelta(std::span<const Shader* const> shaders, const StartedProgressSnapshot* decision = nullptr);
     void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {}, const StartedProgressSnapshot* decision = nullptr);
