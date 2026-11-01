@@ -1583,11 +1583,22 @@ void checkUnwatchedInFlight(const std::filesystem::path& tool, bool restored) {
     check(sceAgcDriverSubmitDcb(&running) == 0, "the busy submission failed");
     awaitStarted();
     if (restored) {
-        waitUntil([&] { return std::atomic_ref<std::uint32_t>(*word).load(std::memory_order_acquire) == Done; }, "the busy submission did not store into the unwatched block");
+        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::atomic_ref<std::uint32_t>(*word).load(std::memory_order_acquire) != Done) {
+            check(std::chrono::steady_clock::now() < limit, "the busy submission did not store into the unwatched block within 10 s");
+            std::this_thread::yield();
+        }
         std::atomic_ref<std::uint32_t>(*word).store(0, std::memory_order_release);
     }
     const auto stored = pattern(149);
     std::memcpy(other.source, stored.data(), stored.size());
+    if (restored) {
+        std::uint64_t accepted = 0;
+        std::uint64_t completed = 0;
+        AgcDriverSerialProgress_nid_postfix(&accepted, &completed);
+        const auto halfway = std::atomic_ref<std::uint32_t>(reinterpret_cast<std::uint32_t*>(busy.base + BusyLabels)[BusyPackets / 2]).load(std::memory_order_acquire);
+        if (completed >= accepted || halfway == Done) throw Inconclusive("the busy submission passed half of its labels before the title's next call; raise BusyPackets");
+    }
     check(sceAgcDriverSubmitDcb(&closing) == 0, "the submission behind the busy one failed");
     AgcDriverWaitIdle_nid_postfix();
     flip();
@@ -1603,6 +1614,7 @@ void checkUnwatchedInFlight(const std::filesystem::path& tool, bool restored) {
     const auto& calls = reader.Calls();
     const auto submit = std::find_if(calls.begin(), calls.end(), [&](const auto& call) { return call.kind == FrameCallKind::Submit && call.address == at(layout.secondCommands); });
     check(submit != calls.end(), "the capture lost the submission behind the busy one: " + header);
+    check(!restored || submit->accepted != submit->completed, "the call behind the busy submission was recorded with nothing in flight, although the busy submission was still running before the call: " + header);
     if (submit->accepted == submit->completed) throw Inconclusive("the busy submission finished before the title's next call, so no delta was read while it ran");
     const auto delta = std::find_if(calls.begin(), calls.end(), [&](const auto& call) { return call.kind == FrameCallKind::Memory && call.ordinal + 1 == submit->ordinal; });
     check(delta != calls.end(), "the capture recorded no memory delta for the page the title wrote while the busy submission ran: " + header);
