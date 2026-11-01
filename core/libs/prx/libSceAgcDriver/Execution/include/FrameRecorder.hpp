@@ -93,6 +93,7 @@ private:
         std::uint32_t protection = 0;
         std::uint32_t access = 0;
         bool readable = false;
+        std::vector<std::uint64_t> since;
     };
 
     FrameRecorder(std::filesystem::path directory, std::filesystem::path trigger, std::uint64_t atBoundary, std::uint64_t frames);
@@ -105,12 +106,13 @@ private:
     struct Span {
         std::uint64_t address = 0;
         std::uint64_t bytes = 0;
-        std::uint64_t since = 0;
+        std::uint64_t* since = nullptr;
     };
 
     FrameCall make(FrameCallKind kind);
     void record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders = {}, const std::function<void()>& accept = {});
     bool recordLocked(FrameCall& call, bool prologueCall, std::span<const Shader* const> shaders);
+    static bool collects(const Range& range);
     void emitDelta(const StartedProgressSnapshot* decision = nullptr);
     void emitShaderDelta(std::span<const Shader* const> shaders, const StartedProgressSnapshot* decision = nullptr);
     void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {}, const StartedProgressSnapshot* decision = nullptr);
@@ -141,7 +143,7 @@ private:
     std::vector<FrameCall> prologue;
     std::deque<FrameCall> reservations;
     std::vector<Range> ranges;
-    std::map<std::uint64_t, std::uint64_t> shaderMarks;
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> shaderMarks;
     std::map<std::uint64_t, std::uint64_t> hostPageHashes;
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::pair<std::uint64_t, std::uint64_t>> unwatchedHashes;
     inline static std::atomic<bool> notingGpuStores{false};
