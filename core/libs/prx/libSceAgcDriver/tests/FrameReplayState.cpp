@@ -840,9 +840,15 @@ void testPartlyCoveredBlock(const std::filesystem::path& directory) {
     auto* recorder = AgcDriver::FrameRecorder::Active();
     check(recorder != nullptr, "frame recorder is disabled");
     recorder->FrameBoundary();
+    std::fill_n(bytes + Page, Page, std::byte{0x3c});
     recorder->RegisterShader(shader);
     recorder->FrameBoundary();
     const FrameCaptureReader reader(directory);
+    const auto& calls = reader.Calls();
+    const auto registration = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::RegisterShader; });
+    check(registration != calls.end() && registration != calls.begin() && (registration - 1)->kind == FrameCallKind::Memory, "the shader registration has no memory delta before it");
+    const auto written = deltaGroupsHolding(reader, bytes + Page);
+    check(std::find(written.begin(), written.end(), (registration - 1)->values.at(0)) != written.end(), "the page written during the capture, in the shader block the captured ranges cover only in part, is not in the shader registration's memory delta");
     const auto groups = deltaGroupsHolding(reader, bytes);
     if (groups.empty()) return;
     std::string failure = "the page written before the capture, in a shader block the captured ranges cover only in part, is in memory delta groups";
