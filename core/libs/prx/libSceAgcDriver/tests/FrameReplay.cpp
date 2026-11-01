@@ -1019,6 +1019,7 @@ void testDeltaReadInFlight(const std::filesystem::path& tool) {
     check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
     const FrameCaptureReader reader(directory);
     deltaReadInFlight(reader, layout.secondCommands);
+    check(reader.Header().find("\"read_depths\":[0,1,0,") != std::string::npos, "the capture header does not count the one delta read in flight behind one running submission: " + reader.Header());
     check(replayed(tool, checkCapture(1), layout.firstTarget, DataBytes) == stored, "the replay did not copy the page the title stored while the busy submission ran");
 }
 
@@ -1192,6 +1193,13 @@ void testHoldDiagnostics(const std::filesystem::path& tool) {
     waitUntil([&] { return awaits(awaitedLabel); }, "the compute submission never waited on its label");
     std::memset(layout.source, 0x11, DataBytes);
     check(sceAgcDriverSubmitDcb(&labelWriter) == 0, "the submission that writes the awaited label failed");
+    awaitStarted();
+    const auto firstPage = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::atomic_ref<std::uint32_t>(busyLabels[1024]).load(std::memory_order_acquire) != Done) {
+        check(std::chrono::steady_clock::now() < firstPage, "the busy submission did not finish its first page of labels within 10 s");
+        std::this_thread::yield();
+    }
+    std::atomic_ref<std::uint32_t>(busyLabels[0]).store(Stored, std::memory_order_release);
     std::memset(layout.source, 0x22, DataBytes);
     if (!awaits(awaitedLabel) || std::atomic_ref<std::uint32_t>(*awaitedLabel).load(std::memory_order_acquire) == Done) throw Inconclusive("the busy labels reached the awaited label before the title's next call; raise BusyPackets");
     check(sceAgcDriverSubmitDcb(&afterLabel) == 0, "the submission after the label wait failed");
@@ -1207,6 +1215,8 @@ void testHoldDiagnostics(const std::filesystem::path& tool) {
         const auto count = AgcDriverAwaitedWaits_nid_postfix(waits.data(), waits.size());
         return std::any_of(waits.begin(), waits.begin() + static_cast<std::ptrdiff_t>(count), [&](const auto& wait) { return wait.address == at(gate); });
     }, "the gated submission never waited on its gate");
+    std::atomic_ref<std::uint32_t>(busyLabels[1]).store(Stored, std::memory_order_release);
+    std::atomic_ref<std::uint32_t>(layout.label[3]).store(Stored, std::memory_order_release);
     auto behind = commands(layout.secondCommands);
     writeDone(behind, layout.label + 2);
     Packet queued{layout.secondCommands, static_cast<std::uint32_t>(behind.cursor_up - layout.secondCommands), 0, {}};
@@ -1225,7 +1235,7 @@ void testHoldDiagnostics(const std::filesystem::path& tool) {
     const FrameCaptureReader reader(capture);
     const auto& header = reader.Header();
     const auto reasons = jsonCounts(jsonObject(header, "hold_reasons"));
-    check(jsonCount(reasons, "parked", header) >= 2 && jsonCount(reasons, "queued", header) >= 1, "the capture did not count both the parked gate and the submission queued behind it for the delta read while both were in flight: " + header);
+    check(jsonCount(reasons, "parked", header) >= 4 && jsonCount(reasons, "queued", header) >= 1, "the capture did not count both the parked gate and the submission queued behind it for the delta read while both were in flight: " + header);
     check(jsonCount(reasons, "unwatched", header) == 0, "the capture held a delta for an unwatched block that only the title had written since its last record: " + header);
     const auto masks = jsonCounts(jsonObject(header, "hold_masks"));
     check(std::any_of(masks.begin(), masks.end(), [](const auto& mask) {
@@ -1239,13 +1249,18 @@ void testHoldDiagnostics(const std::filesystem::path& tool) {
     for (const char* name : {"parked_on_title", "driver_page_since_full", "title_wait_unpassed", "wait_dword_in_delta"}) check(reasons.contains(name), std::string("the capture header does not count the hold reason ") + name + ": " + header);
     check(header.find("\"read_depths\":[") != std::string::npos, "the capture header has no read_depths: " + header);
     check(jsonCount(reasons, "title_wait_unpassed", header) >= 1, "the capture did not count the gate the parked submission waits on as an unpassed wait on title memory: " + header);
-    const auto parkedMask = [&](bool title) {
+    const auto anyMask = [&](std::initializer_list<const char*> with, std::initializer_list<const char*> without) {
         return std::any_of(masks.begin(), masks.end(), [&](const auto& mask) {
             const auto names = "+" + mask.first + "+";
-            return names.find("+parked+") != std::string::npos && (names.find("+parked_on_title+") != std::string::npos) == title;
+            const auto has = [&](const char* name) { return names.find(std::string("+") + name + "+") != std::string::npos; };
+            return std::all_of(with.begin(), with.end(), has) && std::none_of(without.begin(), without.end(), has);
         });
     };
-    check(parkedMask(true) && parkedMask(false), "the hold masks do not tell a queue parked on the title's gate from one parked on a label that a submission in flight writes: " + header);
+    check(anyMask({"parked", "parked_on_title", "title_wait_unpassed"}, {"wait_dword_in_delta"}), "no hold mask counts the queue parked on a dword nothing in flight labels as parked on title memory with an unpassed wait whose dword the delta does not hold: " + header);
+    check(anyMask({"parked"}, {"parked_on_title", "title_wait_unpassed"}), "no hold mask counts the queue parked on a label that a submission in flight writes as parked without parked_on_title or title_wait_unpassed: " + header);
+    check(anyMask({"driver_page", "driver_page_since_full"}, {}), "no hold mask counts the label page the driver stored into after the last full delta as driver_page_since_full: " + header);
+    check(anyMask({"driver_page"}, {"driver_page_since_full"}), "no hold mask counts the label page the driver stored into before the last full delta as driver_page without driver_page_since_full: " + header);
+    check(anyMask({"wait_dword_in_delta"}, {}), "no hold mask counts the delta holding the gate's page as holding a dword the parked submission waits on: " + header);
 
     const auto result = capture / "hold diagnostics.json";
     const auto dump = capture / "hold diagnostics.bin";
