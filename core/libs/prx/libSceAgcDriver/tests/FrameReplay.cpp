@@ -1463,15 +1463,17 @@ void checkAwaitAfterRead(const std::filesystem::path& tool, WaitKind kind, std::
     std::memcpy(layout.source, copied.data(), copied.size());
     if (kind == WaitKind::Semaphore && std::atomic_ref<std::uint32_t>(*marker).load(std::memory_order_acquire) == Done) throw Inconclusive("the submission reached its semaphore before the title's next call; raise BusyWrites");
     bool reached = false;
+    std::atomic<bool> calling{false};
     std::jthread signaller;
     if (kind == WaitKind::Semaphore) {
         signaller = std::jthread([&] {
             const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (std::atomic_ref<std::uint32_t>(*marker).load(std::memory_order_acquire) != Done && std::chrono::steady_clock::now() < limit) std::this_thread::yield();
+            while ((!calling.load(std::memory_order_acquire) || std::atomic_ref<std::uint32_t>(*marker).load(std::memory_order_acquire) != Done) && std::chrono::steady_clock::now() < limit) std::this_thread::yield();
             reached = std::atomic_ref<std::uint32_t>(*marker).load(std::memory_order_acquire) == Done;
             passAwait(kind, word);
         });
     }
+    calling.store(true, std::memory_order_release);
     submitLabel(layout.firstCommands, layout.label + 2);
     if (kind == WaitKind::Semaphore) {
         signaller.join();
