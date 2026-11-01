@@ -1331,11 +1331,11 @@ void testStoreAfterLastFrame(const std::filesystem::path& tool) {
     const FrameCaptureReader reader(directory);
     const auto& header = reader.Header();
     check(!header.empty(), "the capture has no capture.json");
+    deltaReadInFlight(reader, layout.secondCommands);
     std::vector<std::uint64_t> flagged;
     for (const auto& call : reader.Calls()) {
         if (call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0 && !call.values.empty()) flagged.push_back(call.values.front());
     }
-    if (flagged.empty()) throw Inconclusive("the labels finished before a delta holding the title's half of the page was read, or the capture held every such delta: " + header);
     const auto number = [&](const std::string& key) -> std::uint64_t {
         const auto found = header.find("\"" + key + "\":");
         return found == std::string::npos ? 0 : std::stoull(header.substr(found + key.size() + 3));
