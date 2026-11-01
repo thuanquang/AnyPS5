@@ -1621,8 +1621,15 @@ void storageWriterTests(const Device& device, Recorder& recorder) {
     resource.dstSelW = 7;
     const auto guestBytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
     Require(guestBytes != 0 && guestBytes <= bytes, "the storage writer surface does not fit in its block");
-    for (const std::uint64_t dropped : {std::uint64_t{100}, std::uint64_t{0}}) {
-        const auto what = "a storage image marked pending under serial " + std::to_string(dropped) + ", dropped without a write-back and marked again under serial 141";
+    struct Case {
+        std::uint64_t earlier;
+        bool dropped;
+        std::uint64_t later;
+        std::uint64_t reported;
+    };
+    for (const auto& [earlier, dropped, later, reported] : {Case{100, true, 141, 141}, Case{0, true, 141, 141}, Case{141, false, AgcDriver::GuestMemory::TitleCallStoreSerial, 0}}) {
+        const auto what = dropped ? "a storage image marked pending under serial " + std::to_string(earlier) + ", dropped without a write-back and marked again under serial 141" : std::string("a storage image marked pending under serial 141 and again under a title call");
+        const auto why = dropped ? std::string(", the only writer of the results it still held") : std::string(" (unattributed), since a title call also wrote the results it still held");
         std::memset(block, 0x11, bytes);
         auto image = StorageTexture::Create(context, detiler, resource, 0);
         {
@@ -1635,12 +1642,12 @@ void storageWriterTests(const Device& device, Recorder& recorder) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         }
         {
-            const AgcDriver::GuestMemory::StoreSerialScope writer(dropped);
+            const AgcDriver::GuestMemory::StoreSerialScope writer(earlier);
             image->MarkDirty();
         }
-        Require(StorageTexture::DiscardPendingInside(address, guestBytes) == 1, what + ": the drop did not discard the image's pending results");
+        if (dropped) Require(StorageTexture::DiscardPendingInside(address, guestBytes) == 1, what + ": the drop did not discard the image's pending results");
         {
-            const AgcDriver::GuestMemory::StoreSerialScope writer(141);
+            const AgcDriver::GuestMemory::StoreSerialScope writer(later);
             image->MarkDirty();
         }
         {
@@ -1658,7 +1665,7 @@ void storageWriterTests(const Device& device, Recorder& recorder) {
         for (const auto& [begin, serial] : observedStores) {
             if (begin < address || begin >= address + guestBytes) continue;
             ++stored;
-            Require(serial == 141, what + ": its write-back was reported under serial " + std::to_string(serial) + " instead of 141, the only writer of the results it still held");
+            Require(serial == reported, what + ": its write-back was reported under serial " + std::to_string(serial) + " instead of " + std::to_string(reported) + why);
         }
         Require(stored != 0, what + ": its write-back made no observed driver store");
     }
