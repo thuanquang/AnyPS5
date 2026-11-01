@@ -179,6 +179,17 @@ void FrameRecorder::noteDriverStore(std::uint64_t begin, std::uint64_t end, std:
     }
 }
 
+bool FrameRecorder::driverStoredSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t stores) {
+    std::lock_guard lock(storeMutex);
+    for (const auto& [begin, end] : blocks) {
+        for (auto page = begin & ~std::uint64_t{HostPageBytes - 1}; page < end; page += HostPageBytes) {
+            const auto found = driverPages.find(page);
+            if (found != driverPages.end() && found->second > stores) return true;
+        }
+    }
+    return false;
+}
+
 std::uint32_t FrameRecorder::holdMask(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks) {
     std::uint32_t mask = 0;
     auto& driver = DriverDetail::Driver::Get();
@@ -635,6 +646,8 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     finishedWaitDwords.insert(finishedWaitDwords.end(), awaited.finished.begin(), awaited.finished.end());
     auto accepted = entry.accepted;
     auto completed = entry.completed;
+    const auto mark = GuestMemory::WriteGeneration();
+    const auto previousStores = readStores;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> blocks;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwatched;
@@ -644,7 +657,8 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             const auto bytes = static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, span.bytes - offset));
             if (GuestMemory::Watched(at, bytes)) {
                 auto& since = span.since[offset / FrameCaptureWriter::BlockBytes];
-                since = std::max(since, GuestMemory::CollectWrittenBlocks(at, bytes, since, written));
+                const auto collected = GuestMemory::CollectWrittenBlocks(at, bytes, since, written);
+                since = std::max(since, !written.empty() && driverStoredSince(written, previousStores) ? mark : collected);
                 blocks.insert(blocks.end(), written.begin(), written.end());
             } else {
                 blocks.emplace_back(at, at + bytes);
@@ -711,7 +725,11 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         for (std::uint64_t at = 0; at < range.bytes;) {
             bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
             const bool walked = collected && GuestMemory::Watched(range.address + at, bytes.size());
-            if (walked) range.since[static_cast<std::size_t>(at / FrameCaptureWriter::BlockBytes)] = GuestMemory::CollectWrittenBlocks(range.address + at, bytes.size(), std::numeric_limits<std::uint64_t>::max(), written);
+            if (walked) {
+                const auto walkedTo = GuestMemory::CollectWrittenBlocks(range.address + at, bytes.size(), std::numeric_limits<std::uint64_t>::max(), written);
+                const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> piece{{{range.address + at, range.address + at + bytes.size()}}};
+                range.since[static_cast<std::size_t>(at / FrameCaptureWriter::BlockBytes)] = driverStoredSince(piece, previousStores) ? mark : walkedTo;
+            }
             readGuest(range.address + at, bytes);
             writeTitleWords(range.address + at, !walked && std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; }));
             if (!GuestMemory::Watched(range.address + at, bytes.size())) recordUnwatched(range.address + at, bytes, stores);
