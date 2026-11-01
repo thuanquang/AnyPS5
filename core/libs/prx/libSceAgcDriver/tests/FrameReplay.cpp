@@ -458,6 +458,14 @@ std::filesystem::path checkCapture(std::uint64_t inFlight) {
     return capture;
 }
 
+void checkCallSerials(const FrameCaptureReader& reader, bool flipWithoutSerial) {
+    for (const auto& call : reader.Calls()) {
+        if (call.kind == FrameCallKind::Submit || call.kind == FrameCallKind::Suspend) check(call.values == std::vector<std::uint64_t>{call.accepted + 1}, "the capture did not record the serial that call " + std::to_string(call.ordinal) + " took: " + reader.Header());
+        if (call.kind == FrameCallKind::Flip) check(call.values.size() == 5 && (call.values.back() == 0 || call.values.back() == call.accepted + 1), "the capture did not record the serial that flip " + std::to_string(call.ordinal) + " took, or 0 for none: " + reader.Header());
+    }
+    if (flipWithoutSerial) check(std::any_of(reader.Calls().begin(), reader.Calls().end(), [](const auto& call) { return call.kind == FrameCallKind::Flip && call.values.size() == 5 && call.values.back() == 0; }), "the capture did not record 0 for the CPU flip that took no serial: " + reader.Header());
+}
+
 std::vector<std::byte> replayed(const std::filesystem::path& tool, const std::filesystem::path& capture, const void* address, std::size_t bytes, const std::string& options = "") {
     const auto dump = capture / "dump.bin";
     auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict" + options + " --dump " + std::to_string(at(address)) + ":" + std::to_string(bytes) + ":\"" + dump.string() + "\"";
@@ -836,7 +844,9 @@ void testGpuFillRestoredToCachedValue(const std::filesystem::path& tool) {
     std::memset(bulk.base, 0, FillBytes);
     flip();
     AgcDriverWaitIdle_nid_postfix();
-    const auto dumped = replayed(tool, checkCapture(0), word, 4);
+    const auto capture = checkCapture(0);
+    checkCallSerials(FrameCaptureReader(capture), true);
+    const auto dumped = replayed(tool, capture, word, 4);
     std::uint32_t value = 0;
     std::memcpy(&value, dumped.data(), sizeof(value));
     check(value == 0, "the replay lost a CPU restore matching the cached bytes after an intervening GPU fill");
@@ -1021,6 +1031,7 @@ void testDeltaReadInFlight(const std::filesystem::path& tool) {
     const FrameCaptureReader reader(directory);
     deltaReadInFlight(reader, layout.secondCommands);
     check(reader.Header().find("\"read_depths\":[0,1,0,") != std::string::npos, "the capture header does not count the one delta read in flight behind one running submission: " + reader.Header());
+    checkCallSerials(reader, false);
     check(replayed(tool, checkCapture(1), layout.firstTarget, DataBytes) == stored, "the replay did not copy the page the title stored while the busy submission ran");
 }
 
