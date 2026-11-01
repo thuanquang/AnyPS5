@@ -83,7 +83,7 @@ public:
     bool SerialDone(std::uint64_t serial);
     void HoldForRecorder();
     void ReleaseForRecorder();
-    void ParkForRecorder();
+    void ParkForRecorder() { if (recorderHold.load(std::memory_order_acquire)) parkForRecorder(); }
     std::uint64_t FlipSubmissions() const;
     std::vector<AwaitedWait> AwaitedWaits();
     void WaitForPipelineJournal();
@@ -151,6 +151,7 @@ private:
     bool parkedOnTitle() const;
     void noteAwaitingTitle(std::uint32_t queue, std::uint64_t awaited);
     void releaseFlipHold();
+    void parkForRecorder();
     void reserveOutputs(Submission& submission);
     void executeRewindTail(const Submission& stalled);
     void enqueue(Submission submission);

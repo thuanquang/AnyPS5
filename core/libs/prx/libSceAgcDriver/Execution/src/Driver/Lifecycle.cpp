@@ -347,8 +347,7 @@ void Driver::ReleaseForRecorder() {
     changed.notify_all();
 }
 
-void Driver::ParkForRecorder() {
-    if (!recorderHold.load(std::memory_order_acquire)) return;
+void Driver::parkForRecorder() {
     std::unique_lock lock(mutex);
     changed.wait(lock, [&] { return !recorderHold.load(std::memory_order_acquire) || stopping.load(std::memory_order_acquire) || failure != nullptr; });
 }
