@@ -685,6 +685,7 @@ void testPagesCollectedOnce(const std::filesystem::path& directory) {
     AgcDriverSuspendPoint_nid_postfix();
     recorder->FrameBoundary();
     const FrameCaptureReader reader(directory);
+    check(reader.Header().find("stopped") == std::string::npos, ("the capture stopped: " + reader.Header()).c_str());
     const auto first = groupBeforeSuspend(reader, 0);
     const auto second = groupBeforeSuspend(reader, 1);
     check(first != 0 && second != 0, "the CPU writes before the first two suspend points are not in memory deltas");
@@ -726,6 +727,7 @@ void testPieceSince(const std::filesystem::path& directory) {
     AgcDriverSuspendPoint_nid_postfix();
     recorder->FrameBoundary();
     const FrameCaptureReader reader(directory);
+    check(reader.Header().find("stopped") == std::string::npos, ("the capture stopped: " + reader.Header()).c_str());
     std::array<std::uint64_t, 4> groups{};
     for (std::size_t index = 0; index < groups.size(); ++index) groups[index] = groupBeforeSuspend(reader, index);
     check(std::all_of(groups.begin(), groups.end(), [](std::uint64_t group) { return group != 0; }), "the CPU writes before the first four suspend points are not in memory deltas");
@@ -807,6 +809,7 @@ void testPendingResultRead(const std::filesystem::path& directory) {
     recorder->FrameBoundary();
     AgcDriver::GuestMemory::SetFlushHook(nullptr);
     const FrameCaptureReader reader(directory);
+    check(reader.Header().find("stopped") == std::string::npos, ("the capture stopped: " + reader.Header()).c_str());
     const auto first = groupBeforeSuspend(reader, 0);
     const auto second = groupBeforeSuspend(reader, 1);
     check(first != 0 && second != 0, "the CPU writes before the suspend points are not in memory deltas");
@@ -844,6 +847,7 @@ void testPartlyCoveredBlock(const std::filesystem::path& directory) {
     recorder->RegisterShader(shader);
     recorder->FrameBoundary();
     const FrameCaptureReader reader(directory);
+    check(reader.Header().find("stopped") == std::string::npos, ("the capture stopped: " + reader.Header()).c_str());
     const auto& calls = reader.Calls();
     const auto registration = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::RegisterShader; });
     check(registration != calls.end() && registration != calls.begin() && (registration - 1)->kind == FrameCallKind::Memory, "the shader registration has no memory delta before it");
@@ -878,6 +882,7 @@ void testLateClear(const std::filesystem::path& directory) {
     AgcDriverSuspendPoint_nid_postfix();
     recorder->FrameBoundary();
     const FrameCaptureReader reader(directory);
+    check(reader.Header().find("stopped") == std::string::npos, ("the capture stopped: " + reader.Header()).c_str());
     std::uint64_t holding = 0;
     std::uint64_t lastGroup = 0;
     std::byte last{0};
