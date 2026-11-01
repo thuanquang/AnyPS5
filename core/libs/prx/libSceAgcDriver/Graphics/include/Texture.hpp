@@ -636,6 +636,7 @@ private:
     std::vector<std::uint64_t> layerGeneration;
     std::vector<std::uint64_t> completionKept;
     std::vector<bool> layerPending;
+    std::vector<std::uint64_t> unitWriters;
     std::vector<bool> layerBehind;
     bool blockUnits = false;
     // Write-back hysteresis (block units, see writeBack): partial stores in the current window of
@@ -683,9 +684,6 @@ private:
     std::vector<std::uint64_t> storeNotes;
     std::uint64_t version = 0;
     std::uint64_t writes = 0;
-    std::uint64_t writerSerial = 0;
-    bool writerPending = false;
-    bool writerUnknown = false;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     std::vector<bool> layerOriginal;
     std::map<std::uint64_t, std::uint64_t> keptAtUnwatch;

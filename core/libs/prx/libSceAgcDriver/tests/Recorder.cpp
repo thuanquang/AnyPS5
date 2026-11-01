@@ -1576,6 +1576,94 @@ void titleCallClosureTests(const Device& device, Recorder& recorder) {
     Require(memory[0] == 1 && memory[4] == 1 && memory[8] == 1, "the completions registered under a title call did not store");
 }
 
+void storageWriterTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the storage writer block");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Release {
+        void* block;
+        ~Release() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } release{block};
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = 64;
+    resource.height = 64;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto guestBytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+    Require(guestBytes != 0 && guestBytes <= bytes, "the storage writer surface does not fit in its block");
+    for (const std::uint64_t dropped : {std::uint64_t{100}, std::uint64_t{0}}) {
+        const auto what = "a storage image marked pending under serial " + std::to_string(dropped) + ", dropped without a write-back and marked again under serial 141";
+        std::memset(block, 0x11, bytes);
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        {
+            const auto commands = recorder.Commands();
+            recorder.Keep(image);
+            const VkClearColorValue red{{1.0f, 0.0f, 0.0f, 1.0f}};
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &red, 1, &range);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        }
+        {
+            const AgcDriver::GuestMemory::StoreSerialScope writer(dropped);
+            image->MarkDirty();
+        }
+        Require(StorageTexture::DiscardPendingInside(address, guestBytes) == 1, what + ": the drop did not discard the image's pending results");
+        {
+            const AgcDriver::GuestMemory::StoreSerialScope writer(141);
+            image->MarkDirty();
+        }
+        {
+            std::lock_guard lock(observedStoresMutex);
+            observedStores.clear();
+        }
+        AgcDriver::GuestMemory::SetDriverStoreObserver(&observeStore);
+        image->WriteBack();
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        AgcDriver::GuestMemory::SetDriverStoreObserver(nullptr);
+        std::lock_guard lock(observedStoresMutex);
+        std::size_t stored = 0;
+        for (const auto& [begin, serial] : observedStores) {
+            if (begin < address || begin >= address + guestBytes) continue;
+            ++stored;
+            Require(serial == 141, what + ": its write-back was reported under serial " + std::to_string(serial) + " instead of 141, the only writer of the results it still held");
+        }
+        Require(stored != 0, what + ": its write-back made no observed driver store");
+    }
+}
+
 int gpuTimingCompletionTests(const Device& device, bool incomplete) {
     const auto& context = device.GetContext();
     if (!device.Timestamps()) {
@@ -12522,6 +12610,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--title-call-closure-only") {
             titleCallClosureTests(device, recorder);
             std::cout << "title-call completion attribution tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--storage-writer-only") {
+            storageWriterTests(device, recorder);
+            std::cout << "storage image writer attribution tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bda-staging-only") {
