@@ -923,7 +923,7 @@ int usage() {
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
-                         "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
+                         "                      with n > 1 the frame times and the in-flight depth come from passes 2 to n, after the first warmed the caches\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
                          "  --shaders           replays nothing and maps no guest memory; lists each shader registration with its code\n"
                          "                      address, size and code hash as the snapshot and the captured writes before it hold them,\n"
