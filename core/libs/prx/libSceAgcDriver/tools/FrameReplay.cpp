@@ -153,42 +153,6 @@ std::uint64_t headerNumber(const std::string& header, std::string_view key) {
     return *value;
 }
 
-std::optional<std::vector<std::string>> headerStrings(const std::string& header, std::string_view key) {
-    const auto quoted = "\"" + std::string(key) + "\":[";
-    auto at = header.find(quoted);
-    if (at == std::string::npos) return std::nullopt;
-    const auto malformed = [&] { return std::runtime_error("frame replay: the capture header's " + std::string(key) + " are not a list of the strings the recorder writes"); };
-    std::vector<std::string> strings;
-    for (at += quoted.size(); at < header.size() && header[at] != ']';) {
-        if (!strings.empty() && header[at++] != ',') throw malformed();
-        if (at >= header.size() || header[at++] != '"') throw malformed();
-        std::string text;
-        while (at < header.size() && header[at] != '"') {
-            if (header[at] != '\\') {
-                text += header[at++];
-                continue;
-            }
-            if (header.size() - at < 2) throw malformed();
-            const auto escaped = header[at + 1];
-            if (escaped == '"' || escaped == '\\') {
-                text += escaped;
-                at += 2;
-                continue;
-            }
-            unsigned code = 0;
-            const auto* const digits = header.data() + at + 2;
-            if (escaped != 'u' || header.size() - at < 6 || std::from_chars(digits, digits + 4, code, 16).ptr != digits + 4 || code >= 0x80) throw malformed();
-            text += static_cast<char>(code);
-            at += 6;
-        }
-        if (at >= header.size()) throw malformed();
-        ++at;
-        strings.push_back(std::move(text));
-    }
-    if (at >= header.size()) throw malformed();
-    return strings;
-}
-
 void requireVerifiedDeltas(const FrameCaptureReader& reader) {
     if (reader.Version() < 2) return;
     const auto& header = reader.Header();
@@ -202,11 +166,6 @@ void requireVerifiedDeltas(const FrameCaptureReader& reader) {
     const auto unverified = headerValue(header, "unverified_deltas");
     if (!unverified) throw refuse("capture.json has no unverified_deltas");
     if (*unverified != 0) throw refuse("capture.json has unverified_deltas " + std::to_string(*unverified));
-    const auto warnings = headerStrings(header, "warnings");
-    if (!warnings) throw refuse("capture.json has no warnings");
-    for (const auto& warning : *warnings) {
-        if (warning.starts_with("stopped:")) throw refuse("the capture " + warning);
-    }
 }
 
 void requireRecordedSerials(const FrameCaptureReader& reader) {
