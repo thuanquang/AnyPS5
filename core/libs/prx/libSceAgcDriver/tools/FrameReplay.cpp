@@ -636,10 +636,20 @@ struct Replay {
     void waitStarted(const FrameCall& call) {
         const auto accepted = progress().first;
         const auto limit = Clock::now() + options.busyTimeout;
+        auto lastSeen = progress();
+        auto quietSince = Clock::now();
         for (std::size_t index = 1; index < call.values.size(); ++index) {
             const auto serial = accepted - (call.accepted - call.values[index]);
+            const auto blocked = [&](const std::string& reason) { return std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for submission " + std::to_string(call.values[index]) + " (replay serial " + std::to_string(serial) + "), which had started when the capture read the delta, but " + reason); };
             while (!AgcDriverSerialDone_nid_postfix(serial)) {
-                if (Clock::now() >= limit) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waited longer than the busy timeout for submission " + std::to_string(serial) + ", which had started when the delta was read");
+                const auto now = Clock::now();
+                if (const auto seen = progress(); seen != lastSeen) {
+                    lastSeen = seen;
+                    quietSince = now;
+                } else if (now - quietSince >= options.paceTimeout && AgcDriverSettled_nid_postfix() && !AgcDriverSerialDone_nid_postfix(serial) && progress() == seen) {
+                    throw blocked("no queue runs and the serials stopped at " + std::to_string(seen.second) + "/" + std::to_string(seen.first) + "; blocked on" + describeBlocked());
+                }
+                if (now >= limit) throw blocked("it did not complete within " + std::to_string(options.busyTimeout.count()) + " ms");
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
             }
         }
