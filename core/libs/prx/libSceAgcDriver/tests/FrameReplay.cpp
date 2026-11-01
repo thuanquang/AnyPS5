@@ -1436,6 +1436,7 @@ void checkNeverReadInFlight(const Packet& awaiting) {
     const auto serial = submit->accepted + 1;
     check(std::none_of(calls.begin(), calls.end(), [&](const auto& call) { return call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0 && std::find(call.values.begin() + 1, call.values.end(), serial) != call.values.end(); }), "the capture read a memory delta in flight while submission " + std::to_string(serial) + ", in flight at the read, still waited on the semaphore the title signals: " + header);
     check(jsonCount(jsonCounts(jsonObject(header, "hold_reasons")), "awaits_title", header) >= 1, "the capture did not count the submission's semaphore wait as a hold reason: " + header);
+    check(header.find("stopped") == std::string::npos && header.find("\"frames\":2") != std::string::npos, "the capture stopped or did not record both frames, although the title signalled the semaphore once the submission reached it: " + header);
 }
 
 void checkAwaitAfterRead(const std::filesystem::path& tool, WaitKind kind, std::uint8_t seed) {
@@ -1443,7 +1444,11 @@ void checkAwaitAfterRead(const std::filesystem::path& tool, WaitKind kind, std::
     const auto busy = allocate();
     for (const auto* touched : {&layout, &busy}) std::memset(touched->base, 0, BlockBytes);
     std::uint32_t* word = nullptr;
-    const auto awaiting = awaitingCopy(busy, layout, [&](CommandBuffer& buffer) { word = emitAwait(buffer, kind, layout.secondTarget); }, false);
+    auto* const marker = reinterpret_cast<std::uint32_t*>(busy.base + BusyLabels) + 2;
+    const auto awaiting = awaitingCopy(busy, layout, [&](CommandBuffer& buffer) {
+        if (kind == WaitKind::Semaphore) writeDone(buffer, marker);
+        word = emitAwait(buffer, kind, layout.secondTarget);
+    }, false);
     const auto warming = warmingPacket(busy);
     const auto copied = pattern(seed);
     auto output = std::make_shared<Output>();
@@ -1455,9 +1460,25 @@ void checkAwaitAfterRead(const std::filesystem::path& tool, WaitKind kind, std::
     check(sceAgcDriverSubmitDcb(&awaiting) == 0, "the submission that waits on the title's flag failed");
     awaitStarted();
     if (awaits(word)) throw Inconclusive("the submission reached its wait on the title's flag before the title's next call; raise BusyWrites");
+    if (kind == WaitKind::Semaphore && std::atomic_ref<std::uint32_t>(*marker).load(std::memory_order_acquire) == Done) throw Inconclusive("the submission reached its semaphore before the title's next call; raise BusyWrites");
+    bool reached = false;
+    std::jthread signaller;
+    if (kind == WaitKind::Semaphore) {
+        signaller = std::jthread([&] {
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (std::atomic_ref<std::uint32_t>(*marker).load(std::memory_order_acquire) != Done && std::chrono::steady_clock::now() < limit) std::this_thread::yield();
+            reached = std::atomic_ref<std::uint32_t>(*marker).load(std::memory_order_acquire) == Done;
+            passAwait(kind, word);
+        });
+    }
     std::memcpy(layout.source, copied.data(), copied.size());
     submitLabel(layout.firstCommands, layout.label + 2);
-    passAwait(kind, word);
+    if (kind == WaitKind::Semaphore) {
+        signaller.join();
+        check(reached, "the submission did not reach its semaphore within 10 s after the title's next call");
+    } else {
+        passAwait(kind, word);
+    }
     submitLabel(layout.secondCommands, layout.label + 3);
     AgcDriverWaitIdle_nid_postfix();
     check(equal(layout.firstTarget, copied), "the driver did not copy the title's store after the title stored the flag");
