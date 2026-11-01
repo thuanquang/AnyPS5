@@ -504,7 +504,7 @@ struct Replay {
 
     void execute(const FrameCall& call) {
         pace(call);
-        if (recording && paced(call.kind)) sampleDepth();
+        if (recording && call.kind == FrameCallKind::Submit) sampleDepth();
         switch (call.kind) {
         case FrameCallKind::RegisterShader:
             registration([&] { AgcDriverRegisterShader_nid_postfix(shader(call.address)); });
