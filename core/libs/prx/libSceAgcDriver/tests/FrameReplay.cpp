@@ -1526,6 +1526,8 @@ void testWaitAfterLastFrame(const std::filesystem::path& tool) {
     flip();
     AgcDriverWaitIdle_nid_postfix();
     settleDeltas(warming);
+    const auto kept = pattern(61);
+    std::memcpy(written.source + 16 * DataBytes, kept.data(), kept.size());
     check(sceAgcDriverSubmitDcb(&running) == 0, "the busy submission failed");
     awaitStarted();
     const auto stored = pattern(59);
