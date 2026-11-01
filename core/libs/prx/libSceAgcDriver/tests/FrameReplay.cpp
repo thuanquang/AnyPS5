@@ -1023,6 +1023,7 @@ void testDeltaReadInFlight(const std::filesystem::path& tool) {
     check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
     const FrameCaptureReader reader(directory);
     deltaReadInFlight(reader, layout.secondCommands);
+    check(reader.Header().find("\"read_depths\":[0,1,0,") != std::string::npos, "the capture header does not count the one delta read in flight behind one running submission: " + reader.Header());
     check(replayed(tool, checkCapture(1), layout.firstTarget, DataBytes) == stored, "the replay did not copy the page the title stored while the busy submission ran");
 }
 
@@ -1163,17 +1164,50 @@ std::uint64_t jsonCount(const std::map<std::string, std::uint64_t>& counts, cons
     return found->second;
 }
 
+bool awaits(const std::uint32_t* word);
+
 void testHoldDiagnostics(const std::filesystem::path& tool) {
     constexpr std::uint32_t Stored = 0x77u;
+    constexpr std::uint32_t ComputeQueue = 0x20;
     const auto layout = allocate();
     const auto bulk = allocate();
+    const auto busy = allocate();
+    std::memset(busy.base, 0, BlockBytes);
     auto* const word = reinterpret_cast<std::uint32_t*>(bulk.base);
     AgcDriver::GuestMemory::Unwatch(at(bulk.base), 4096);
     check(!AgcDriver::GuestMemory::Watched(at(bulk.base), 4096), "the test buffer did not lose write-watch coverage");
+    auto* const busyWords = reinterpret_cast<std::uint32_t*>(busy.base);
+    auto* const busyLabels = reinterpret_cast<std::uint32_t*>(busy.base + BusyLabels);
+    auto* const awaitedLabel = busyLabels + BusyPackets;
+    CommandBuffer labelling{busyWords, busyLabels, busyWords, busyLabels, nullptr, nullptr, 0};
+    for (std::size_t index = 0; index < BusyPackets; ++index) writeDone(labelling, busyLabels + index);
+    writeDone(labelling, awaitedLabel);
+    const Packet labelWriter{busyWords, static_cast<std::uint32_t>(labelling.cursor_up - busyWords), 0, {}};
+    auto* const waitWords = reinterpret_cast<std::uint32_t*>(busy.base + BusyLabels + 2 * CommandBytes);
+    auto waiting = commands(waitWords);
+    sceAgcAcbWaitRegMem(&waiting, 0, 3, 0, awaitedLabel, Done, 0xffffffffu, 0);
+    sceAgcAcbWriteData(&waiting, ComputeMemory, 0, at(awaitedLabel + 1), &Done, 1, 0, 1);
+    const Packet labelWaiter{waitWords, static_cast<std::uint32_t>(waiting.cursor_up - waitWords), 0, {}};
+    const auto afterLabel = labelPacket(reinterpret_cast<std::uint32_t*>(busy.base + BusyLabels + 3 * CommandBytes), awaitedLabel + 2);
     auto output = std::make_shared<Output>();
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
 
     flip();
+    AgcDriverWaitIdle_nid_postfix();
+    check(sceAgcDriverSubmitAcb(ComputeQueue, &labelWaiter) == 0, "the compute submission that waits on a label failed");
+    waitUntil([&] { return awaits(awaitedLabel); }, "the compute submission never waited on its label");
+    std::memset(layout.source, 0x11, DataBytes);
+    check(sceAgcDriverSubmitDcb(&labelWriter) == 0, "the submission that writes the awaited label failed");
+    awaitStarted();
+    const auto firstPage = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::atomic_ref<std::uint32_t>(busyLabels[1024]).load(std::memory_order_acquire) != Done) {
+        check(std::chrono::steady_clock::now() < firstPage, "the busy submission did not finish its first page of labels within 10 s");
+        std::this_thread::yield();
+    }
+    std::atomic_ref<std::uint32_t>(busyLabels[0]).store(Stored, std::memory_order_release);
+    std::memset(layout.source, 0x22, DataBytes);
+    if (!awaits(awaitedLabel) || std::atomic_ref<std::uint32_t>(*awaitedLabel).load(std::memory_order_acquire) == Done) throw Inconclusive("the busy labels reached the awaited label before the title's next call; raise BusyPackets");
+    check(sceAgcDriverSubmitDcb(&afterLabel) == 0, "the submission after the label wait failed");
     AgcDriverWaitIdle_nid_postfix();
     auto* const gate = layout.label + 1;
     auto gated = commands(layout.firstCommands);
@@ -1186,6 +1220,8 @@ void testHoldDiagnostics(const std::filesystem::path& tool) {
         const auto count = AgcDriverAwaitedWaits_nid_postfix(waits.data(), waits.size());
         return std::any_of(waits.begin(), waits.begin() + static_cast<std::ptrdiff_t>(count), [&](const auto& wait) { return wait.address == at(gate); });
     }, "the gated submission never waited on its gate");
+    std::atomic_ref<std::uint32_t>(busyLabels[1]).store(Stored, std::memory_order_release);
+    std::atomic_ref<std::uint32_t>(layout.label[3]).store(Stored, std::memory_order_release);
     auto behind = commands(layout.secondCommands);
     writeDone(behind, layout.label + 2);
     Packet queued{layout.secondCommands, static_cast<std::uint32_t>(behind.cursor_up - layout.secondCommands), 0, {}};
@@ -1204,7 +1240,7 @@ void testHoldDiagnostics(const std::filesystem::path& tool) {
     const FrameCaptureReader reader(capture);
     const auto& header = reader.Header();
     const auto reasons = jsonCounts(jsonObject(header, "hold_reasons"));
-    check(jsonCount(reasons, "parked", header) >= 2 && jsonCount(reasons, "queued", header) >= 1, "the capture did not count both the parked gate and the submission queued behind it for the delta read while both were in flight: " + header);
+    check(jsonCount(reasons, "parked", header) >= 4 && jsonCount(reasons, "queued", header) >= 1, "the capture did not count both the parked gate and the submission queued behind it for the delta read while both were in flight: " + header);
     check(jsonCount(reasons, "unwatched", header) == 0, "the capture held a delta for an unwatched block that only the title had written since its last record: " + header);
     const auto masks = jsonCounts(jsonObject(header, "hold_masks"));
     check(std::any_of(masks.begin(), masks.end(), [](const auto& mask) {
@@ -1215,6 +1251,21 @@ void testHoldDiagnostics(const std::filesystem::path& tool) {
     check(entry != std::string::npos, "the capture header does not list the unwatched block: " + header);
     const auto block = jsonCounts(header.substr(entry + 1, header.find('}', entry) - entry - 1));
     check(jsonCount(block, "deltas", header) >= 2 && jsonCount(block, "changed", header) == 1 && jsonCount(block, "driver_stored", header) == 0, "the unwatched block's counters do not show one CPU store and no driver store between the deltas read while the gate was closed: " + header);
+    for (const char* name : {"parked_on_title", "driver_page_since_full", "title_wait_unpassed", "wait_dword_in_delta"}) check(reasons.contains(name), std::string("the capture header does not count the hold reason ") + name + ": " + header);
+    check(header.find("\"read_depths\":[") != std::string::npos, "the capture header has no read_depths: " + header);
+    check(jsonCount(reasons, "title_wait_unpassed", header) >= 1, "the capture did not count the gate the parked submission waits on as an unpassed wait on title memory: " + header);
+    const auto anyMask = [&](std::initializer_list<const char*> with, std::initializer_list<const char*> without) {
+        return std::any_of(masks.begin(), masks.end(), [&](const auto& mask) {
+            const auto names = "+" + mask.first + "+";
+            const auto has = [&](const char* name) { return names.find(std::string("+") + name + "+") != std::string::npos; };
+            return std::all_of(with.begin(), with.end(), has) && std::none_of(without.begin(), without.end(), has);
+        });
+    };
+    check(anyMask({"parked", "parked_on_title", "title_wait_unpassed"}, {"wait_dword_in_delta"}), "no hold mask counts the queue parked on a dword nothing in flight labels as parked on title memory with an unpassed wait whose dword the delta does not hold: " + header);
+    check(anyMask({"parked"}, {"parked_on_title", "title_wait_unpassed"}), "no hold mask counts the queue parked on a label that a submission in flight writes as parked without parked_on_title or title_wait_unpassed: " + header);
+    check(anyMask({"driver_page", "driver_page_since_full"}, {}), "no hold mask counts the label page the driver stored into after the last full delta as driver_page_since_full: " + header);
+    check(anyMask({"driver_page"}, {"driver_page_since_full"}), "no hold mask counts the label page the driver stored into before the last full delta as driver_page without driver_page_since_full: " + header);
+    check(anyMask({"wait_dword_in_delta"}, {}), "no hold mask counts the delta holding the gate's page as holding a dword the parked submission waits on: " + header);
 
     const auto result = capture / "hold diagnostics.json";
     const auto dump = capture / "hold diagnostics.bin";
@@ -1362,7 +1413,7 @@ void submitLabel(std::uint32_t* words, const std::uint32_t* label) {
     check(sceAgcDriverSubmitDcb(&packet) == 0, "the submission after the title's store failed");
 }
 
-void checkTitleWaitsHeld(const std::filesystem::path& tool, const Packet& awaiting, const std::byte* target, const std::vector<std::byte>& copied, const std::string& options = " --no-release") {
+void checkTitleWaitsHeld(const std::filesystem::path& tool, const Packet& awaiting, const std::byte* target, const std::vector<std::byte>& copied, const std::string& options = " --no-release", bool unpassedAtRead = false) {
     const char* directory = std::getenv("APS5_FRAME_CAPTURE");
     check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
     const std::filesystem::path capture(directory);
@@ -1375,6 +1426,7 @@ void checkTitleWaitsHeld(const std::filesystem::path& tool, const Packet& awaiti
     const auto submit = std::find_if(calls.begin(), calls.end(), [&](const auto& call) { return call.kind == FrameCallKind::Submit && call.address == at(awaiting.addr); });
     check(submit != calls.end(), "the capture does not hold the submission that waits on the title's flag");
     const auto serial = submit->accepted + 1;
+    if (unpassedAtRead) check(jsonCount(jsonCounts(jsonObject(header, "hold_reasons")), "title_wait_unpassed", header) >= 1, "the capture did not count the delta read at the title's next call, while submission " + std::to_string(serial) + " still had to pass its wait on the title's flag and no label in flight stored a value that wait accepts, as title_wait_unpassed: " + header);
     check(std::none_of(calls.begin(), calls.end(), [&](const auto& call) { return call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0 && std::find(call.values.begin() + 1, call.values.end(), serial) != call.values.end(); }), "the capture read a memory delta in flight while submission " + std::to_string(serial) + ", in flight at the read, still depended on the flag the title stores: " + header);
     check(jsonCount(jsonCounts(jsonObject(header, "hold_reasons")), "awaits_title", header) >= 1, "the capture did not count the submission's wait on the title's flag as a hold reason: " + header);
     check(replayed(tool, capture, target, DataBytes, options) == copied, "the replay did not copy the title's store after the submission passed its wait on the title's flag");
@@ -1461,7 +1513,7 @@ void checkAwaitAfterRead(const std::filesystem::path& tool, WaitKind kind, std::
     flip();
     AgcDriverWaitIdle_nid_postfix();
     if (kind == WaitKind::Semaphore) checkNeverReadInFlight(awaiting);
-    else checkTitleWaitsHeld(tool, awaiting, layout.firstTarget, copied, placement == LabelPlacement::Behind ? "" : " --no-release");
+    else checkTitleWaitsHeld(tool, awaiting, layout.firstTarget, copied, placement == LabelPlacement::Behind ? "" : " --no-release", true);
 }
 
 void testWaitAfterRead(const std::filesystem::path& tool) {
