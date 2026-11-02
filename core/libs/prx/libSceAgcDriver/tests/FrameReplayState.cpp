@@ -711,12 +711,19 @@ void testPieceSince(const std::filesystem::path& directory) {
     constexpr std::size_t Block = FrameCaptureWriter::BlockBytes;
     auto* bytes = allocate(Size);
     std::fill_n(bytes, Size, std::byte{0});
+    auto* stored = bytes;
     auto* partA = bytes + Block;
     auto* partB = bytes + Block + 4 * Page;
     auto* whole = bytes + 2 * Block;
     auto* recorder = AgcDriver::FrameRecorder::Active();
     check(recorder != nullptr, "frame recorder is disabled");
     recorder->FrameBoundary();
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope serial(AgcDriver::GuestMemory::TitleCallStoreSerial);
+        const std::vector<std::byte> driver(Page, std::byte{0x66});
+        AgcDriver::GuestMemory::StoreOwnBytes(address(stored), driver);
+    }
+    std::fill_n(stored, Page, std::byte{0x77});
     std::fill_n(partA, Page, std::byte{0x11});
     std::fill_n(whole, Block, std::byte{0x22});
     AgcDriverSuspendPoint_nid_postfix();
@@ -738,6 +745,7 @@ void testPieceSince(const std::filesystem::path& directory) {
     for (std::size_t index = 0; index < groups.size(); ++index) groups[index] = groupBeforeSuspend(reader, index);
     check(std::all_of(groups.begin(), groups.end(), [](std::uint64_t group) { return group != 0; }), "the CPU writes before the first four suspend points are not in memory deltas");
     std::string failures;
+    expectGroups(reader, failures, stored, {groups[0], groups[1]}, "the page the driver stored into and the CPU then overwrote before the first suspend point, in the first 64 KiB piece of the allocation");
     expectGroups(reader, failures, partA, {groups[0]}, "the first written page of a 64 KiB piece written in part before the first suspend point");
     expectGroups(reader, failures, partB, {groups[1]}, "the page written later in the same piece before the second suspend point");
     expectGroups(reader, failures, whole, {groups[0]}, "the 64 KiB piece written whole before the first suspend point");
