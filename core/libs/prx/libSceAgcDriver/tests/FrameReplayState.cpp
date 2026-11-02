@@ -695,7 +695,13 @@ void testPagesCollectedOnce(const std::filesystem::path& directory) {
     expectGroups(reader, failures, lateSource, {second}, "the written page of the range committed during the capture");
     const auto& calls = reader.Calls();
     const auto registration = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::RegisterShader; });
-    if (registration == calls.end() || registration + 1 == calls.end() || (registration + 1)->kind != FrameCallKind::RegisterShader) failures += std::string(failures.empty() ? "" : "; ") + "the second registration of the shader collected its blocks again";
+    if (registration == calls.end()) {
+        failures += std::string(failures.empty() ? "" : "; ") + "the capture holds no registration of the shader";
+    } else {
+        const auto holding = deltaGroupsHolding(reader, x + FrameCaptureWriter::BlockBytes);
+        if (registration == calls.begin() || (registration - 1)->kind != FrameCallKind::Memory || std::find(holding.begin(), holding.end(), (registration - 1)->values.at(0)) == holding.end()) failures += std::string(failures.empty() ? "" : "; ") + "the first registration of the shader has no memory delta holding the page written into the shader's next 64 KiB block before it";
+        if (registration + 1 == calls.end() || (registration + 1)->kind != FrameCallKind::RegisterShader) failures += std::string(failures.empty() ? "" : "; ") + "the second registration of the shader collected its blocks again";
+    }
     if (!failures.empty()) throw std::runtime_error(failures);
 }
 
