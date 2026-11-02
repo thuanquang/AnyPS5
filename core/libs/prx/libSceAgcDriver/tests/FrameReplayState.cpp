@@ -23,9 +23,9 @@ void check(bool condition, const char* reason) {
 void checkRanToEnd(const FrameCaptureReader& reader) {
     const auto& header = reader.Header();
     check(!header.empty(), "the capture has no capture.json, so the recorder never finished it");
-    const auto warnings = headerStrings(header, "warnings");
-    check(warnings.has_value(), ("the capture header has no warnings list: " + header).c_str());
-    for (const auto& warning : *warnings) check(!warning.starts_with("stopped:"), ("the capture " + warning).c_str());
+    const auto warnings = header.find("\"warnings\":[");
+    check(warnings != std::string::npos, ("the capture header has no warnings list: " + header).c_str());
+    check(header.find("[\"stopped:", warnings) == std::string::npos && header.find(",\"stopped:", warnings) == std::string::npos, ("the capture stopped: " + header).c_str());
 }
 
 std::uint64_t address(const void* pointer) {
