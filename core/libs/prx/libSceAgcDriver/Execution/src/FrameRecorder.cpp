@@ -729,18 +729,26 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             any = true;
         }
     };
-    for (const auto& range : added) {
-        writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
-        ranges.push_back(range);
+    for (const auto& entry : added) {
+        writer->WriteRange(entry.address, entry.bytes, entry.kind, entry.protection, entry.access);
+        auto& range = ranges.emplace_back(entry);
         ++lateRanges;
         if (!range.readable) {
             unreadableBytes += range.bytes;
             continue;
         }
+        const bool collected = collects(range);
+        if (collected) range.since.assign(static_cast<std::size_t>((range.bytes + FrameCaptureWriter::BlockBytes - 1) / FrameCaptureWriter::BlockBytes), generation);
         for (std::uint64_t at = 0; at < range.bytes;) {
             bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
+            const bool walked = collected && GuestMemory::Watched(range.address + at, bytes.size());
+            if (walked) {
+                const auto walkedTo = GuestMemory::CollectWrittenBlocks(range.address + at, bytes.size(), std::numeric_limits<std::uint64_t>::max(), written);
+                const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> piece{{{range.address + at, range.address + at + bytes.size()}}};
+                range.since[static_cast<std::size_t>(at / FrameCaptureWriter::BlockBytes)] = driverStoredSince(piece, previousStores) ? mark : walkedTo;
+            }
             readGuest(range.address + at, bytes);
-            writeTitleWords(range.address + at, std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; }));
+            writeTitleWords(range.address + at, !walked && std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; }));
             if (!GuestMemory::Watched(range.address + at, bytes.size())) recordUnwatched(range.address + at, bytes, stores);
             at += bytes.size();
         }
