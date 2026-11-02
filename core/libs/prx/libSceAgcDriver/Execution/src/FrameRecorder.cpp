@@ -949,6 +949,7 @@ void FrameRecorder::stop(const char* reason) {
     } catch (const std::exception& failure) {
         std::fprintf(stderr, "[frame-capture] %s\n", failure.what());
     }
+    GuestMemory::SetOwnStoreCompare(false);
     GuestMemory::SetDriverStoreObserver(nullptr);
     writer.reset();
     endGpuStores();
@@ -967,6 +968,7 @@ void FrameRecorder::start() {
         return;
     }
     if (!GuestMemory::WriteWatched()) throw std::runtime_error("frame capture: the guest write watch is unavailable, so CPU stores during the frames cannot be recorded");
+    GuestMemory::SetOwnStoreCompare(true);
     startedAt = std::chrono::steady_clock::now();
     startBoundary = boundaries;
     allocationsGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
@@ -1047,6 +1049,7 @@ void FrameRecorder::finish() {
     std::tie(end.accepted, end.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(end);
     awaitLateStores();
+    GuestMemory::SetOwnStoreCompare(false);
     writeReferenceFrames();
     if (stopOnHazard()) return;
     writer->Finish(header());
