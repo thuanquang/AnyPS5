@@ -161,6 +161,7 @@ private:
     std::uint64_t startBoundary = 0;
     std::uint64_t recordedFrames = 0;
     std::uint64_t generation = 0;
+    std::uint64_t lastGeneration = 0;
     std::uint64_t deltaGroups = 0;
     std::uint64_t deltaBytes = 0;
     std::uint64_t snapshotBytes = 0;

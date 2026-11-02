@@ -684,6 +684,12 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             offset += bytes;
         }
     }
+    const auto after = GuestMemory::WriteGeneration();
+    if (mark < lastGeneration || after < mark) {
+        stop("stopped: the write-watch generation wrapped during the capture");
+        return;
+    }
+    lastGeneration = after;
     const auto group = deltaGroups + 1;
     std::vector<std::uint64_t> started;
     bool inFlightRead = false;
@@ -971,6 +977,7 @@ void FrameRecorder::start() {
     }
     GuestMemory::SetDriverStoreObserver(&FrameRecorder::observeDriverStore);
     generation = GuestMemory::TrackerGeneration();
+    lastGeneration = generation;
     for (const auto& range : ranges) {
         snapshot(range);
         if (!writer) return;
