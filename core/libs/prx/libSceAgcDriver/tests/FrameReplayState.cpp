@@ -626,6 +626,18 @@ void storePendingResult(std::uint64_t begin, std::size_t bytes) {
     pendingResult = nullptr;
 }
 
+std::atomic<std::uint64_t> collectOnRead{0};
+std::atomic<std::byte*> collectedPage{nullptr};
+
+void storeAndCollect(std::uint64_t begin, std::size_t bytes) {
+    const auto trigger = collectOnRead.load();
+    if (trigger == 0 || trigger < begin || trigger >= begin + bytes) return;
+    collectOnRead = 0;
+    auto* const page = collectedPage.load();
+    std::fill_n(page, 4096, std::byte{0x6b});
+    AgcDriver::GuestMemory::CollectWritesUncached(address(page), 4096);
+}
+
 std::uint64_t groupBeforeSuspend(const FrameCaptureReader& reader, std::size_t index) {
     const FrameCall* previous = nullptr;
     for (const auto& call : reader.Calls()) {
@@ -733,8 +745,20 @@ void testPieceSince(const std::filesystem::path& directory) {
     std::fill_n(late, Size, std::byte{0});
     auto* lateC = late + Block;
     auto* lateD = late + Block + 4 * Page;
+    auto* lateE = late + 3 * Block;
     std::fill_n(lateC, Page, std::byte{0x44});
+    struct FlushHookReset {
+        ~FlushHookReset() {
+            AgcDriver::GuestMemory::SetFlushHook(nullptr);
+            collectOnRead = 0;
+        }
+    } reset;
+    collectedPage = lateE;
+    collectOnRead = address(late + 4 * Block);
+    AgcDriver::GuestMemory::SetFlushHook(&storeAndCollect);
     AgcDriverSuspendPoint_nid_postfix();
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+    check(collectOnRead.load() == 0, "the delta that added the range committed during the capture did not read its fifth 64 KiB piece through the flush hook");
     std::fill_n(lateD, Page, std::byte{0x55});
     AgcDriverSuspendPoint_nid_postfix();
     AgcDriverSuspendPoint_nid_postfix();
@@ -753,6 +777,14 @@ void testPieceSince(const std::filesystem::path& directory) {
     expectGroups(reader, failures, lateC, {groups[2]}, "the page of a range committed during the capture written before the delta that added it");
     expectGroups(reader, failures, lateD, {groups[2], groups[3]}, "the page of that range written after the delta that added it, which writes every block of the range it adds");
     expectGroups(reader, failures, late + 5 * Block, {groups[2]}, "an all-zero 64 KiB piece of the range committed during the capture");
+    std::uint64_t lateEGroup = 0;
+    std::byte lateEByte{0};
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Delta || chunk.address > address(lateE) || address(lateE) + Page > chunk.address + chunk.bytes || chunk.group < lateEGroup) continue;
+        lateEGroup = chunk.group;
+        lateEByte = reader.Read(chunk)[address(lateE) - chunk.address];
+    }
+    if (lateEByte != std::byte{0x6b}) failures += std::string(failures.empty() ? "" : "; ") + "the page of that range the CPU wrote, and another walk collected, while the delta that added the range read a later 64 KiB piece " + (lateEGroup == 0 ? std::string("is in no memory delta") : "has byte " + std::to_string(static_cast<int>(lateEByte)) + " in the last memory delta holding it (group " + std::to_string(lateEGroup) + "), not the 107 the CPU stored");
     if (!failures.empty()) throw std::runtime_error(failures);
 }
 
