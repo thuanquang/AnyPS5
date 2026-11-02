@@ -902,6 +902,15 @@ bool insideRanges(const FrameCaptureReader& reader, const FrameMemoryChunk& chun
     return cursor >= chunk.address + chunk.bytes;
 }
 
+std::atomic<std::uint32_t*> pendingResult{nullptr};
+
+void storePendingResult(std::uint64_t begin, std::size_t bytes) {
+    auto* const result = pendingResult.load();
+    if (result == nullptr || begin >= address(result) + sizeof(std::uint32_t) || address(result) >= begin + bytes) return;
+    *result = 1;
+    pendingResult = nullptr;
+}
+
 std::atomic<std::uint64_t> collectOnRead{0};
 std::atomic<std::byte*> collectedPage{nullptr};
 
@@ -1107,6 +1116,87 @@ void testDriverStoreAfterShaderDelta(const std::filesystem::path& directory) {
     std::string failures;
     expectGroups(reader, failures, stored, {first, second}, "the page the driver stored into and the CPU then overwrote before a shader registration and the first suspend point");
     if (!failures.empty()) throw std::runtime_error(failures);
+}
+
+void testPendingResultRead(const std::filesystem::path& directory) {
+    constexpr std::size_t Size = 1u << 20;
+    constexpr std::size_t Page = 4096;
+    auto* bytes = allocate(Size);
+    std::fill_n(bytes, Size, std::byte{0});
+    auto* page = bytes + 2 * FrameCaptureWriter::BlockBytes;
+    auto* result = reinterpret_cast<std::uint32_t*>(page + Page - sizeof(std::uint32_t));
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->FrameBoundary();
+    struct FlushHookReset {
+        ~FlushHookReset() {
+            AgcDriver::GuestMemory::SetFlushHook(nullptr);
+            pendingResult = nullptr;
+        }
+    } reset;
+    AgcDriver::GuestMemory::SetFlushHook(&storePendingResult);
+    std::fill_n(page, Page - sizeof(std::uint32_t), std::byte{0x3c});
+    pendingResult = result;
+    AgcDriverSuspendPoint_nid_postfix();
+    auto* late = allocate(Size);
+    std::fill_n(late, Size, std::byte{0});
+    auto* latePage = late + 2 * FrameCaptureWriter::BlockBytes;
+    auto* lateResult = reinterpret_cast<std::uint32_t*>(latePage + Page - sizeof(std::uint32_t));
+    std::fill_n(latePage, Page - sizeof(std::uint32_t), std::byte{0x3c});
+    pendingResult = lateResult;
+    AgcDriverSuspendPoint_nid_postfix();
+    recorder->FrameBoundary();
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+    const FrameCaptureReader reader(directory);
+    checkRanToEnd(reader);
+    const auto first = groupBeforeSuspend(reader, 0);
+    const auto second = groupBeforeSuspend(reader, 1);
+    check(first != 0 && second != 0, "the CPU writes before the suspend points are not in memory deltas");
+    std::string failures;
+    const auto expectStored = [&](const std::uint32_t* word, std::uint64_t group, const char* name) {
+        std::optional<std::uint32_t> held;
+        for (const auto& chunk : reader.Chunks()) {
+            if (chunk.kind != FrameMemoryKind::Delta || chunk.group != group || chunk.address > address(word) || address(word) + sizeof(std::uint32_t) > chunk.address + chunk.bytes) continue;
+            const auto data = reader.Read(chunk);
+            std::uint32_t value = 0;
+            std::memcpy(&value, data.data() + (address(word) - chunk.address), sizeof(value));
+            held = value;
+        }
+        if (held == 1u) return;
+        failures += std::string(failures.empty() ? "" : "; ") + name + (held ? " read the page before the result pending over it was stored: it holds " + std::to_string(*held) + ", not 1" : std::string(" does not hold the page the CPU wrote"));
+    };
+    expectStored(result, first, "the memory delta before the first suspend point");
+    expectStored(lateResult, second, "the memory delta that added the range committed during the capture");
+    if (!failures.empty()) throw std::runtime_error(failures);
+}
+
+void testPartlyCoveredBlock(const std::filesystem::path& directory) {
+    constexpr std::size_t Page = 4096;
+    auto* bytes = allocate(4 * Page);
+    std::fill_n(bytes, 4 * Page, std::byte{0x2b});
+    auto* shader = reinterpret_cast<Shader*>(bytes + 2 * Page);
+    *shader = {};
+    shader->file_header = 0x34333231u;
+    shader->version = 0x18u;
+    shader->header_size = sizeof(Shader);
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->FrameBoundary();
+    std::fill_n(bytes + Page, Page, std::byte{0x3c});
+    recorder->RegisterShader(shader);
+    recorder->FrameBoundary();
+    const FrameCaptureReader reader(directory);
+    checkRanToEnd(reader);
+    const auto& calls = reader.Calls();
+    const auto registration = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::RegisterShader; });
+    check(registration != calls.end() && registration != calls.begin() && (registration - 1)->kind == FrameCallKind::Memory, "the shader registration has no memory delta before it");
+    const auto written = deltaGroupsHolding(reader, bytes + Page);
+    check(std::find(written.begin(), written.end(), (registration - 1)->values.at(0)) != written.end(), "the page written during the capture, in the shader block the captured ranges cover only in part, is not in the shader registration's memory delta");
+    const auto groups = deltaGroupsHolding(reader, bytes);
+    if (groups.empty()) return;
+    std::string failure = "the page written before the capture, in a shader block the captured ranges cover only in part, is in memory delta groups";
+    for (const auto held : groups) failure += " " + std::to_string(held);
+    throw std::runtime_error(failure);
 }
 
 void testLateClear(const std::filesystem::path& directory) {
@@ -1369,6 +1459,8 @@ int main(int argc, char** argv) {
         else if (mode == "once") testPagesCollectedOnce(directory);
         else if (mode == "piece_since") testPieceSince(directory);
         else if (mode == "driver_store_shader") testDriverStoreAfterShaderDelta(directory);
+        else if (mode == "pending_result") testPendingResultRead(directory);
+        else if (mode == "partly_covered") testPartlyCoveredBlock(directory);
         else if (mode == "late_clear") testLateClear(directory);
         else throw std::runtime_error("unknown test");
         if (mode != "reservation_failure" && mode != "gate_failure") AgcDriverShutdown_nid_postfix();
