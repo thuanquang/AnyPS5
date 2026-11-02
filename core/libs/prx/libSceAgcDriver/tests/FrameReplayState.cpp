@@ -567,6 +567,7 @@ void testShaderCode(const std::filesystem::path& directory, bool host) {
     recorder->RegisterShader(shader);
     recorder->FrameBoundary();
     const FrameCaptureReader reader(directory);
+    check(reader.Header().find("stopped") == std::string::npos, ("the capture stopped: " + reader.Header()).c_str());
     std::vector<std::byte> captured(CodeBytes);
     const auto apply = [&](const FrameMemoryChunk& chunk) {
         const auto begin = std::max(address(code), chunk.address);
@@ -968,6 +969,7 @@ void testShaderBlockHole(const std::filesystem::path& directory) {
     recorder->RegisterShader(shader);
     recorder->FrameBoundary();
     const FrameCaptureReader reader(directory);
+    check(reader.Header().find("stopped") == std::string::npos, ("the capture stopped: " + reader.Header()).c_str());
     bool shaderDelta = false;
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind != FrameMemoryKind::Delta) continue;
