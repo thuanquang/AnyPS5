@@ -1874,7 +1874,8 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
         else written.emplace_back(begin, stop);
     };
     for (auto block = first; block <= last; ++block) {
-        if (tracker.cpuStampOf(block) <= since) continue;
+        const bool cpu = tracker.cpuStampOf(block) > since;
+        if (!cpu && tracker.stampOf(block) <= since) continue;
         const auto [begin, stop] = clip(block);
         const auto pages = tracker.cpuPages.find(block);
         bool any = false;
@@ -1889,7 +1890,7 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
                 any = true;
             }
         }
-        if (!any) append(begin, stop);
+        if (!any && cpu) append(begin, stop);
     }
     return tracker.generation.load(std::memory_order_relaxed);
 }
