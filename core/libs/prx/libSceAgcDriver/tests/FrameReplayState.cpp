@@ -779,14 +779,21 @@ void testPieceSince(const std::filesystem::path& directory) {
     expectGroups(reader, failures, lateC, {groups[2]}, "the page of a range committed during the capture written before the delta that added it");
     expectGroups(reader, failures, lateD, {groups[2], groups[3]}, "the page of that range written after the delta that added it, which writes every block of the range it adds");
     expectGroups(reader, failures, late + 5 * Block, {groups[2]}, "an all-zero 64 KiB piece of the range committed during the capture");
+    const std::string lateEName = "the page of that range the CPU wrote, and another walk collected, while the delta that added the range read a later 64 KiB piece";
     std::uint64_t lateEGroup = 0;
     std::byte lateEByte{0};
+    std::optional<std::byte> lateEAdded;
     for (const auto& chunk : reader.Chunks()) {
-        if (chunk.kind != FrameMemoryKind::Delta || chunk.address > address(lateE) || address(lateE) + Page > chunk.address + chunk.bytes || chunk.group < lateEGroup) continue;
+        if (chunk.kind != FrameMemoryKind::Delta || chunk.address > address(lateE) || address(lateE) + Page > chunk.address + chunk.bytes) continue;
+        const auto value = reader.Read(chunk)[address(lateE) - chunk.address];
+        if (chunk.group == groups[2]) lateEAdded = value;
+        if (chunk.group < lateEGroup) continue;
         lateEGroup = chunk.group;
-        lateEByte = reader.Read(chunk)[address(lateE) - chunk.address];
+        lateEByte = value;
     }
-    if (lateEByte != std::byte{0x6b}) failures += std::string(failures.empty() ? "" : "; ") + "the page of that range the CPU wrote, and another walk collected, while the delta that added the range read a later 64 KiB piece " + (lateEGroup == 0 ? std::string("is in no memory delta") : "has byte " + std::to_string(static_cast<int>(lateEByte)) + " in the last memory delta holding it (group " + std::to_string(lateEGroup) + "), not the 107 the CPU stored");
+    if (lateEAdded && *lateEAdded != std::byte{0}) failures += std::string(failures.empty() ? "" : "; ") + lateEName + " already has byte " + std::to_string(static_cast<int>(*lateEAdded)) + " in the delta that added the range (group " + std::to_string(groups[2]) + "), so the flush hook stored before that delta read the page";
+    if (lateEByte != std::byte{0x6b}) failures += std::string(failures.empty() ? "" : "; ") + lateEName + (lateEGroup == 0 ? std::string(" is in no memory delta") : " has byte " + std::to_string(static_cast<int>(lateEByte)) + " in the last memory delta holding it (group " + std::to_string(lateEGroup) + "), not the 107 the CPU stored");
+    else if (lateEGroup != groups[3]) failures += std::string(failures.empty() ? "" : "; ") + lateEName + " is last in memory delta group " + std::to_string(lateEGroup) + ", not in group " + std::to_string(groups[3]) + ", the delta after the one that added the range";
     if (!failures.empty()) throw std::runtime_error(failures);
 }
 
