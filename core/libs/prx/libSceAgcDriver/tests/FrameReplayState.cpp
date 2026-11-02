@@ -19,6 +19,14 @@ void check(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
 }
 
+void checkRanToEnd(const FrameCaptureReader& reader) {
+    const auto& header = reader.Header();
+    check(!header.empty(), "the capture has no capture.json, so the recorder never finished it");
+    const auto warnings = header.find("\"warnings\":[");
+    check(warnings != std::string::npos, ("the capture header has no warnings list: " + header).c_str());
+    check(header.find("[\"stopped:", warnings) == std::string::npos && header.find(",\"stopped:", warnings) == std::string::npos, ("the capture stopped: " + header).c_str());
+}
+
 std::uint64_t address(const void* pointer) {
     return reinterpret_cast<std::uintptr_t>(pointer);
 }
@@ -1173,6 +1181,156 @@ bool insideRanges(const FrameCaptureReader& reader, const FrameMemoryChunk& chun
     return cursor >= chunk.address + chunk.bytes;
 }
 
+std::uint64_t groupBeforeSuspend(const FrameCaptureReader& reader, std::size_t index) {
+    const FrameCall* previous = nullptr;
+    for (const auto& call : reader.Calls()) {
+        if (call.kind == FrameCallKind::Suspend) {
+            if (index == 0) return previous != nullptr && previous->kind == FrameCallKind::Memory ? previous->values.at(0) : 0;
+            --index;
+        }
+        previous = &call;
+    }
+    return 0;
+}
+
+std::vector<std::uint64_t> deltaGroupsHolding(const FrameCaptureReader& reader, const std::byte* page) {
+    std::vector<std::uint64_t> groups;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Delta || chunk.address >= address(page) + 4096 || address(page) >= chunk.address + chunk.bytes) continue;
+        if (std::find(groups.begin(), groups.end(), chunk.group) == groups.end()) groups.push_back(chunk.group);
+    }
+    return groups;
+}
+
+void expectGroups(const FrameCaptureReader& reader, std::string& failures, const std::byte* page, const std::vector<std::uint64_t>& expected, const char* name) {
+    const auto groups = deltaGroupsHolding(reader, page);
+    if (groups == expected) return;
+    failures += std::string(failures.empty() ? "" : "; ") + name + (groups.empty() ? " is in no memory delta" : " is in memory delta groups");
+    for (const auto held : groups) failures += " " + std::to_string(held);
+    failures += ", not only in group";
+    for (const auto group : expected) failures += " " + std::to_string(group);
+}
+
+void testPagesCollectedOnce(const std::filesystem::path& directory) {
+    constexpr std::size_t Size = 1u << 20;
+    constexpr std::size_t Page = 4096;
+    auto* bytes = allocate(Size);
+    std::fill_n(bytes, Size, std::byte{0});
+    auto* x = bytes + 2 * FrameCaptureWriter::BlockBytes;
+    auto* y = bytes + 4 * FrameCaptureWriter::BlockBytes;
+    auto* shader = reinterpret_cast<Shader*>(x + 2 * Page);
+    *shader = {};
+    shader->file_header = 0x34333231u;
+    shader->version = 0x18u;
+    shader->header_size = sizeof(Shader);
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->FrameBoundary();
+    std::fill_n(x, Page, std::byte{0x31});
+    AgcDriverSuspendPoint_nid_postfix();
+    std::fill_n(x + FrameCaptureWriter::BlockBytes, Page, std::byte{0x4d});
+    recorder->RegisterShader(shader);
+    recorder->RegisterShader(shader);
+    std::fill_n(y, Page, std::byte{0x65});
+    AgcDriverSuspendPoint_nid_postfix();
+    AgcDriverSuspendPoint_nid_postfix();
+    recorder->FrameBoundary();
+    const FrameCaptureReader reader(directory);
+    checkRanToEnd(reader);
+    const auto first = groupBeforeSuspend(reader, 0);
+    const auto second = groupBeforeSuspend(reader, 1);
+    check(first != 0 && second != 0, "the CPU writes before the first two suspend points are not in memory deltas");
+    std::string failures;
+    expectGroups(reader, failures, x, {first}, "the page written before the first suspend point");
+    expectGroups(reader, failures, y, {second}, "the page written before the second suspend point");
+    const auto& calls = reader.Calls();
+    const auto registration = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::RegisterShader; });
+    if (registration == calls.end()) {
+        failures += std::string(failures.empty() ? "" : "; ") + "the capture holds no registration of the shader";
+    } else {
+        const auto holding = deltaGroupsHolding(reader, x + FrameCaptureWriter::BlockBytes);
+        if (registration == calls.begin() || (registration - 1)->kind != FrameCallKind::Memory || std::find(holding.begin(), holding.end(), (registration - 1)->values.at(0)) == holding.end()) failures += std::string(failures.empty() ? "" : "; ") + "the first registration of the shader has no memory delta holding the page written into the shader's next 64 KiB block before it";
+        if (registration + 1 == calls.end() || (registration + 1)->kind != FrameCallKind::RegisterShader) failures += std::string(failures.empty() ? "" : "; ") + "the second registration of the shader collected its blocks again";
+    }
+    if (!failures.empty()) throw std::runtime_error(failures);
+}
+
+void testPieceSince(const std::filesystem::path& directory) {
+    constexpr std::size_t Size = 1u << 20;
+    constexpr std::size_t Page = 4096;
+    constexpr std::size_t Block = FrameCaptureWriter::BlockBytes;
+    auto* bytes = allocate(Size);
+    std::fill_n(bytes, Size, std::byte{0});
+    auto* stored = bytes;
+    auto* partA = bytes + Block;
+    auto* partB = bytes + Block + 4 * Page;
+    auto* whole = bytes + 2 * Block;
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->FrameBoundary();
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope serial(AgcDriver::GuestMemory::TitleCallStoreSerial);
+        const std::vector<std::byte> driver(Page, std::byte{0x66});
+        AgcDriver::GuestMemory::StoreOwnBytes(address(stored), driver);
+    }
+    std::fill_n(stored, Page, std::byte{0x77});
+    std::fill_n(partA, Page, std::byte{0x11});
+    std::fill_n(whole, Block, std::byte{0x22});
+    AgcDriverSuspendPoint_nid_postfix();
+    std::fill_n(partB, Page, std::byte{0x33});
+    AgcDriverSuspendPoint_nid_postfix();
+    recorder->FrameBoundary();
+    const FrameCaptureReader reader(directory);
+    checkRanToEnd(reader);
+    std::array<std::uint64_t, 2> groups{};
+    for (std::size_t index = 0; index < groups.size(); ++index) groups[index] = groupBeforeSuspend(reader, index);
+    check(std::all_of(groups.begin(), groups.end(), [](std::uint64_t group) { return group != 0; }), "the CPU writes before the first two suspend points are not in memory deltas");
+    std::string failures;
+    expectGroups(reader, failures, stored, {groups[0], groups[1]}, "the page the driver stored into and the CPU then overwrote before the first suspend point, in the first 64 KiB piece of the allocation");
+    expectGroups(reader, failures, partA, {groups[0]}, "the first written page of a 64 KiB piece written in part before the first suspend point");
+    expectGroups(reader, failures, partB, {groups[1]}, "the page written later in the same piece before the second suspend point");
+    expectGroups(reader, failures, whole, {groups[0]}, "the 64 KiB piece written whole before the first suspend point");
+    expectGroups(reader, failures, whole + Block - Page, {groups[0]}, "the last page of the 64 KiB piece written whole before the first suspend point");
+    if (!failures.empty()) throw std::runtime_error(failures);
+}
+
+void testDriverStoreAfterShaderDelta(const std::filesystem::path& directory) {
+    constexpr std::size_t Size = 1u << 20;
+    constexpr std::size_t Page = 4096;
+    constexpr std::size_t Block = FrameCaptureWriter::BlockBytes;
+    auto* bytes = allocate(Size);
+    std::fill_n(bytes, Size, std::byte{0});
+    auto* stored = bytes + Block;
+    auto* other = bytes + 2 * Block;
+    auto* shader = reinterpret_cast<Shader*>(bytes + 4 * Block);
+    *shader = {};
+    shader->file_header = 0x34333231u;
+    shader->version = 0x18u;
+    shader->header_size = sizeof(Shader);
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->FrameBoundary();
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope serial(AgcDriver::GuestMemory::TitleCallStoreSerial);
+        const std::vector<std::byte> driver(Page, std::byte{0x66});
+        AgcDriver::GuestMemory::StoreOwnBytes(address(stored), driver);
+    }
+    std::fill_n(stored, Page, std::byte{0x77});
+    recorder->RegisterShader(shader);
+    AgcDriverSuspendPoint_nid_postfix();
+    std::fill_n(other, Page, std::byte{0x88});
+    AgcDriverSuspendPoint_nid_postfix();
+    recorder->FrameBoundary();
+    const FrameCaptureReader reader(directory);
+    checkRanToEnd(reader);
+    const auto first = groupBeforeSuspend(reader, 0);
+    const auto second = groupBeforeSuspend(reader, 1);
+    check(first != 0 && second != 0, "the CPU writes before the first two suspend points are not in memory deltas");
+    std::string failures;
+    expectGroups(reader, failures, stored, {first, second}, "the page the driver stored into and the CPU then overwrote before a shader registration and the first suspend point");
+    if (!failures.empty()) throw std::runtime_error(failures);
+}
+
 void testShaderBlockHole(const std::filesystem::path& directory) {
     constexpr std::size_t Block = FrameCaptureWriter::BlockBytes;
     constexpr std::size_t Page = 4096;
@@ -1395,6 +1553,9 @@ int main(int argc, char** argv) {
         else if (mode == "shader_host_rewritten" || mode == "shader_host_restored" || mode == "shader_unaligned_restored") testDeltaPaths(directory, mode);
         else if (mode == "shader_hole") testShaderBlockHole(directory);
         else if (mode == "delta_hole") testDeltaOutsideRanges(directory);
+        else if (mode == "once") testPagesCollectedOnce(directory);
+        else if (mode == "piece_since") testPieceSince(directory);
+        else if (mode == "driver_store_shader") testDriverStoreAfterShaderDelta(directory);
         else throw std::runtime_error("unknown test");
         if (mode != "reservation_failure" && mode != "gate_failure") AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");
