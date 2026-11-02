@@ -146,6 +146,7 @@ private:
     void forgetWait(WaitKey key, const DriverDetail::AwaitedDword& wait);
     void judgeWaits(std::uint64_t address, std::span<const std::byte> bytes, std::span<const std::pair<std::size_t, std::size_t>> runs, std::span<const std::pair<std::uint64_t, std::uint64_t>> skipped, std::uint64_t readStart, WaitVerdicts& verdicts);
     std::uint32_t holdMask(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t& checked);
+    bool driverStoredSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t stores);
     void countUnwatched(std::vector<std::pair<std::uint64_t, std::uint64_t>>& unwatched, std::vector<std::pair<std::uint64_t, std::uint64_t>>& blocks);
     void recordUnwatched(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stores);
     bool arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted, std::uint64_t checked);
@@ -159,6 +160,7 @@ private:
         std::uint32_t protection = 0;
         std::uint32_t access = 0;
         bool readable = false;
+        std::vector<std::uint64_t> since;
     };
 
     FrameRecorder(std::filesystem::path directory, std::filesystem::path trigger, std::uint64_t atBoundary, std::uint64_t frames);
@@ -171,13 +173,14 @@ private:
     struct Span {
         std::uint64_t address = 0;
         std::uint64_t bytes = 0;
-        std::uint64_t since = 0;
+        std::uint64_t* since = nullptr;
     };
 
     FrameCall make(FrameCallKind kind);
     void takePreviousExit(FrameCall& call);
     void record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders = {}, const std::function<void()>& accept = {});
     bool recordLocked(FrameCall& call, bool prologueCall, std::span<const Shader* const> shaders);
+    static bool collects(const Range& range);
     void emitDelta(const StartedProgressSnapshot* decision = nullptr);
     static void collectShaderPages(std::span<const Shader* const> shaders, std::set<std::uint64_t>& blocks, std::set<std::uint64_t>& hostPages);
     void emitShaderDelta(std::span<const Shader* const> shaders, const StartedProgressSnapshot* decision = nullptr);
@@ -210,7 +213,7 @@ private:
     std::set<std::uint64_t> prologueHostPages;
     std::deque<FrameCall> reservations;
     std::vector<Range> ranges;
-    std::map<std::uint64_t, std::uint64_t> shaderMarks;
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> shaderMarks;
     std::map<std::uint64_t, std::uint64_t> hostPageHashes;
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::pair<std::uint64_t, std::uint64_t>> unwatchedHashes;
     inline static std::atomic<bool> notingGpuStores{false};
@@ -247,6 +250,7 @@ private:
     std::uint64_t startStores = 0;
     std::uint64_t readStores = 0;
     std::uint64_t fullDeltaStores = 0;
+    std::uint64_t fullDeltaWalkStores = 0;
     std::unordered_map<std::uint64_t, StoreOwner> storeOwners;
     StoreHazard storeHazard;
     std::uint64_t unattributedStores = 0;
