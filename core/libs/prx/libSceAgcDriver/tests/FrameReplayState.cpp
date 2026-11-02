@@ -2605,6 +2605,48 @@ void testPacingFailure(const std::filesystem::path& directory) {
     check(rethrown, "the injected driver failure was not propagated at shutdown");
 }
 
+#ifdef __linux__
+std::optional<std::pair<std::uint64_t, std::byte>> lastRecorded(const FrameCaptureReader& reader, const std::byte* at) {
+    std::optional<std::pair<std::uint64_t, std::byte>> last;
+    for (const auto& chunk : reader.Chunks()) {
+        if ((chunk.kind != FrameMemoryKind::Delta && chunk.kind != FrameMemoryKind::Snapshot) || chunk.address > address(at) || address(at) >= chunk.address + chunk.bytes) continue;
+        const std::uint64_t group = chunk.kind == FrameMemoryKind::Delta ? chunk.group : 0;
+        if (last && group < last->first) continue;
+        last = std::pair{group, reader.Read(chunk)[address(at) - chunk.address]};
+    }
+    return last;
+}
+
+std::string describeRecorded(const std::optional<std::pair<std::uint64_t, std::byte>>& last) {
+    if (!last) return "in no memory delta and not in the snapshot";
+    const auto where = last->first == 0 ? std::string("last recorded by the snapshot") : "last recorded in memory delta group " + std::to_string(last->first);
+    return where + " with byte " + std::to_string(static_cast<int>(last->second));
+}
+
+void testFreshPage(const std::filesystem::path& directory) {
+    constexpr std::size_t Size = 1u << 20;
+    constexpr std::size_t Page = 4096;
+    auto* bytes = allocate(Size);
+    std::fill_n(bytes, Size, std::byte{0});
+    auto* block = bytes + 2 * FrameCaptureWriter::BlockBytes;
+    auto* remapped = block + Page;
+    std::fill_n(remapped, Page, std::byte{0x52});
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->FrameBoundary();
+    check(mmap(remapped, Page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == remapped, "the guest page could not be mapped again");
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(remapped, Page);
+    check(AgcDriver::GuestMemory::MarkWritten(address(block + 8 * Page), 4) != 0, "the GPU write in the block of the page mapped again was not stamped");
+    AgcDriverSuspendPoint_nid_postfix();
+    recorder->FrameBoundary();
+    const FrameCaptureReader reader(directory);
+    check(reader.Header().find("stopped") == std::string::npos, ("the capture stopped: " + reader.Header()).c_str());
+    const auto last = lastRecorded(reader, remapped);
+    if (last && last->first != 0 && last->second == std::byte{0}) return;
+    throw std::runtime_error("the page mapped again during the capture is " + describeRecorded(last) + ", not the 0 of its new mapping");
+}
+#endif
+
 }
 
 int main(int argc, char** argv) {
@@ -2622,6 +2664,9 @@ int main(int argc, char** argv) {
         else if (mode == "shared_page") testSharedPage(directory);
         else if (mode == "host_neighbors") testHostNeighbors(directory);
         else if (mode == "unwatched") testUnwatched();
+#ifdef __linux__
+        else if (mode == "fresh_page") testFreshPage(directory);
+#endif
         else if (mode == "tokens") testEopTokens();
         else if (mode == "reservations" || mode == "reservation_failure") testRepeatedReservations(directory, mode == "reservation_failure");
         else if (mode == "blocking") testBlockingSubmission(directory);
