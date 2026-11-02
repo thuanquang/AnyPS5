@@ -529,7 +529,6 @@ void FrameRecorder::emitDelta(const StartedProgressSnapshot* decision) {
     writeDelta(spans, {}, added, decision);
     fullDeltaStores = readStores;
     fullDeltaWalkStores = walkStores;
-    shaderMarks.clear();
     finishedWaitDwords.clear();
 }
 
