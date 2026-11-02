@@ -419,8 +419,17 @@ void FrameRecorder::writeReferenceFrames() {
         presented = displayBuffers;
     }
     if (presented.empty()) return;
-    if (!DriverDetail::Driver::Get().WaitIdleFor(std::chrono::seconds(10))) {
+    auto& driver = DriverDetail::Driver::Get();
+    const struct Hold {
+        DriverDetail::Driver& driver;
+        ~Hold() { driver.ReleaseSettled(); }
+    } hold{driver};
+    if (!driver.WaitSettledFor(std::chrono::seconds(10))) {
         warnings.push_back("no reference frames: the driver did not go idle after the last frame");
+        return;
+    }
+    if (const auto [accepted, completed] = driver.SerialProgress(); completed < accepted) {
+        warnings.push_back("no reference frames: submissions accepted before the end of the capture wait on memory that nothing running in the driver writes (" + std::to_string(driver.AwaitedWaits().size()) + " parked)");
         return;
     }
     std::uint64_t index = 0;
