@@ -759,7 +759,7 @@ void testPieceSince(const std::filesystem::path& directory) {
     AgcDriver::GuestMemory::SetFlushHook(&storeAndCollect);
     AgcDriverSuspendPoint_nid_postfix();
     AgcDriver::GuestMemory::SetFlushHook(nullptr);
-    check(collectOnRead.load() == 0, "the delta that added the range committed during the capture did not read its fifth 64 KiB piece through the flush hook");
+    const bool hooked = collectOnRead.load() == 0;
     std::fill_n(lateD, Page, std::byte{0x55});
     AgcDriverSuspendPoint_nid_postfix();
     AgcDriverSuspendPoint_nid_postfix();
@@ -769,6 +769,7 @@ void testPieceSince(const std::filesystem::path& directory) {
     std::array<std::uint64_t, 4> groups{};
     for (std::size_t index = 0; index < groups.size(); ++index) groups[index] = groupBeforeSuspend(reader, index);
     check(std::all_of(groups.begin(), groups.end(), [](std::uint64_t group) { return group != 0; }), "the CPU writes before the first four suspend points are not in memory deltas");
+    check(hooked, "the delta that added the range committed during the capture did not read its fifth 64 KiB piece through the flush hook");
     std::string failures;
     expectGroups(reader, failures, stored, {groups[0], groups[1]}, "the page the driver stored into and the CPU then overwrote before the first suspend point, in the first 64 KiB piece of the allocation");
     expectGroups(reader, failures, partA, {groups[0]}, "the first written page of a 64 KiB piece written in part before the first suspend point");
