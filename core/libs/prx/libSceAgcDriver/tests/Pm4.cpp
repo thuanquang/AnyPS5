@@ -12,6 +12,8 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libc/include/FailureReport.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include <algorithm>
 #include <array>
@@ -1290,6 +1292,48 @@ void testMemSemaphore() {
     check(std::atomic_ref<std::uint64_t>(semaphore).load() == 1, "a MEM_SEMAPHORE wait did not take one from the semaphore");
 }
 
+void testMemSemaphoreImage() {
+    constexpr std::size_t Block = 65536;
+    constexpr std::size_t Page = 4096;
+    auto* block = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(Block, Block));
+    check(block != nullptr, "guest allocation failed");
+    GuestArena::GuestArenaCommit_nid_postfix(block, Block, 0x04, Block);
+#ifdef __linux__
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, Block);
+#endif
+    const auto base = reinterpret_cast<std::uint64_t>(block);
+    check(AgcDriver::GuestMemory::Watched(base, Block), "the semaphore's block is not write-watched");
+    auto* semaphore = reinterpret_cast<std::uint64_t*>(block + Page + 0x100);
+    std::atomic_ref<std::uint64_t> word(*semaphore);
+    const auto packet = [&](std::uint32_t control) { return makePacket(0x39, {low(semaphore), high(semaphore), control}); };
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> page{{base + Page, base + 2 * Page}};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    auto since = AgcDriver::GuestMemory::CollectWrittenBlocks(base, Block, std::numeric_limits<std::uint64_t>::max(), written);
+    word.store(5);
+    since = AgcDriver::GuestMemory::CollectWrittenBlocks(base, Block, since, written);
+    check(since != 0 && written == page, "a CPU store to the semaphore's page was not listed");
+    struct CompareOff {
+        ~CompareOff() { AgcDriver::GuestMemory::SetOwnStoreCompare(false); }
+    } compareOff;
+    AgcDriver::GuestMemory::SetOwnStoreCompare(true);
+    AgcDriver::GuestMemory::StoreOwnBytes(base + Page + 0x100, sizeof(*semaphore), [&] { word.fetch_add(1); });
+    since = AgcDriver::GuestMemory::CollectWrittenBlocks(base, Block, since, written);
+    check(written == page, "a driver store that gives no bytes was not listed while its page is compared");
+    AgcDriver::QueueState state;
+    std::string failures;
+    const auto expectUnlisted = [&](std::uint32_t control, std::uint64_t value, const char* name) {
+        execute(state, packet(control));
+        since = AgcDriver::GuestMemory::CollectWrittenBlocks(base, Block, since, written);
+        const auto stored = word.load();
+        if (stored != value) failures += std::string(failures.empty() ? "" : "; ") + name + " left " + std::to_string(stored) + ", not " + std::to_string(value);
+        else if (!written.empty()) failures += std::string(failures.empty() ? "" : "; ") + name + ", with no other store in its page, was listed as a CPU write";
+    };
+    expectUnlisted(0xc0000000u, 7, "a MEM_SEMAPHORE signal that adds one");
+    expectUnlisted(0xc0100000u, 1, "a MEM_SEMAPHORE signal that sets one");
+    expectUnlisted(0xe0000000u, 0, "a MEM_SEMAPHORE wait");
+    check(failures.empty(), failures.c_str());
+}
+
 void testSuspendPointWritesQueuedLabels() {
     alignas(8) static std::uint32_t gate = 0, marker = 0;
     gate = 0;
@@ -2157,7 +2201,8 @@ int main(int argc, char** argv) {
         const std::pair<const char*, void (*)()> ringModes[]{
             {"ring", testSubmissionRing}, {"ring-empty", testEmptySubmissionRing}, {"ring-disabled", testDisabledSubmissionRing},
             {"ring-invalid", testInvalidSubmissionRing}, {"ring-report", testSubmissionRingFailureReport}, {"stall-watchdog", testStallWatchdog},
-            {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"rewind-trace", testRewindTailTrace}};
+            {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"rewind-trace", testRewindTailTrace},
+            {"semaphore-image", testMemSemaphoreImage}};
         if (argc == 2 && std::string(argv[1]) == "ring-report-heap") {
 #ifdef _WIN32
             testSubmissionRingFailureReportHeap();
