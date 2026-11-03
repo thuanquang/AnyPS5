@@ -1148,9 +1148,14 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
                 prepare();
                 const bool set = (packet[3] & 0x100000u) != 0;
                 std::uint64_t stored = 1;
-                GuestMemory::StoreOwnBytes(semaphore, sizeof(*word), [&] {
+                GuestMemory::StoreOwnBytes(semaphore, sizeof(*word), [&](std::span<std::byte> image) {
                     if (set) shared.store(1, std::memory_order_release);
                     else stored = shared.fetch_add(1, std::memory_order_acq_rel) + 1;
+                    if (image.empty()) return;
+                    std::uint64_t earlier = 0;
+                    std::memcpy(&earlier, image.data(), sizeof(earlier));
+                    const std::uint64_t expected = set ? 1 : earlier + 1;
+                    std::memcpy(image.data(), &expected, sizeof(expected));
                 });
                 FrameRecorder::NoteGpuStore(semaphore, std::as_bytes(std::span(&stored, 1)));
                 return;
@@ -1165,8 +1170,13 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
                 auto value = shared.load(std::memory_order_acquire);
                 if (value != 0) {
                     bool taken = false;
-                    GuestMemory::StoreOwnBytes(semaphore, sizeof(*word), [&] {
+                    GuestMemory::StoreOwnBytes(semaphore, sizeof(*word), [&](std::span<std::byte> image) {
                         taken = shared.compare_exchange_strong(value, value - 1, std::memory_order_acq_rel);
+                        if (!taken || image.empty()) return;
+                        std::uint64_t earlier = 0;
+                        std::memcpy(&earlier, image.data(), sizeof(earlier));
+                        const std::uint64_t expected = earlier - 1;
+                        std::memcpy(image.data(), &expected, sizeof(expected));
                     });
                     if (!taken) continue;
                     const auto stored = value - 1;
