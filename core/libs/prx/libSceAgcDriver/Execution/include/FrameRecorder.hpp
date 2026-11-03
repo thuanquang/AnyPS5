@@ -146,7 +146,7 @@ private:
     void forgetWait(WaitKey key, const DriverDetail::AwaitedDword& wait);
     void judgeWaits(std::uint64_t address, std::span<const std::byte> bytes, std::span<const std::pair<std::size_t, std::size_t>> runs, std::span<const std::pair<std::uint64_t, std::uint64_t>> skipped, std::uint64_t readStart, WaitVerdicts& verdicts);
     std::uint32_t holdMask(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t& checked);
-    bool driverStoredSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t stores);
+    bool driverStoredSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t stores, std::set<std::pair<std::uint64_t, std::uint64_t>>& pages);
     void countUnwatched(std::vector<std::pair<std::uint64_t, std::uint64_t>>& unwatched, std::vector<std::pair<std::uint64_t, std::uint64_t>>& blocks);
     void recordUnwatched(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stores);
     bool arm(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t group, std::uint64_t accepted, std::uint64_t checked);
@@ -184,7 +184,7 @@ private:
     void emitDelta(const StartedProgressSnapshot* decision = nullptr);
     static void collectShaderPages(std::span<const Shader* const> shaders, std::set<std::uint64_t>& blocks, std::set<std::uint64_t>& hostPages);
     void emitShaderDelta(std::span<const Shader* const> shaders, const StartedProgressSnapshot* decision = nullptr);
-    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {}, const StartedProgressSnapshot* decision = nullptr);
+    void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {}, const StartedProgressSnapshot* decision = nullptr, const std::set<std::pair<std::uint64_t, std::uint64_t>>& again = {});
     bool triggered();
     void start();
     void finish();
@@ -265,6 +265,7 @@ private:
     std::unordered_map<std::uint64_t, UnwatchedPage> unwatchedPages;
     std::map<std::pair<std::uint64_t, std::uint64_t>, UnwatchedCounts> unwatchedCounts;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> finishedWaitDwords;
+    std::set<std::pair<std::uint64_t, std::uint64_t>> readAgain;
     std::set<std::uint64_t> callThreads;
     static std::atomic<FrameRecorder*> observing;
     std::vector<std::string> warnings;
