@@ -1513,6 +1513,48 @@ void testStoreWindowStopped(const std::filesystem::path& directory) {
     if (!written.empty()) throw std::runtime_error("a driver store made after the capture stopped was listed as a CPU write");
 }
 
+void testComparedDriverStore(const std::filesystem::path& directory, bool late) {
+    constexpr std::size_t Size = 1u << 20;
+    constexpr std::size_t Page = 4096;
+    constexpr std::size_t Block = FrameCaptureWriter::BlockBytes;
+    auto* bytes = allocate(Size);
+    std::fill_n(bytes, Size, std::byte{0});
+    auto* other = bytes + 2 * Block;
+    auto* recorder = AgcDriver::FrameRecorder::Active();
+    check(recorder != nullptr, "frame recorder is disabled");
+    recorder->FrameBoundary();
+    auto* range = bytes;
+    if (late) {
+        range = allocate(Size);
+        std::fill_n(range, Size, std::byte{0});
+    }
+    auto* stored = range + Block;
+    bool imaged = false;
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope serial(AgcDriver::GuestMemory::TitleCallStoreSerial);
+        AgcDriver::GuestMemory::StoreOwnBytes(address(stored), Page, [&](std::span<std::byte> image) {
+            std::fill_n(stored, Page, std::byte{0x66});
+            std::fill(image.begin(), image.end(), std::byte{0x66});
+            imaged = !image.empty();
+            std::fill_n(stored, Page, std::byte{0x77});
+        });
+    }
+    AgcDriverSuspendPoint_nid_postfix();
+    std::fill_n(other, Page, std::byte{0x88});
+    AgcDriverSuspendPoint_nid_postfix();
+    recorder->FrameBoundary();
+    const FrameCaptureReader reader(directory);
+    checkRanToEnd(reader);
+    check(imaged, "the driver store was not given the copy of its page that the capture compares");
+    const auto first = groupBeforeSuspend(reader, 0);
+    const auto second = groupBeforeSuspend(reader, 1);
+    check(first != 0 && second != 0, "the CPU writes before the first two suspend points are not in memory deltas");
+    std::string failures;
+    expectGroups(reader, failures, stored, {first, second}, late ? "the page the CPU wrote over a driver store's bytes during that store, in a range committed during the capture" : "the page the CPU wrote over a driver store's bytes during that store, alone in its 64 KiB piece");
+    expectGroups(reader, failures, other, {second}, "the page written before the second suspend point");
+    if (!failures.empty()) throw std::runtime_error(failures);
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1557,6 +1599,7 @@ int main(int argc, char** argv) {
         else if (mode == "store_window") testStoreWindow(directory);
         else if (mode == "store_window_unwritten") testStoreWindowUnwritten(directory);
         else if (mode == "store_window_stopped") testStoreWindowStopped(directory);
+        else if (mode == "driver_store_compared" || mode == "driver_store_compared_late") testComparedDriverStore(directory, mode == "driver_store_compared_late");
         else throw std::runtime_error("unknown test");
         if (mode != "reservation_failure" && mode != "gate_failure") AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");
