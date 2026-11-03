@@ -179,15 +179,18 @@ void FrameRecorder::noteDriverStore(std::uint64_t begin, std::uint64_t end, std:
     }
 }
 
-bool FrameRecorder::driverStoredSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t stores) {
+bool FrameRecorder::driverStoredSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t stores, std::set<std::pair<std::uint64_t, std::uint64_t>>& pages) {
     std::lock_guard lock(storeMutex);
+    bool stored = false;
     for (const auto& [begin, end] : blocks) {
         for (auto page = begin & ~std::uint64_t{HostPageBytes - 1}; page < end; page += HostPageBytes) {
             const auto found = driverPages.find(page);
-            if (found != driverPages.end() && found->second > stores) return true;
+            if (found == driverPages.end() || found->second <= stores) continue;
+            pages.emplace(std::max(begin, page), std::min(end, page + HostPageBytes));
+            stored = true;
         }
     }
-    return false;
+    return stored;
 }
 
 std::uint32_t FrameRecorder::holdMask(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t& checked) {
@@ -542,7 +545,8 @@ void FrameRecorder::emitDelta(const StartedProgressSnapshot* decision) {
         std::lock_guard lock(storeMutex);
         walkStores = driverStores;
     }
-    writeDelta(spans, {}, added, decision);
+    const auto again = std::exchange(readAgain, {});
+    writeDelta(spans, {}, added, decision, again);
     fullDeltaStores = readStores;
     fullDeltaWalkStores = walkStores;
     finishedWaitDwords.clear();
@@ -659,7 +663,7 @@ void FrameRecorder::emitShaderDelta(std::span<const Shader* const> shaders, cons
     for (std::size_t index = 0; index < spans.size(); ++index) shaderMarks[spans[index].address] = {spans[index].address + spans[index].bytes, since[index]};
 }
 
-void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added, const StartedProgressSnapshot* decision) {
+void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added, const StartedProgressSnapshot* decision, const std::set<std::pair<std::uint64_t, std::uint64_t>>& again) {
     if (abandonIfDiskLow()) return;
     auto& driver = DriverDetail::Driver::Get();
     const struct Hold {
@@ -683,13 +687,21 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             if (GuestMemory::Watched(at, bytes)) {
                 auto& since = span.since[offset / FrameCaptureWriter::BlockBytes];
                 const auto collected = GuestMemory::CollectWrittenBlocks(at, bytes, since, written);
-                since = !written.empty() && driverStoredSince(written, previousStores) ? mark : collected;
+                since = !written.empty() && driverStoredSince(written, previousStores, readAgain) ? mark : collected;
                 blocks.insert(blocks.end(), written.begin(), written.end());
             } else {
                 blocks.emplace_back(at, at + bytes);
                 unwatched.emplace_back(at, at + bytes);
             }
             offset += bytes;
+        }
+    }
+    if (!again.empty()) {
+        auto listed = blocks;
+        std::sort(listed.begin(), listed.end());
+        for (const auto& [begin, end] : again) {
+            const auto next = std::upper_bound(listed.begin(), listed.end(), std::pair{begin, std::numeric_limits<std::uint64_t>::max()});
+            if (next == listed.begin() || std::prev(next)->second < end) blocks.emplace_back(begin, end);
         }
     }
     const auto group = deltaGroups + 1;
@@ -762,7 +774,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             if (walked) {
                 const auto walkedTo = GuestMemory::CollectWrittenBlocks(range.address + at, bytes.size(), std::numeric_limits<std::uint64_t>::max(), written);
                 const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> piece{{{range.address + at, range.address + at + bytes.size()}}};
-                range.since[static_cast<std::size_t>(at / FrameCaptureWriter::BlockBytes)] = driverStoredSince(piece, previousStores) ? mark : walkedTo;
+                range.since[static_cast<std::size_t>(at / FrameCaptureWriter::BlockBytes)] = driverStoredSince(piece, previousStores, readAgain) ? mark : walkedTo;
             }
             readGuest(range.address + at, bytes);
             writeTitleWords(range.address + at, !walked && std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; }));
