@@ -4,6 +4,7 @@
 #include "execution/VulkanTestDevice.hpp"
 #include "prx/libSceAgc/DcbFlow/include/Memory.hpp"
 #include "prx/libSceAgc/DcbFlow/include/Sync.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
@@ -31,8 +32,10 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #ifdef _WIN32
@@ -411,6 +414,345 @@ void testParkedRewindReplays(const std::filesystem::path& tool) {
 
 CommandBuffer commands(std::uint32_t* words) {
     return CommandBuffer{words, words + CommandBytes / sizeof(std::uint32_t), words, words + CommandBytes / sizeof(std::uint32_t), nullptr, nullptr, 0};
+}
+
+constexpr std::size_t TiledBytes = 64u * 1024u;
+constexpr std::string_view FlipHashesMagic = "aps5-flip-hashes 1\n";
+
+enum class FlipOrder { Serial, Early };
+
+struct FlipCapture {
+    Layout layout;
+    AgcDriver::DisplayBuffer linear{};
+    AgcDriver::DisplayBuffer tiled{};
+    std::uint32_t dwords = 0;
+    std::array<std::vector<std::byte>, 3> sources;
+};
+
+struct ToolRun {
+    int code = 0;
+    std::string out;
+    std::string err;
+};
+
+struct FlipRow {
+    std::string id;
+    bool premise = false;
+    std::function<std::string()> run;
+};
+
+std::uint64_t fnv(std::span<const std::byte> bytes) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto value : bytes) {
+        hash ^= std::to_integer<std::uint64_t>(value);
+        hash *= 0x100000001b3ull;
+    }
+    return hash;
+}
+
+std::string addressText(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+std::string hashText(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+std::string fileText(const std::filesystem::path& path) {
+    const auto bytes = readFile(path);
+    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+std::filesystem::path writeText(const std::filesystem::path& path, std::string_view text) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(text.data(), static_cast<std::streamsize>(text.size()));
+    file.close();
+    check(file.good(), "cannot write " + path.string());
+    return path;
+}
+
+std::string quoted(const std::filesystem::path& path) {
+    return "\"" + path.string() + "\"";
+}
+
+ToolRun runTool(const std::filesystem::path& tool, const std::filesystem::path& capture, const std::string& options, const std::string& name) {
+    const auto out = capture / (name + ".json");
+    const auto err = capture / (name + ".log");
+    auto command = quoted(tool) + " " + quoted(capture) + " " + options + " > " + quoted(out) + " 2> " + quoted(err);
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+#endif
+    ToolRun run;
+    run.code = std::system(command.c_str());
+    run.out = fileText(out);
+    run.err = fileText(err);
+    return run;
+}
+
+std::string described(const ToolRun& run) {
+    return "exit " + std::to_string(run.code) + ", stdout: " + run.out + ", stderr: " + run.err;
+}
+
+std::string passed(const ToolRun& run, const std::vector<std::string>& fields) {
+    if (run.code != 0) return "the replay failed; " + described(run);
+    for (const auto& field : fields) {
+        if (run.out.find(field) == std::string::npos) return "the JSON line has no " + field + "; " + described(run);
+    }
+    return {};
+}
+
+std::string refused(const ToolRun& run, const std::vector<std::string>& messages) {
+    if (run.code == 0) return "the replay did not fail; " + described(run);
+    for (const auto& message : messages) {
+        if (run.err.find(message) == std::string::npos) return "the log has no '" + message + "'; " + described(run);
+    }
+    return {};
+}
+
+void runRows(const std::vector<FlipRow>& rows) {
+    std::size_t failed = 0;
+    for (const auto& row : rows) {
+        std::string reason;
+        try {
+            reason = row.run();
+        } catch (const std::exception& error) {
+            reason = error.what();
+        }
+        std::printf("row %s: %s\n", row.id.c_str(), reason.empty() ? "ok" : reason.c_str());
+        std::fflush(stdout);
+        check(reason.empty() || !row.premise, "premise row " + row.id + " failed");
+        failed += reason.empty() ? 0 : 1;
+    }
+    check(failed == 0, std::to_string(failed) + " of " + std::to_string(rows.size()) + " rows failed");
+}
+
+FlipCapture flipLayout() {
+    FlipCapture capture;
+    capture.layout = allocate();
+    auto* const base = capture.layout.base;
+    capture.linear = {at(capture.layout.firstTarget), 0x8000000000000000ull, 32, 32, 1, 0, 0, 0, 4096};
+    capture.tiled = {at(base + 3 * CommandBytes), 0x8000000000000000ull, 128, 128, 0, 0, at(base + 4 * CommandBytes), 0, 65536};
+    auto buffer = commands(capture.layout.firstCommands);
+    sceAgcDcbDmaData(&buffer, 0, DmaMemory, 0, capture.linear.address, DmaMemory, 0, at(capture.layout.source), DataBytes, 0, 1, 0);
+    const std::array<std::uint32_t, AgcDriver::FlipPacketWords> flipPacket{AgcDriver::FlipPacketHeader, Handle, 0xffffffffu, 1, 0, 0};
+    std::memcpy(buffer.cursor_up, flipPacket.data(), sizeof(flipPacket));
+    buffer.cursor_up += flipPacket.size();
+    capture.dwords = static_cast<std::uint32_t>(buffer.cursor_up - capture.layout.firstCommands);
+    capture.sources = {pattern(11), pattern(22), pattern(33)};
+    return capture;
+}
+
+void writeCall(AgcDriver::FrameCaptureWriter& writer, std::uint64_t& ordinal, FrameCallKind kind, std::uint64_t serial, std::vector<std::uint64_t> values, std::uint64_t address, std::uint64_t size) {
+    AgcDriver::FrameCall call;
+    call.kind = kind;
+    call.ordinal = ++ordinal;
+    call.accepted = serial;
+    call.completed = serial;
+    call.cpuFlip = kind == FrameCallKind::Flip;
+    call.address = address;
+    call.size = size;
+    call.values = std::move(values);
+    writer.WriteCall(call);
+}
+
+void writeDisplayBuffer(AgcDriver::FrameCaptureWriter& writer, std::uint64_t& ordinal, std::uint64_t serial, std::uint64_t index, const AgcDriver::DisplayBuffer& buffer) {
+    writeCall(writer, ordinal, FrameCallKind::DisplayBuffer, serial, {index, buffer.pixelFormat, buffer.width, buffer.height, buffer.tilingMode, buffer.pitchInPixel, buffer.dccAddress, buffer.dccClearColor, buffer.alignment}, buffer.address, 0);
+}
+
+void writeGuestBlock(AgcDriver::FrameCaptureWriter& writer, const FlipCapture& capture) {
+    writer.WriteRange(at(capture.layout.base), BlockBytes, AgcDriver::FrameRangeKind::Watched, 0x04, AgcDriver::FrameRangeAccess::Readable | AgcDriver::FrameRangeAccess::Writable | AgcDriver::FrameRangeAccess::Gpu);
+}
+
+std::string arenaHeader() {
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    return "{\"arena_base\":" + std::to_string(base) + "}";
+}
+
+void writeFlipCapture(const FlipCapture& capture, const std::filesystem::path& directory, FlipOrder order, bool displays, bool deltaOverDisplay) {
+    AgcDriver::FrameCaptureWriter writer(directory);
+    writeGuestBlock(writer, capture);
+    writer.WriteSnapshot(at(capture.layout.base), std::span<const std::byte>(capture.layout.base, BlockBytes));
+    for (std::uint64_t group = 1; group <= capture.sources.size(); ++group) writer.WriteDelta(group, 0, at(capture.layout.source), capture.sources[group - 1]);
+    if (deltaOverDisplay) writer.WriteDelta(1, 0, capture.linear.address, std::span<const std::byte>(capture.sources[0]).first(16));
+    if (displays) {
+        writer.WriteReference(0, capture.linear.address, AgcDriver::DecodeDisplayBuffer(capture.linear, capture.sources[2]));
+        writer.WriteReference(1, capture.tiled.address, AgcDriver::DecodeDisplayBuffer(capture.tiled, std::vector<std::byte>(TiledBytes)));
+    }
+    std::uint64_t ordinal = 0;
+    const auto commandsAt = at(capture.layout.firstCommands);
+    writeCall(writer, ordinal, FrameCallKind::RegisterVideoOutput, 0, {Handle}, 0, 0);
+    writeCall(writer, ordinal, FrameCallKind::FrameStart, 0, {}, 0, 0);
+    writeCall(writer, ordinal, FrameCallKind::Memory, 0, {1}, 0, 0);
+    writeCall(writer, ordinal, FrameCallKind::Submit, 0, {1}, commandsAt, capture.dwords);
+    writeCall(writer, ordinal, FrameCallKind::Memory, 1, {2}, 0, 0);
+    if (order == FlipOrder::Early) writeCall(writer, ordinal, FrameCallKind::Memory, 1, {3}, 0, 0);
+    writeCall(writer, ordinal, FrameCallKind::Submit, 1, {2}, commandsAt, capture.dwords);
+    if (order == FlipOrder::Serial) writeCall(writer, ordinal, FrameCallKind::Memory, 2, {3}, 0, 0);
+    writeCall(writer, ordinal, FrameCallKind::Submit, 2, {3}, commandsAt, capture.dwords);
+    writeCall(writer, ordinal, FrameCallKind::End, 3, {}, 0, 0);
+    if (displays) {
+        writeDisplayBuffer(writer, ordinal, 3, 0, capture.linear);
+        writeDisplayBuffer(writer, ordinal, 3, 1, capture.tiled);
+    }
+    writer.Finish(arenaHeader());
+}
+
+void writeCpuFlipCapture(const FlipCapture& capture, const std::filesystem::path& directory) {
+    AgcDriver::FrameCaptureWriter writer(directory);
+    writeGuestBlock(writer, capture);
+    writer.WriteReference(0, capture.linear.address, AgcDriver::DecodeDisplayBuffer(capture.linear, std::vector<std::byte>(DataBytes)));
+    std::uint64_t ordinal = 0;
+    writeCall(writer, ordinal, FrameCallKind::RegisterVideoOutput, 0, {Handle}, 0, 0);
+    writeCall(writer, ordinal, FrameCallKind::FrameStart, 0, {}, 0, 0);
+    writeCall(writer, ordinal, FrameCallKind::Flip, 0, {Handle, static_cast<std::uint64_t>(-1), 1, 0, 1}, 0, 0);
+    writeCall(writer, ordinal, FrameCallKind::Flip, 1, {Handle, static_cast<std::uint64_t>(-1), 1, 0, 0}, 0, 0);
+    writeCall(writer, ordinal, FrameCallKind::End, 1, {}, 0, 0);
+    writeDisplayBuffer(writer, ordinal, 1, 0, capture.linear);
+    writer.Finish(arenaHeader());
+}
+
+std::string hashLine(std::uint64_t flip, std::uint64_t address, std::uint64_t hash) {
+    return std::to_string(flip) + " " + addressText(address) + " " + hashText(hash) + "\n";
+}
+
+std::vector<std::string> hashLines(const FlipCapture& capture, const std::vector<std::pair<std::uint64_t, std::size_t>>& flips) {
+    const auto tiled = fnv(std::vector<std::byte>(TiledBytes));
+    const auto keys = fnv(std::vector<std::byte>(AgcDriver::DisplayBufferKeyBytes(capture.tiled)));
+    std::vector<std::string> lines;
+    for (const auto& [flip, source] : flips) {
+        lines.push_back(hashLine(flip, capture.linear.address, fnv(capture.sources[source])));
+        lines.push_back(hashLine(flip, capture.tiled.address, tiled));
+        lines.push_back(hashLine(flip, capture.tiled.dccAddress, keys));
+    }
+    return lines;
+}
+
+std::string hashFile(std::string_view first, const std::vector<std::string>& lines) {
+    std::string text(first);
+    for (const auto& line : lines) text += line;
+    return text;
+}
+
+void testFlipHashOrder(const std::filesystem::path& tool, const std::filesystem::path& root, const FlipCapture& capture) {
+    const auto serial = root / "serial";
+    const auto early = root / "early";
+    writeFlipCapture(capture, serial, FlipOrder::Serial, true, false);
+    writeFlipCapture(capture, early, FlipOrder::Early, true, false);
+    const auto expected = writeText(root / "expected.txt", hashFile(FlipHashesMagic, hashLines(capture, {{1, 0}, {2, 1}, {3, 2}})));
+    const auto written = root / "serial.txt";
+    const auto unwritten = root / "early.txt";
+    const auto linear = addressText(capture.linear.address);
+    runRows({
+        {"P", true, [&] { return passed(runTool(tool, early, "--strict", "p"), {"\"frames\":3,", "\"frames_compared\":2,\"pixels_identical\":1.000000,\"max_channel_diff\":0"}); }},
+        {"R", false, [&] {
+             std::filesystem::remove(unwritten);
+             const auto run = runTool(tool, early, "--strict --flip-hashes " + quoted(unwritten) + " --expect-flip-hashes " + quoted(expected), "r");
+             if (auto reason = refused(run, {"at flip 2 of pass 1 the display buffer at " + linear + " hashes to " + hashText(fnv(capture.sources[2])) + ", but ", " has " + hashText(fnv(capture.sources[1]))}); !reason.empty()) return reason;
+             if (run.out.find("\"p50\"") != std::string::npos) return "a refused replay printed its frame times; " + described(run);
+             return std::filesystem::exists(unwritten) ? "the refused replay wrote " + unwritten.string() : std::string();
+         }},
+        {"G", false, [&] {
+             std::filesystem::remove(written);
+             const auto run = runTool(tool, serial, "--strict --repeat 2 --flip-hashes " + quoted(written) + " --expect-flip-hashes " + quoted(expected), "g");
+             if (auto reason = passed(run, {"\"flips_hashed\":6,"}); !reason.empty()) return reason;
+             if (!std::filesystem::exists(written)) return "the replay wrote no " + written.string() + "; " + described(run);
+             return fileText(written) == fileText(expected) ? std::string() : "the first pass wrote " + fileText(written) + " where " + expected.string() + " has " + fileText(expected);
+         }},
+        {"Z", false, [&] { return passed(runTool(tool, serial, "--strict", "z"), {"\"flips_hashed\":0,\"flip_hash_s\":0.000"}); }},
+    });
+}
+
+void testFlipHashLists(const std::filesystem::path& tool, const std::filesystem::path& root, const FlipCapture& capture) {
+    const auto serial = root / "serial";
+    const auto plain = root / "plain";
+    const auto stored = root / "stored";
+    writeFlipCapture(capture, serial, FlipOrder::Serial, true, false);
+    writeFlipCapture(capture, plain, FlipOrder::Serial, false, false);
+    writeFlipCapture(capture, stored, FlipOrder::Serial, true, true);
+    const auto lines = hashLines(capture, {{1, 0}, {2, 1}, {3, 2}});
+    const auto text = hashFile(FlipHashesMagic, lines);
+    const auto expected = writeText(root / "expected.txt", text);
+    const auto out = root / "out.txt";
+    const auto missing = root / "missing.txt";
+    const auto linear = addressText(capture.linear.address);
+    auto shifted = lines;
+    shifted.front() = hashLine(1, capture.linear.address + DataBytes, fnv(capture.sources[0]));
+    auto cut = lines;
+    cut.pop_back();
+    const auto expect = [&](const std::string& name, std::string_view contents) {
+        return runTool(tool, serial, "--strict --expect-flip-hashes " + quoted(writeText(root / (name + ".txt"), contents)), name);
+    };
+    runRows({
+        {"N", false, [&] {
+             std::filesystem::remove(out);
+             const auto run = runTool(tool, plain, "--flip-hashes " + quoted(out), "n");
+             if (auto reason = refused(run, {"this capture lists none"}); !reason.empty()) return reason;
+             return std::filesystem::exists(out) ? "the refused replay wrote " + out.string() : std::string();
+         }},
+        {"D", false, [&] { return refused(runTool(tool, stored, "--expect-flip-hashes " + quoted(expected), "d"), {"memory delta 1 at " + linear + " (16 bytes) holds bytes of the display buffer at " + linear}); }},
+        {"F", false, [&] {
+             const auto run = runTool(tool, serial, "--flip-hashes " + quoted(expected) + " --expect-flip-hashes " + quoted(expected), "f");
+             if (auto reason = refused(run, {"name the same file"}); !reason.empty()) return reason;
+             return fileText(expected) == text ? std::string() : "the refused replay changed " + expected.string();
+         }},
+        {"O", false, [&] {
+             std::filesystem::remove(missing);
+             return refused(runTool(tool, serial, "--expect-flip-hashes " + quoted(missing), "o"), {"cannot open"});
+         }},
+        {"V", false, [&] { return refused(expect("v", hashFile("aps5-flip-hashes 2\n", lines)), {"does not start with the line 'aps5-flip-hashes 1'"}); }},
+        {"M", false, [&] { return refused(expect("m", std::string(FlipHashesMagic) + "1 " + linear + "\n"), {"line 2 of", "is not '<flip> 0x<address> <hash>'"}); }},
+        {"E", false, [&] { return refused(expect("e", FlipHashesMagic), {" lists no flips"}); }},
+        {"A1", false, [&] { return refused(expect("a1", hashFile(FlipHashesMagic, shifted)), {"line 2 of ", " lists flip 1 at " + addressText(capture.linear.address + DataBytes) + ", where this capture hashes flip 1 at " + linear}); }},
+        {"A2", false, [&] { return refused(expect("a2", hashFile(FlipHashesMagic, hashLines(capture, {{1, 0}, {3, 1}, {2, 2}}))), {"line 5 of ", " lists flip 3 at " + linear + ", where this capture hashes flip 2 at " + linear}); }},
+        {"T", false, [&] { return refused(expect("t", hashFile(FlipHashesMagic, cut)), {"ends inside flip 3, after 2 of the 3 ranges"}); }},
+        {"U", false, [&] {
+             std::filesystem::remove(out);
+             const auto run = runTool(tool, serial, "--submits 1 --flip-hashes " + quoted(out), "u");
+             if (auto reason = refused(run, {"--flip-hashes <file>"}); !reason.empty()) return reason;
+             return std::filesystem::exists(out) ? "the refused listing wrote " + out.string() : std::string();
+         }},
+        {"S", false, [&] { return refused(expect("s", hashFile(FlipHashesMagic, hashLines(capture, {{1, 0}, {2, 1}}))), {"flip 3 of pass 1 is past the 2 flips that"}); }},
+        {"L", false, [&] { return refused(expect("l", hashFile(FlipHashesMagic, hashLines(capture, {{1, 0}, {2, 1}, {3, 2}, {4, 2}}))), {"pass 1 presented 3 flips, but", " lists 4"}); }},
+    });
+}
+
+void testFlipHashCpu(const std::filesystem::path& tool, const std::filesystem::path& root, const FlipCapture& capture) {
+    check(std::getenv("APS5_CPU_FLIP_IN_ORDER") == nullptr && std::getenv("APS5_SYNC_FLIP") == nullptr && std::getenv("APS5_DUMP_SUBMITS") == nullptr && !APS5_ENABLE_TIMING_LOG, "the environment or the build orders CPU flips or captures submissions, so the replay would not show its second CPU flip on the replaying thread");
+    const auto cpu = root / "cpu";
+    writeCpuFlipCapture(capture, cpu);
+    const auto out = root / "out.txt";
+    runRows({
+        {"C0", true, [&] { return passed(runTool(tool, cpu, "--strict", "c0"), {"\"frames\":2,"}); }},
+        {"C", false, [&] {
+             std::filesystem::remove(out);
+             const auto run = runTool(tool, cpu, "--strict --flip-hashes " + quoted(out), "c");
+             if (auto reason = refused(run, {" of pass 1 was shown on the replaying thread"}); !reason.empty()) return reason;
+             if (run.out.find("\"p50\"") != std::string::npos) return "a refused replay printed its frame times; " + described(run);
+             return std::filesystem::exists(out) ? "the refused replay wrote " + out.string() : std::string();
+         }},
+    });
+}
+
+void testFlipHashes(const std::filesystem::path& tool, const std::string& mode) {
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const std::filesystem::path root(directory);
+    std::filesystem::create_directories(root);
+    const auto capture = flipLayout();
+    check(AgcDriver::DisplayBufferSize(capture.linear) == DataBytes && AgcDriver::DisplayBufferSize(capture.tiled) == TiledBytes, "the test display buffers do not have the sizes the expected hashes cover");
+    const auto first = fnv(capture.sources[0]);
+    const auto second = fnv(capture.sources[1]);
+    const auto third = fnv(capture.sources[2]);
+    check(first != second && first != third && second != third, "two source patterns hash alike, so the hash at a flip could not tell the copies apart");
+    if (mode == "flip_hashes") testFlipHashOrder(tool, root, capture);
+    else if (mode == "flip_hashes_lists") testFlipHashLists(tool, root, capture);
+    else testFlipHashCpu(tool, root, capture);
 }
 
 std::uint32_t* submitRewound(std::uint32_t* words, const std::function<void(CommandBuffer&)>& before, const std::function<void(CommandBuffer&)>& tail) {
@@ -1704,8 +2046,8 @@ int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
         {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}, {"wait64_after_read", testWait64AfterRead}, {"semaphore_after_read", testSemaphoreAfterRead}, {"rewind_after_read", testRewindAfterRead}, {"late_wait", testWaitAfterLastFrame}};
-    if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read|late_wait]\n");
+    if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "flip_hashes" || mode == "flip_hashes_lists" || mode == "flip_hashes_cpu" || mode == "rewind" || rewound.contains(mode)))) {
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|flip_hashes|flip_hashes_lists|flip_hashes_cpu|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read|late_wait]\n");
         return 2;
     }
     int status = 0;
@@ -1721,6 +2063,7 @@ int main(int argc, char** argv) {
             test->second(argv[1]);
         } else if (mode == "concurrent") testConcurrentCopies(argv[1]);
         else if (mode == "reservation_error") testReservationError(argv[1]);
+        else if (mode.starts_with("flip_hashes")) testFlipHashes(argv[1], mode);
         else if (mode == "rewind") testParkedRewindReplays(argv[1]);
         else testCaptureAndReplay(argv[1], mode == "pipelines");
     } catch (const Inconclusive& error) {
