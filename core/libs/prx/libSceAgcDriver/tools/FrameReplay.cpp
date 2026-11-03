@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -24,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <set>
@@ -80,7 +82,38 @@ struct Options {
     std::size_t submits = 0;
     bool traceSerials = false;
     bool coldPipelines = false;
+    std::filesystem::path flipHashes;
+    std::filesystem::path expectedFlipHashes;
 };
+
+std::uint64_t contentHash(const std::byte* bytes, std::size_t size);
+
+struct FlipRange {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::size_t alignment = 1;
+    bool keys = false;
+};
+
+struct FlipHash {
+    std::uint64_t flip = 0;
+    std::uint64_t address = 0;
+    std::uint64_t hash = 0;
+};
+
+thread_local bool issuing = false;
+
+std::string addressText(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+std::string hashText(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(value));
+    return text;
+}
 
 class Frames {
 public:
@@ -104,16 +137,100 @@ public:
         return failure;
     }
 
+    void HashFlips(std::vector<FlipRange> ranges, std::vector<FlipHash> expected, std::string source) {
+        std::lock_guard lock(mutex);
+        flipRanges = std::move(ranges);
+        expectedHashes = std::move(expected);
+        expectedSource = std::move(source);
+    }
+
+    void StartPass(std::size_t number) {
+        std::lock_guard lock(mutex);
+        pass = number;
+        passFlips = 0;
+    }
+
+    void HashFlip() {
+        if (flipRanges.empty()) return;
+        std::uint64_t flip = 0;
+        std::size_t number = 0;
+        {
+            std::lock_guard lock(mutex);
+            if (!pass || failure || (*pass != 0 && expectedHashes.empty())) return;
+            flip = ++passFlips;
+            number = *pass + 1;
+        }
+        const auto began = Clock::now();
+        try {
+            if (issuing) throw std::runtime_error("frame replay: flip " + std::to_string(flip) + " of pass " + std::to_string(number) + " was shown on the replaying thread before the work queued ahead of it ran (a CPU flip from a thread with no graphics submission), so its display buffers cannot be hashed at the flip");
+            std::vector<FlipHash> hashes;
+            for (const auto& range : flipRanges) {
+                AgcDriver::GuestMemory::FlushGpuWrites(range.address, range.bytes);
+                const auto* bytes = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(range.address));
+                AgcDriver::GuestMemory::CheckRange(bytes, range.bytes, range.alignment);
+                hashes.push_back({flip, range.address, contentHash(bytes, range.bytes)});
+            }
+            std::lock_guard lock(mutex);
+            ++hashedFlips;
+            hashNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+            if (number == 1) written.insert(written.end(), hashes.begin(), hashes.end());
+            if (expectedHashes.empty()) return;
+            const auto first = (flip - 1) * flipRanges.size();
+            if (first >= expectedHashes.size()) throw std::runtime_error("frame replay: flip " + std::to_string(flip) + " of pass " + std::to_string(number) + " is past the " + std::to_string(expectedHashes.size() / flipRanges.size()) + " flips that " + expectedSource + " lists");
+            for (std::size_t index = 0; index < hashes.size(); ++index) {
+                const auto expected = expectedHashes[first + index].hash;
+                if (hashes[index].hash == expected) continue;
+                const bool keys = flipRanges[index].keys;
+                throw std::runtime_error("frame replay: at flip " + std::to_string(flip) + " of pass " + std::to_string(number) + (keys ? " the DCC keys at " : " the display buffer at ") + addressText(hashes[index].address) + (keys ? " hash to " : " hashes to ") + hashText(hashes[index].hash) + ", but " + expectedSource + " has " + hashText(expected));
+            }
+        } catch (...) {
+            Failed(std::current_exception());
+        }
+    }
+
+    void EndPass() {
+        std::lock_guard lock(mutex);
+        if (flipRanges.empty() || expectedHashes.empty() || !pass || failure) return;
+        const auto listed = expectedHashes.size() / flipRanges.size();
+        if (passFlips != listed) failure = std::make_exception_ptr(std::runtime_error("frame replay: pass " + std::to_string(*pass + 1) + " presented " + std::to_string(passFlips) + " flips, but " + expectedSource + " lists " + std::to_string(listed)));
+    }
+
+    std::vector<FlipHash> Written() const {
+        std::lock_guard lock(mutex);
+        return written;
+    }
+
+    std::uint64_t HashedFlips() const {
+        std::lock_guard lock(mutex);
+        return hashedFlips;
+    }
+
+    double HashSeconds() const {
+        std::lock_guard lock(mutex);
+        return static_cast<double>(hashNs) / 1e9;
+    }
+
 private:
     mutable std::mutex mutex;
     std::vector<Clock::time_point> ready;
     std::exception_ptr failure;
+    std::vector<FlipRange> flipRanges;
+    std::vector<FlipHash> expectedHashes;
+    std::string expectedSource;
+    std::vector<FlipHash> written;
+    std::optional<std::size_t> pass;
+    std::uint64_t passFlips = 0;
+    std::uint64_t hashedFlips = 0;
+    std::int64_t hashNs = 0;
 };
 
 class ReplayFlip final : public AgcDriver::IFlipRequest {
 public:
     explicit ReplayFlip(Frames& frames) : frames(frames) {}
-    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override { frames.MarkReady(); }
+    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override {
+        frames.HashFlip();
+        frames.MarkReady();
+    }
     void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
 
 private:
@@ -528,6 +645,10 @@ struct Replay {
     }
 
     void execute(const FrameCall& call) {
+        const struct Issuing {
+            Issuing() { issuing = true; }
+            ~Issuing() { issuing = false; }
+        } scope;
         pace(call);
         if (recording && call.kind == FrameCallKind::Submit) sampleDepth();
         switch (call.kind) {
@@ -979,7 +1100,7 @@ struct Replay {
 
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--pace-timeout-ms <n>] [--no-release] [--release-after-ms <n>] [--strict]\n"
-                         "                        [--repeat <n>] [--cold-pipelines] [--dump <address>:<bytes>:<file>]...\n"
+                         "                        [--repeat <n>] [--cold-pipelines] [--flip-hashes <file>] [--expect-flip-hashes <file>] [--dump <address>:<bytes>:<file>]...\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
@@ -1002,7 +1123,14 @@ int usage() {
                          "  --submits <n>       replays nothing; lists the first n submissions and flips of the captured frames with\n"
                          "                      their queue and serials, the packets of each and the fields of its waits and releases\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
-                         "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
+                         "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n"
+                         "  --flip-hashes <file>\n"
+                         "                      hashes each display buffer the capture lists, and its DCC keys, at every flip of the first\n"
+                         "                      pass, on the queue worker once the packets before the flip have run and the GPU writes over\n"
+                         "                      them are flushed, and writes the hashes to <file> once the pass finished without a failure\n"
+                         "  --expect-flip-hashes <file>\n"
+                         "                      hashes every pass the same way and fails at the first flip whose hashes differ from <file>,\n"
+                         "                      or when a pass presents another number of flips than <file> lists\n");
     return 2;
 }
 
@@ -1040,21 +1168,26 @@ void writeFrame(const std::filesystem::path& path, const AgcDriver::DisplayBuffe
     if (failure) std::fprintf(stderr, "[frame-replay] cannot write %s (%s failed)\n", path.string().c_str(), failure.operation);
 }
 
+AgcDriver::DisplayBuffer recordedDisplayBuffer(const FrameCall& call) {
+    AgcDriver::DisplayBuffer buffer{};
+    buffer.address = call.address;
+    buffer.pixelFormat = call.values[1];
+    buffer.width = static_cast<std::uint32_t>(call.values[2]);
+    buffer.height = static_cast<std::uint32_t>(call.values[3]);
+    buffer.tilingMode = static_cast<std::uint32_t>(call.values[4]);
+    buffer.pitchInPixel = static_cast<std::uint32_t>(call.values[5]);
+    buffer.dccAddress = call.values[6];
+    buffer.dccClearColor = call.values[7];
+    buffer.alignment = static_cast<std::uint32_t>(call.values[8]);
+    return buffer;
+}
+
 FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& options) {
     FrameCheck check;
     if (!options.frames.empty()) std::filesystem::create_directories(options.frames);
     for (const auto& call : reader.Calls()) {
         if (call.kind != FrameCallKind::DisplayBuffer || call.values.size() < 9) continue;
-        AgcDriver::DisplayBuffer buffer{};
-        buffer.address = call.address;
-        buffer.pixelFormat = call.values[1];
-        buffer.width = static_cast<std::uint32_t>(call.values[2]);
-        buffer.height = static_cast<std::uint32_t>(call.values[3]);
-        buffer.tilingMode = static_cast<std::uint32_t>(call.values[4]);
-        buffer.pitchInPixel = static_cast<std::uint32_t>(call.values[5]);
-        buffer.dccAddress = call.values[6];
-        buffer.dccClearColor = call.values[7];
-        buffer.alignment = static_cast<std::uint32_t>(call.values[8]);
+        const auto buffer = recordedDisplayBuffer(call);
         const auto chunk = std::find_if(reader.Chunks().begin(), reader.Chunks().end(), [&](const FrameMemoryChunk& candidate) { return candidate.kind == FrameMemoryKind::Reference && candidate.group == call.values[0]; });
         if (chunk == reader.Chunks().end()) continue;
         const auto reference = reader.Read(*chunk);
@@ -1088,6 +1221,87 @@ std::uint64_t contentHash(const std::byte* bytes, std::size_t size) {
         hash *= 0x100000001b3ull;
     }
     return hash;
+}
+
+constexpr std::string_view FlipHashesMagic = "aps5-flip-hashes 1";
+
+std::vector<FlipRange> hashedRanges(const FrameCaptureReader& reader) {
+    std::vector<FlipRange> ranges;
+    for (const auto& call : reader.Calls()) {
+        if (call.kind != FrameCallKind::DisplayBuffer || call.values.size() < 9) continue;
+        const auto buffer = recordedDisplayBuffer(call);
+        ranges.push_back({buffer.address, AgcDriver::DisplayBufferSize(buffer), buffer.alignment, false});
+        if (buffer.dccAddress != 0) ranges.push_back({buffer.dccAddress, AgcDriver::DisplayBufferKeyBytes(buffer), 1, true});
+    }
+    if (ranges.empty()) throw std::runtime_error("frame replay: --flip-hashes and --expect-flip-hashes hash the display buffers a capture lists after its last frame, and this capture lists none");
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Delta) continue;
+        for (const auto& range : ranges) {
+            if (chunk.address >= range.address + range.bytes || range.address >= chunk.address + chunk.bytes) continue;
+            throw std::runtime_error("frame replay: memory delta " + std::to_string(chunk.group) + " at " + addressText(chunk.address) + " (" + std::to_string(chunk.bytes) + " bytes) holds bytes of " + (range.keys ? "the DCC keys at " : "the display buffer at ") + addressText(range.address) + ", so their hash at a flip would depend on when the replay restores the delta");
+        }
+    }
+    return ranges;
+}
+
+std::vector<FlipHash> readFlipHashes(const std::filesystem::path& path, const std::vector<FlipRange>& ranges) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) throw std::runtime_error("frame replay: cannot open " + path.string());
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    std::vector<std::string_view> lines;
+    for (std::size_t begin = 0; begin < text.size();) {
+        const auto end = std::min(text.find('\n', begin), text.size());
+        lines.push_back(std::string_view(text).substr(begin, end - begin));
+        begin = end + 1;
+    }
+    if (lines.empty() || lines.front() != FlipHashesMagic) throw std::runtime_error("frame replay: " + path.string() + " does not start with the line '" + std::string(FlipHashesMagic) + "'");
+    const auto parse = [](std::string_view line, FlipHash& entry) {
+        const auto* cursor = line.data();
+        const auto* const end = line.data() + line.size();
+        const auto number = [&](std::uint64_t& value, int base) {
+            const auto [last, error] = std::from_chars(cursor, end, value, base);
+            if (error != std::errc{}) return false;
+            cursor = last;
+            return true;
+        };
+        const auto literal = [&](std::string_view expected) {
+            if (static_cast<std::size_t>(end - cursor) < expected.size() || std::string_view(cursor, expected.size()) != expected) return false;
+            cursor += expected.size();
+            return true;
+        };
+        return number(entry.flip, 10) && literal(" 0x") && number(entry.address, 16) && literal(" ") && number(entry.hash, 16) && cursor == end;
+    };
+    const auto count = ranges.size();
+    std::vector<FlipHash> hashes;
+    for (std::size_t index = 1; index < lines.size(); ++index) {
+        FlipHash entry;
+        if (!parse(lines[index], entry)) throw std::runtime_error("frame replay: line " + std::to_string(index + 1) + " of " + path.string() + " is not '<flip> 0x<address> <hash>'");
+        const auto flip = static_cast<std::uint64_t>(hashes.size() / count + 1);
+        const auto& range = ranges[hashes.size() % count];
+        if (entry.flip != flip || entry.address != range.address) throw std::runtime_error("frame replay: line " + std::to_string(index + 1) + " of " + path.string() + " lists flip " + std::to_string(entry.flip) + " at " + addressText(entry.address) + ", where this capture hashes flip " + std::to_string(flip) + " at " + addressText(range.address));
+        hashes.push_back(entry);
+    }
+    if (hashes.empty()) throw std::runtime_error("frame replay: " + path.string() + " lists no flips");
+    if (hashes.size() % count != 0) throw std::runtime_error("frame replay: " + path.string() + " ends inside flip " + std::to_string(hashes.size() / count + 1) + ", after " + std::to_string(hashes.size() % count) + " of the " + std::to_string(count) + " ranges this capture hashes at each flip");
+    return hashes;
+}
+
+void writeFlipHashes(const std::filesystem::path& path, const std::vector<FlipHash>& hashes) {
+    std::string text(FlipHashesMagic);
+    text += '\n';
+    for (const auto& entry : hashes) {
+        char line[80];
+        std::snprintf(line, sizeof(line), "%llu 0x%llx %016llx\n", static_cast<unsigned long long>(entry.flip), static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.hash));
+        text += line;
+    }
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) throw std::runtime_error("frame replay: cannot open " + path.string());
+    file.write(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!file) throw std::runtime_error("frame replay: cannot write " + path.string());
+    file.flush();
+    if (!file) throw std::runtime_error("frame replay: cannot flush " + path.string());
+    file.close();
+    if (!file) throw std::runtime_error("frame replay: cannot close " + path.string());
 }
 
 class CapturedMemory {
@@ -1320,13 +1534,22 @@ double percentile(std::vector<double> values, double fraction) {
 }
 
 int run(const Options& options) {
+    if (std::error_code error; !options.flipHashes.empty() && !options.expectedFlipHashes.empty() && std::filesystem::equivalent(options.flipHashes, options.expectedFlipHashes, error)) throw std::runtime_error("frame replay: --flip-hashes and --expect-flip-hashes name the same file " + options.flipHashes.string());
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
+    const bool hashing = !options.flipHashes.empty() || !options.expectedFlipHashes.empty();
+    std::vector<FlipRange> ranges;
+    std::vector<FlipHash> expected;
+    if (hashing) {
+        ranges = hashedRanges(reader);
+        if (!options.expectedFlipHashes.empty()) expected = readFlipHashes(options.expectedFlipHashes, ranges);
+    }
     if (options.pace) requireRecordedSerials(reader);
     auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
     Replay replay{options, reader};
+    if (hashing) replay.frames.HashFlips(std::move(ranges), std::move(expected), options.expectedFlipHashes.string());
     replay.skipped = std::move(skipped);
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind == FrameMemoryKind::Delta) replay.groups[chunk.group].push_back(&chunk);
@@ -1363,12 +1586,15 @@ int run(const Options& options) {
                 if (call->kind == FrameCallKind::ReserveEopFlip) replay.execute(*call);
             }
         }
+        replay.frames.StartPass(pass);
         Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
         replay.recording = true;
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
         replay.endedAt = Clock::now();
+        if (replay.unfinished == 0) replay.frames.EndPass();
+        if (pass == 0 && !options.flipHashes.empty() && replay.unfinished == 0 && !replay.frames.Failure()) writeFlipHashes(options.flipHashes, replay.frames.Written());
         if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
         measured.frames = replay.frames.Times().size() - measured.firstFrame;
         measured.seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
@@ -1405,7 +1631,7 @@ int run(const Options& options) {
         frames += measured.frames;
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"restore_s\":%.3f,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"restore_s\":%.3f,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f,\"flips_hashed\":%llu,\"flip_hash_s\":%.3f}\n",
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
@@ -1413,7 +1639,8 @@ int run(const Options& options) {
                 static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
-                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds);
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds,
+                static_cast<unsigned long long>(replay.frames.HashedFlips()), replay.frames.HashSeconds());
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }
@@ -1455,10 +1682,13 @@ int main(int argc, char** argv) {
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
+        else if (argument == "--flip-hashes" && index + 1 < argc) options.flipHashes = argv[++index];
+        else if (argument == "--expect-flip-hashes" && index + 1 < argc) options.expectedFlipHashes = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
     if (options.directory.empty()) return usage();
+    if ((options.shaders || options.submits != 0) && (!options.flipHashes.empty() || !options.expectedFlipHashes.empty())) return usage();
     configureEnvironment(options);
     int code = 2;
     const bool listing = options.shaders || options.submits != 0;
