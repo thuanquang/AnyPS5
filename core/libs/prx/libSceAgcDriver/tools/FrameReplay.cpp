@@ -785,6 +785,7 @@ struct Replay {
     static constexpr std::size_t DecodeWindowBytes = 8 * AgcDriver::FrameCaptureWriter::ChunkBytes;
     std::vector<std::byte> decoded;
     std::vector<std::exception_ptr> decodeFailures;
+    std::vector<std::vector<std::size_t>> rewindCandidates;
     std::unique_ptr<DecodePool> decoders;
     std::atomic<std::uint64_t> paceTimeouts{0};
     std::atomic<std::uint64_t> staleRegistrations{0};
@@ -1257,6 +1258,22 @@ struct Replay {
         if (plan->frame[next] >= 2) entry.restore.push_back(accepted - completed);
     }
 
+    static bool rewindHeader(std::uint32_t header) {
+        return (header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x59u;
+    }
+
+    static void findRewinds(std::uint64_t address, std::span<const std::byte> bytes, std::vector<std::size_t>& found) {
+        found.clear();
+        for (auto at = static_cast<std::size_t>((4 - address % 4) % 4); at + 8 <= bytes.size(); at += 4) {
+            std::uint32_t header = 0;
+            std::memcpy(&header, bytes.data() + at, sizeof(header));
+            if (!rewindHeader(header)) continue;
+            std::uint32_t value = 0;
+            std::memcpy(&value, bytes.data() + at + 4, sizeof(value));
+            if ((value & AgcDriver::Pm4::RewindValid) != 0) found.push_back(at + 4);
+        }
+    }
+
     template <typename TApply>
     void decodeWindows(const std::vector<const FrameMemoryChunk*>& chunks, TApply&& apply) {
         if (!decoders) decoders = std::make_unique<DecodePool>();
@@ -1270,15 +1287,18 @@ struct Replay {
                 used += static_cast<std::size_t>(chunks[last++]->bytes);
             } while (last < chunks.size() && used <= DecodeWindowBytes && chunks[last]->bytes <= DecodeWindowBytes - used);
             if (decoded.size() < used) decoded.resize(used);
+            if (rewindCandidates.size() < last - first) rewindCandidates.resize(last - first);
             const auto began = Clock::now();
             decodeWorkNs += decoders->Run(last - first, [&](std::size_t index) {
                 const auto& chunk = *chunks[first + index];
-                reader.Read(chunk, std::span(decoded).subspan(starts[index], static_cast<std::size_t>(chunk.bytes)));
+                const auto bytes = std::span(decoded).subspan(starts[index], static_cast<std::size_t>(chunk.bytes));
+                reader.Read(chunk, bytes);
+                findRewinds(chunk.address, bytes, rewindCandidates[index]);
             }, decodeFailures);
             decodeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
             for (auto index = first; index < last; ++index) {
                 if (decodeFailures[index - first]) std::rethrow_exception(decodeFailures[index - first]);
-                apply(*chunks[index], std::span(decoded).subspan(starts[index - first], static_cast<std::size_t>(chunks[index]->bytes)));
+                apply(*chunks[index], std::span(decoded).subspan(starts[index - first], static_cast<std::size_t>(chunks[index]->bytes)), rewindCandidates[index - first]);
             }
             first = last;
         }
@@ -1326,7 +1346,7 @@ struct Replay {
         bool reading = false;
         std::size_t firstControl = 0;
         std::vector<std::vector<std::byte>> contents;
-        decodeWindows(ordered, [&](const FrameMemoryChunk& chunk, std::span<std::byte> bytes) {
+        decodeWindows(ordered, [&](const FrameMemoryChunk& chunk, std::span<std::byte> bytes, std::vector<std::size_t>& offsets) {
             const auto [first, last] = runs[run];
             if (applied == 0) {
                 const auto checked = Clock::now();
@@ -1338,16 +1358,27 @@ struct Replay {
                 firstControl = controls.size();
             }
             auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address));
-            for (auto at = static_cast<std::size_t>((4 - chunk.address % 4) % 4); at + 4 <= bytes.size(); at += 4) {
+            for (const auto address : parked) {
+                if (address % 4 == 0 && address >= chunk.address && bytes.size() >= 4 && address - chunk.address <= bytes.size() - 4) offsets.push_back(static_cast<std::size_t>(address - chunk.address));
+            }
+            std::sort(offsets.begin(), offsets.end());
+            const auto control = [&](std::size_t at) {
+                if (at + 4 > bytes.size()) return false;
                 std::uint32_t value = 0;
                 std::memcpy(&value, bytes.data() + at, sizeof(value));
-                if ((value & AgcDriver::Pm4::RewindValid) == 0) continue;
+                if ((value & AgcDriver::Pm4::RewindValid) == 0) return false;
                 std::uint32_t header = 0;
                 if (at >= 4) std::memcpy(&header, bytes.data() + at - 4, sizeof(header));
-                const bool rewind = (header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x59u;
-                if (!rewind && std::find(parked.begin(), parked.end(), chunk.address + at) == parked.end()) continue;
+                if (!rewindHeader(header) && std::find(parked.begin(), parked.end(), chunk.address + at) == parked.end()) return false;
                 controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
                 std::memcpy(bytes.data() + at, target + at, sizeof(value));
+                return true;
+            };
+            std::size_t next = 0;
+            for (auto at : offsets) {
+                if (at < next) continue;
+                while (control(at)) at += 4;
+                next = at + 4;
             }
             if (reading) {
                 contents.emplace_back(bytes.begin(), bytes.end());
