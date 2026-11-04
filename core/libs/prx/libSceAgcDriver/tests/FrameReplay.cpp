@@ -2808,7 +2808,7 @@ void checkWaitFloor(const std::filesystem::path& tool, bool changedAgain) {
         check(header.find("restores the dword at " + hexAddress(flag) + " after submission " + std::to_string(waited) + " passed a wait on it") != std::string::npos, "no capture warning names the flag whose value submission " + std::to_string(waited) + " passed on was lost: " + header);
         return;
     }
-    check(delta.floorFlags == 0 && delta.waitFloor == 0, floorsOf(delta) + ", although it supplies the flag value submission " + std::to_string(waited) + " passed on and still holds: " + header);
+    check(delta.floorFlags == AgcDriver::FrameFloorFlag::ReleasesWait && delta.waitFloor == 0, floorsOf(delta) + ", not flags " + flagsText(AgcDriver::FrameFloorFlag::ReleasesWait) + " alone: it supplies the flag value submission " + std::to_string(waited) + " passed on and still holds, so a replay restores it with that submission parked: " + header);
     check(replayed(tool, capture, flag, sizeof(*flag), " --no-release --no-synthesize") == wordBytes(Done), "the replay did not restore the flag the waiting submission passed on");
 }
 
@@ -2853,7 +2853,7 @@ void testWaitFloorLater(const std::filesystem::path& tool) {
     const auto waited = submitted(reader, layout.secondCommands).values.back();
     const auto& supplied = deltaBefore(reader, submitted(reader, supplying));
     const auto& changed = deltaBefore(reader, submitted(reader, changing));
-    check(supplied.floorFlags == 0 && supplied.waitFloor == 0, floorsOf(supplied) + ", although it only supplies the flag value submission " + std::to_string(waited) + " passed on: " + header);
+    check(supplied.floorFlags == AgcDriver::FrameFloorFlag::ReleasesWait && supplied.waitFloor == 0, floorsOf(supplied) + ", not flags " + flagsText(AgcDriver::FrameFloorFlag::ReleasesWait) + " alone: it only supplies the flag value submission " + std::to_string(waited) + " passed on: " + header);
     check(changed.waitFloor == waited && changed.floorFlags == 0, floorsOf(changed) + ", not submission " + std::to_string(waited) + ", whose wait passed on the value an earlier delta supplied and this one replaces: " + header);
     check(replayed(tool, capture, flag, sizeof(*flag), " --no-synthesize") == wordBytes(2), "the replay did not restore the title's later flag value");
 }
@@ -2977,7 +2977,7 @@ void testWaitFloorOrder(const std::filesystem::path&) {
     finishedCapture(reader);
     const auto waited = submitted(reader, layout.secondCommands + 64).values.back();
     const auto& delta = deltaBefore(reader, submitted(reader, next));
-    check(delta.floorFlags == AgcDriver::FrameFloorFlag::WaitOrderLost && delta.waitFloor == 0, floorsOf(delta) + ", not a lost order: it supplies the flag submission " + std::to_string(waited) + " waited for and clears the fence that submission passed on, so it must also follow it: " + reader.Header());
+    check(delta.floorFlags == (AgcDriver::FrameFloorFlag::WaitOrderLost | AgcDriver::FrameFloorFlag::ReleasesWait) && delta.waitFloor == 0, floorsOf(delta) + ", not a lost order that still marks the wait it supplies: it supplies the flag submission " + std::to_string(waited) + " waited for and clears the fence that submission passed on, so it must also follow it: " + reader.Header());
 }
 
 void testWaitFloorOrderQueues(const std::filesystem::path&) {
@@ -3031,7 +3031,7 @@ void testWaitFloorOrderQueues(const std::filesystem::path&) {
     const auto waited = submitted(reader, layout.secondCommands).values.back();
     check(copied < waited, "the compute submission did not take the earlier serial: " + reader.Header());
     const auto& delta = deltaBefore(reader, submitted(reader, next));
-    check(delta.floorFlags == AgcDriver::FrameFloorFlag::WaitOrderLost && delta.storeFloor == copied && delta.waitFloor == 0, floorsOf(delta) + ", not store floor " + std::to_string(copied) + " with a lost order: the delta supplies the flag submission " + std::to_string(waited) + " waited for, and the copy of submission " + std::to_string(copied) + " that it restores over ran after that wait passed: " + reader.Header());
+    check(delta.floorFlags == (AgcDriver::FrameFloorFlag::WaitOrderLost | AgcDriver::FrameFloorFlag::ReleasesWait) && delta.storeFloor == copied && delta.waitFloor == 0, floorsOf(delta) + ", not store floor " + std::to_string(copied) + " with a lost order that still marks the wait it supplies: the delta supplies the flag submission " + std::to_string(waited) + " waited for, and the copy of submission " + std::to_string(copied) + " that it restores over ran after that wait passed: " + reader.Header());
 }
 
 void testWaitFloorSemaphore(const std::filesystem::path&) {
@@ -3154,7 +3154,7 @@ void checkWaitFloorTail(WaitKind kind, bool lost) {
     const auto waited = submitted(reader, layout.secondCommands).values.back();
     const auto& delta = deltaBefore(reader, submitted(reader, next));
     if (!lost) {
-        check(delta.floorFlags == 0 && delta.waitFloor == 0, floorsOf(delta) + ", although it supplies the release and the flag value the REWIND tail of submission " + std::to_string(waited) + " passed on: " + header);
+        check(delta.floorFlags == AgcDriver::FrameFloorFlag::ReleasesWait && delta.waitFloor == 0, floorsOf(delta) + ", not flags " + flagsText(AgcDriver::FrameFloorFlag::ReleasesWait) + " alone: it supplies the release and the flag value the REWIND tail of submission " + std::to_string(waited) + " passed on: " + header);
         return;
     }
     check((delta.floorFlags & AgcDriver::FrameFloorFlag::WaitValueLost) != 0 && delta.waitFloor == 0, floorsOf(delta) + ", not a lost wait value: the REWIND tail of submission " + std::to_string(waited) + " passed its wait on a value the title stored after the delta before it, which no delta holds: " + header);

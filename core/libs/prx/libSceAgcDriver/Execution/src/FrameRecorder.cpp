@@ -946,6 +946,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         call.floorFlags = waitFlags;
     } else {
         call.floorFlags = storeFloor.unknown | waitFlags;
+        if (needed) call.floorFlags |= FrameFloorFlag::ReleasesWait;
         call.storeFloor = (storeFloor.unknown & FrameFloorFlag::StoreUnknown) != 0 ? 0 : storeFloor.serial;
         call.waitFloor = (waitFlags & FrameFloorFlag::WaitUnknown) != 0 ? 0 : waitVerdicts.floor;
     }
