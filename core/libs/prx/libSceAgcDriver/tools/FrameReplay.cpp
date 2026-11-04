@@ -944,20 +944,26 @@ struct Replay {
         }
         std::thread breaker([&] {
             if (!options.release) return;
-            auto lastSeen = progress();
-            auto lastProgress = Clock::now();
-            while (!finished.load()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                const auto seen = progress();
-                const std::unique_lock lock(memoryMutex, std::try_to_lock);
-                if (seen != lastSeen || !lock.owns_lock()) {
-                    lastSeen = seen;
+            try {
+                auto lastSeen = progress();
+                auto lastProgress = Clock::now();
+                while (!finished.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    const auto seen = progress();
+                    const std::unique_lock lock(memoryMutex, std::try_to_lock);
+                    if (seen != lastSeen || !lock.owns_lock()) {
+                        lastSeen = seen;
+                        lastProgress = Clock::now();
+                        continue;
+                    }
+                    if (Clock::now() - lastProgress < options.releaseAfter || !AgcDriverSettled_nid_postfix() || progress() != lastSeen) continue;
+                    releaseAwaited(calls, sequenced.load());
                     lastProgress = Clock::now();
-                    continue;
                 }
-                if (Clock::now() - lastProgress < options.releaseAfter || !AgcDriverSettled_nid_postfix() || progress() != lastSeen) continue;
-                releaseAwaited(calls, sequenced.load());
-                lastProgress = Clock::now();
+            } catch (...) {
+                const std::lock_guard guard(mutex);
+                if (failure == nullptr) failure = std::current_exception();
+                turn.notify_all();
             }
         });
         std::vector<std::thread> workers;
@@ -989,7 +995,8 @@ struct Replay {
             });
         }
         for (auto& worker : workers) worker.join();
-        if (failure == nullptr) drain();
+        const bool failed = [&] { const std::lock_guard guard(mutex); return failure != nullptr; }();
+        if (!failed) drain();
         finished.store(true);
         breaker.join();
         if (failure != nullptr) std::rethrow_exception(failure);
