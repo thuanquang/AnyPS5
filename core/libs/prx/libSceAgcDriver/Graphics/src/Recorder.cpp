@@ -2028,6 +2028,8 @@ std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> settledFrames{0};
 std::atomic<std::uint64_t> settledFrameBusyNs{0};
 std::atomic<bool> batchStampsRequested{false};
+std::atomic<std::uint64_t> batchGpuNanoseconds{0};
+std::atomic<std::uint64_t> batchesUntimed{0};
 std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
 AgcDriver::Mutex timingMutex;
@@ -2191,6 +2193,10 @@ std::pair<std::uint64_t, double> Recorder::FrameGpuBusy() {
 
 void Recorder::RequestBatchStamps() {
     batchStampsRequested.store(true, std::memory_order_relaxed);
+}
+
+Recorder::BatchGpuTime Recorder::BatchGpuTotals() {
+    return {batchGpuNanoseconds.load(std::memory_order_relaxed), batchesUntimed.load(std::memory_order_relaxed)};
 }
 
 void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes) {
@@ -2877,19 +2883,29 @@ void Recorder::readSamples(Batch& batch) {
 }
 
 void Recorder::readGpuTiming(Batch& batch) {
-    if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
+    if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) {
+        batchesUntimed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
-    if (result != VK_SUCCESS) return;
+    if (result != VK_SUCCESS) {
+        batchesUntimed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const auto period = context.limits.timestampPeriod;
     if (!GpuTimingEnabled()) {
         if (batch.batchTiming == 0 && stamps[1] >= stamps[0]) {
             batch.gpuStartNs = static_cast<double>(stamps[0]) * period;
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
+            batchGpuNanoseconds.fetch_add(static_cast<std::uint64_t>(static_cast<double>(stamps[1] - stamps[0]) * period), std::memory_order_relaxed);
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
+        } else {
+            batchesUntimed.fetch_add(1, std::memory_order_relaxed);
         }
         return;
     }
+    if (batch.batchTiming >= batch.timedKeys.size() || stamps[batch.batchTiming * 2 + 1] < stamps[batch.batchTiming * 2]) batchesUntimed.fetch_add(1, std::memory_order_relaxed);
     static auto lastReport = std::chrono::steady_clock::now();
     // The union of the timed ranges (class ranges nest program ranges: a copy's transfer inside
     // its class range) against the batch span gives what no range covers.
@@ -2904,6 +2920,7 @@ void Recorder::readGpuTiming(Batch& batch) {
             batch.gpuEndNs = static_cast<double>(stamps[i * 2 + 1]) * period;
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
             timingBatchMs += ns / 1e6;
+            if (stamps[i * 2 + 1] >= stamps[i * 2]) batchGpuNanoseconds.fetch_add(static_cast<std::uint64_t>(ns), std::memory_order_relaxed);
             AgcDriver::PerformanceCounters::AddGpuNanoseconds(static_cast<std::uint64_t>(ns));
             continue;
         }

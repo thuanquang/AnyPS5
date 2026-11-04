@@ -25,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2366,9 +2367,9 @@ const AgcDriver::FrameCall& recordedAfter(const FrameCaptureReader& reader, cons
     return *found;
 }
 
-std::string replayReport(const std::filesystem::path& tool, const std::filesystem::path& capture) {
+std::string replayReport(const std::filesystem::path& tool, const std::filesystem::path& capture, const std::string& arguments = "--strict") {
     const auto report = capture / "report.json";
-    auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict > \"" + report.string() + "\"";
+    auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" " + arguments + " > \"" + report.string() + "\"";
 #ifdef _WIN32
     command = "\"" + command + "\"";
 #endif
@@ -2443,6 +2444,37 @@ void testExitTimes(const std::filesystem::path& tool) {
     const auto report = replayReport(tool, capture);
     check(jsonNumber(report, "title_s") >= 0.1, "the replay reports less title time than the title's four 25 ms pauses: " + report);
     check(jsonNumber(report, "title_unknown") == 0, "the replay counts title calls without a previous exit time: " + report);
+}
+
+void testGpuTime(const std::filesystem::path& tool) {
+    constexpr std::size_t FillBytes = 16u * 1024u * 1024u;
+    const auto layout = allocate();
+    const auto bulk = allocate(FillBytes);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    for (std::uint32_t frame = 0; frame < 2; ++frame) {
+        auto graphics = commands(frame == 0 ? layout.firstCommands : layout.secondCommands);
+        sceAgcDcbDmaData(&graphics, 0, DmaMemory, 0, at(bulk.base), 2, 0, 0x5a5a5a5au + frame, FillBytes, 0, 1, 0);
+        writeDone(graphics, layout.label + frame);
+        auto* const words = frame == 0 ? layout.firstCommands : layout.secondCommands;
+        Packet packet{words, static_cast<std::uint32_t>(graphics.cursor_up - words), 0, {}};
+        check(sceAgcDriverSubmitDcb(&packet) == 0, "graphics submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        flip();
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    const auto capture = checkCapture(0);
+    const auto report = replayReport(tool, capture);
+    check(report.find("\"gpu_ms_per_frame\":null") == std::string::npos && report.find("\"gpu_ms\":null") == std::string::npos, "the replay reports no GPU time for passes that finished: " + report);
+    check(jsonNumber(report, "gpu_ms") > 0 && jsonNumber(report, "gpu_ms_per_frame") > 0, "the replay reports no GPU time for frames that each fill 16 MiB on the GPU: " + report);
+    const auto repeated = replayReport(tool, capture, "--strict --repeat 2");
+    std::vector<double> passes;
+    for (auto found = repeated.find("\"gpu_ms\":"); found != std::string::npos; found = repeated.find("\"gpu_ms\":", found + 1)) passes.push_back(jsonNumber(repeated.substr(found), "gpu_ms"));
+    check(passes.size() == 2 && passes[0] > 0 && passes[1] > 0, "the replay of two passes does not report GPU time for each: " + repeated);
+    const auto frames = jsonNumber(repeated, "frames");
+    check(frames == 2 && std::abs(jsonNumber(repeated, "gpu_ms_per_frame") - passes[1] / frames) <= 0.001, "the replay of two passes does not report the second pass's GPU time per frame: " + repeated);
 }
 
 const AgcDriver::FrameCall& deltaBefore(const FrameCaptureReader& reader, const AgcDriver::FrameCall& call) {
@@ -3178,9 +3210,9 @@ void testWaitFloorTailSemaphore(const std::filesystem::path&) {
 int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
-        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"flip_serial_start", testFlipSerialAtStart}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"host_page_restored", testHostPageRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}, {"wait64_after_read", testWait64AfterRead}, {"semaphore_after_read", testSemaphoreAfterRead}, {"rewind_after_read", testRewindAfterRead}, {"late_wait", testWaitAfterLastFrame}, {"wait_labelled_after", testWaitLabelledAfter}, {"wait_labelled_before", testWaitLabelledBefore}, {"wait_labelled_skipped", testWaitLabelledSkipped}, {"wait_labelled_elsewhere", testWaitLabelledElsewhere}, {"carried_label", testCarriedLabelKeepsSerial}, {"exit_times", testExitTimes}, {"store_floor", testStoreFloor}, {"store_floor_unknown", testStoreFloorUnknown}, {"store_floor_noted", testStoreFloorNoted}, {"store_floor_note", testStoreFloorNote}, {"store_floor_parked", testStoreFloorParked}, {"store_floor_in_flight", testStoreFloorInFlight}, {"wait_floor", testWaitFloor}, {"wait_floor_once", testWaitFloorOnce}, {"wait_floor_later", testWaitFloorLater}, {"wait_floor_label", testWaitFloorLabel}, {"wait_floor_overwritten", testWaitFloorOverwritten}, {"wait_floor_order", testWaitFloorOrder}, {"wait_floor_order_queues", testWaitFloorOrderQueues}, {"wait_floor_semaphore", testWaitFloorSemaphore}, {"wait_floor_parked", testWaitFloorParked}, {"wait_floor_tail", testWaitFloorTail}, {"wait_floor_tail_once", testWaitFloorTailOnce}, {"wait_floor_tail_semaphore", testWaitFloorTailSemaphore}};
+        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"flip_serial_start", testFlipSerialAtStart}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"host_page_restored", testHostPageRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}, {"wait64_after_read", testWait64AfterRead}, {"semaphore_after_read", testSemaphoreAfterRead}, {"rewind_after_read", testRewindAfterRead}, {"late_wait", testWaitAfterLastFrame}, {"wait_labelled_after", testWaitLabelledAfter}, {"wait_labelled_before", testWaitLabelledBefore}, {"wait_labelled_skipped", testWaitLabelledSkipped}, {"wait_labelled_elsewhere", testWaitLabelledElsewhere}, {"carried_label", testCarriedLabelKeepsSerial}, {"exit_times", testExitTimes}, {"gpu_time", testGpuTime}, {"store_floor", testStoreFloor}, {"store_floor_unknown", testStoreFloorUnknown}, {"store_floor_noted", testStoreFloorNoted}, {"store_floor_note", testStoreFloorNote}, {"store_floor_parked", testStoreFloorParked}, {"store_floor_in_flight", testStoreFloorInFlight}, {"wait_floor", testWaitFloor}, {"wait_floor_once", testWaitFloorOnce}, {"wait_floor_later", testWaitFloorLater}, {"wait_floor_label", testWaitFloorLabel}, {"wait_floor_overwritten", testWaitFloorOverwritten}, {"wait_floor_order", testWaitFloorOrder}, {"wait_floor_order_queues", testWaitFloorOrderQueues}, {"wait_floor_semaphore", testWaitFloorSemaphore}, {"wait_floor_parked", testWaitFloorParked}, {"wait_floor_tail", testWaitFloorTail}, {"wait_floor_tail_once", testWaitFloorTailOnce}, {"wait_floor_tail_semaphore", testWaitFloorTailSemaphore}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "flip_hashes" || mode == "flip_hashes_lists" || mode == "flip_hashes_cpu" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|flip_hashes|flip_hashes_lists|flip_hashes_cpu|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|flip_serial_start|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|host_page_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read|late_wait|wait_labelled_after|wait_labelled_before|wait_labelled_skipped|wait_labelled_elsewhere|carried_label|exit_times|store_floor|store_floor_unknown|store_floor_noted|store_floor_note|store_floor_parked|store_floor_in_flight|wait_floor|wait_floor_once|wait_floor_later|wait_floor_label|wait_floor_overwritten|wait_floor_order|wait_floor_order_queues|wait_floor_semaphore|wait_floor_parked|wait_floor_tail|wait_floor_tail_once|wait_floor_tail_semaphore]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|flip_hashes|flip_hashes_lists|flip_hashes_cpu|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|flip_serial_start|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|host_page_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read|late_wait|wait_labelled_after|wait_labelled_before|wait_labelled_skipped|wait_labelled_elsewhere|carried_label|exit_times|gpu_time|store_floor|store_floor_unknown|store_floor_noted|store_floor_note|store_floor_parked|store_floor_in_flight|wait_floor|wait_floor_once|wait_floor_later|wait_floor_label|wait_floor_overwritten|wait_floor_order|wait_floor_order_queues|wait_floor_semaphore|wait_floor_parked|wait_floor_tail|wait_floor_tail_once|wait_floor_tail_semaphore]\n");
         return 2;
     }
     int status = 0;

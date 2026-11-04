@@ -2195,7 +2195,22 @@ struct Pass {
     double seconds = 0.0;
     std::uint64_t paceTimeouts = 0;
     std::uint64_t synthesized = 0;
+    std::optional<std::uint64_t> gpuNs;
 };
+
+std::string milliseconds(std::optional<std::uint64_t> nanoseconds) {
+    if (!nanoseconds) return "null";
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.3f", static_cast<double>(*nanoseconds) / 1e6);
+    return text;
+}
+
+std::string perFrame(std::optional<std::uint64_t> nanoseconds, std::size_t frames) {
+    if (!nanoseconds || frames == 0) return "null";
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.3f", static_cast<double>(*nanoseconds) / 1e6 / static_cast<double>(frames));
+    return text;
+}
 
 double percentile(std::vector<double> values, double fraction) {
     if (values.empty()) return 0.0;
@@ -2298,6 +2313,7 @@ int run(const Options& options) {
         if (const auto title = titleNs(reader, *call)) titleSeconds += static_cast<double>(*title) / 1e9;
         else ++titleUnknown;
     }
+    AgcDriverRequestBatchStamps_nid_postfix();
     for (auto call = calls.begin(); call != frameStart; ++call) replay.execute(*call);
     const auto journalStart = Clock::now();
     AgcDriverWaitForPipelineJournal_nid_postfix();
@@ -2331,6 +2347,9 @@ int run(const Options& options) {
         replay.frames.StartPass(pass);
         Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
         replay.recording = true;
+        std::uint64_t gpuBefore = 0;
+        std::uint64_t untimedBefore = 0;
+        AgcDriverBatchGpuTime_nid_postfix(&gpuBefore, &untimedBefore);
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
@@ -2338,6 +2357,13 @@ int run(const Options& options) {
         if (replay.unfinished == 0) replay.frames.EndPass();
         if (pass == 0 && !options.flipHashes.empty() && replay.unfinished == 0 && !replay.frames.Failure()) writeFlipHashes(options.flipHashes, replay.frames.Written());
         if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
+        if (replay.unfinished == 0) {
+            AgcDriverWaitIdle_nid_postfix();
+            std::uint64_t gpuAfter = 0;
+            std::uint64_t untimedAfter = 0;
+            AgcDriverBatchGpuTime_nid_postfix(&gpuAfter, &untimedAfter);
+            if (untimedAfter == untimedBefore) measured.gpuNs = gpuAfter - gpuBefore;
+        }
         measured.frames = replay.frames.Times().size() - measured.firstFrame;
         measured.seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
         measured.paceTimeouts = replay.paceTimeouts.load() - measured.paceTimeouts;
@@ -2358,22 +2384,24 @@ int run(const Options& options) {
     std::string passList;
     double seconds = 0.0;
     std::size_t frames = 0;
+    std::optional<std::uint64_t> gpuNs = std::uint64_t{0};
     for (std::size_t index = 0; index < passes.size(); ++index) {
         const auto& measured = passes[index];
         std::vector<double> passMs;
         for (auto frame = measured.firstFrame + 1; frame < measured.firstFrame + measured.frames; ++frame) passMs.push_back(std::chrono::duration<double, std::milli>(ready[frame] - ready[frame - 1]).count());
-        char entry[192];
-        std::snprintf(entry, sizeof(entry), "%s{\"replay_s\":%.3f,\"frames\":%zu,\"p50\":%.3f,\"pace_timeouts\":%llu,\"synthesized\":%llu}", passList.empty() ? "" : ",", measured.seconds, measured.frames,
-                      percentile(passMs, 0.5), static_cast<unsigned long long>(measured.paceTimeouts), static_cast<unsigned long long>(measured.synthesized));
+        char entry[256];
+        std::snprintf(entry, sizeof(entry), "%s{\"replay_s\":%.3f,\"frames\":%zu,\"p50\":%.3f,\"pace_timeouts\":%llu,\"synthesized\":%llu,\"gpu_ms\":%s}", passList.empty() ? "" : ",", measured.seconds, measured.frames,
+                      percentile(passMs, 0.5), static_cast<unsigned long long>(measured.paceTimeouts), static_cast<unsigned long long>(measured.synthesized), milliseconds(measured.gpuNs).c_str());
         passList += entry;
         if (index < firstMeasured) continue;
         for (const auto value : passMs) frameList += (frameList.empty() ? "" : ",") + std::to_string(static_cast<long long>(value));
         frameMs.insert(frameMs.end(), passMs.begin(), passMs.end());
         seconds += measured.seconds;
         frames += measured.frames;
+        gpuNs = gpuNs && measured.gpuNs ? std::optional(*gpuNs + *measured.gpuNs) : std::nullopt;
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"memory_gpu_wait_s\":%.3f,\"memory_gpu_drains\":%llu,\"memory_gpu_waits\":%llu,\"memory_gpu_submits\":%llu,\"restore_s\":%.3f,\"restore_decode_s\":%.3f,\"restore_decode_work_s\":%.3f,\"restore_decode_threads\":%zu,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"title_s\":%.3f,\"title_unknown\":%llu,\"load_s\":%.3f,\"journal_s\":%.3f,\"flips_hashed\":%llu,\"flip_hash_s\":%.3f,\"depth\":%s}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"memory_gpu_wait_s\":%.3f,\"memory_gpu_drains\":%llu,\"memory_gpu_waits\":%llu,\"memory_gpu_submits\":%llu,\"restore_s\":%.3f,\"restore_decode_s\":%.3f,\"restore_decode_work_s\":%.3f,\"restore_decode_threads\":%zu,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"title_s\":%.3f,\"title_unknown\":%llu,\"load_s\":%.3f,\"journal_s\":%.3f,\"flips_hashed\":%llu,\"flip_hash_s\":%.3f,\"depth\":%s,\"gpu_ms_per_frame\":%s}\n",
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
@@ -2382,7 +2410,7 @@ int run(const Options& options) {
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, titleSeconds, static_cast<unsigned long long>(titleUnknown), std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds,
-                static_cast<unsigned long long>(replay.frames.HashedFlips()), replay.frames.HashSeconds(), depthJson(options, replay).c_str());
+                static_cast<unsigned long long>(replay.frames.HashedFlips()), replay.frames.HashSeconds(), depthJson(options, replay).c_str(), perFrame(gpuNs, frames).c_str());
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }

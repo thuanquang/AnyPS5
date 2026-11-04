@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -237,6 +238,16 @@ extern "C" bool AgcDriverPendingGpuRead_nid_postfix(std::uint64_t address, std::
 
 extern "C" bool AgcDriverWaitGpuBatchFor_nid_postfix(std::uint64_t batch, std::int64_t milliseconds) {
     return AgcDriver::DriverDetail::Driver::Get().WaitGpuBatchFor(batch, std::chrono::milliseconds(milliseconds));
+}
+
+extern "C" void AgcDriverRequestBatchStamps_nid_postfix() {
+    AgcDriver::Graphics::Recorder::RequestBatchStamps();
+}
+
+extern "C" void AgcDriverBatchGpuTime_nid_postfix(std::uint64_t* nanoseconds, std::uint64_t* untimed) {
+    const auto totals = AgcDriver::Graphics::Recorder::BatchGpuTotals();
+    *nanoseconds = totals.nanoseconds;
+    *untimed = totals.untimed;
 }
 
 extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {

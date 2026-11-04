@@ -564,6 +564,11 @@ public:
     static void NoteFrameGpuBusy(double milliseconds);
     static std::pair<std::uint64_t, double> FrameGpuBusy();
     static void RequestBatchStamps();
+    struct BatchGpuTime {
+        std::uint64_t nanoseconds = 0;
+        std::uint64_t untimed = 0;
+    };
+    static BatchGpuTime BatchGpuTotals();
 
     // What the presenter learns about finished batches (Driver::Present's [present] line and the
     // frame record): finish() writes an entry per submitted batch into a ring of the last 128,
