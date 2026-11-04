@@ -3038,6 +3038,120 @@ void testPacingRefusals(const std::filesystem::path& directory) {
     check(*sentinel == Marked, "the test capture does not restore its sentinel word, so its refusals could not show that nothing was restored");
 }
 
+void testPacingGpuRead(const std::filesystem::path& directory, bool same) {
+    constexpr std::size_t CopyBytes = 128u * 1024u;
+    openDevice();
+    auto* bytes = allocate(CopyBytes * 2);
+    auto* source = bytes;
+    auto* target = bytes + CopyBytes;
+    auto* words = reinterpret_cast<std::uint32_t*>(allocate(65536, false));
+    std::fill_n(source, CopyBytes, std::byte{0x11});
+    std::fill_n(target, CopyBytes, std::byte{0});
+    const auto copying = put(words, 0, dmaPacket(source, target, CopyBytes));
+    const std::vector<std::byte> restored(CopyBytes, same ? std::byte{0x11} : std::byte{0x22});
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(source), restored);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.busyTimeout = std::chrono::milliseconds(20000);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    BatchHold hold(recorderDevice());
+    const auto before = progress().first;
+    AgcDriverSubmitGraphics_nid_postfix(words, static_cast<std::uint32_t>(copying));
+    waitDone(before + 1, "the copy's submission did not complete on the CPU");
+    const bool pending = copySourcePending(address(source), CopyBytes);
+    if (!pending || !readInOpenBatch(address(source), CopyBytes)) {
+        AgcDriverWaitIdle_nid_postfix();
+        throw Inconclusive(pending ? "inconclusive: the GPU copy that reads the restored range was not in the open batch after its submission completed on the CPU" : "inconclusive: no GPU copy read the restored range in place after its submission completed on the CPU");
+    }
+    {
+        std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+        auto* const recorder = AgcDriver::Graphics::Recorder::Active();
+        check(recorder != nullptr, "the device has no active recorder");
+        hold.SubmitHeld(*recorder);
+    }
+    check(readStillPending(address(source), CopyBytes) && !readInOpenBatch(address(source), CopyBytes), "the copy's batch was not held on the GPU after its submit");
+    std::uint32_t sourceAtRelease = 0;
+    std::thread title([&] {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        sourceAtRelease = loaded(reinterpret_cast<std::uint32_t*>(source));
+        hold.Release();
+    });
+    auto call = memoryCall(1, 1);
+    call.ordinal = 1;
+    const auto began = Clock::now();
+    std::string failure;
+    bool restoredAtDepth = false;
+    try {
+        restoredAtDepth = replay.restoreGroup(call, Restore::AtDepth);
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    const auto seconds = std::chrono::duration<double>(Clock::now() - began).count();
+    title.join();
+    AgcDriverWaitIdle_nid_postfix();
+    check(failure.empty(), ("the depth restore failed: " + failure).c_str());
+    check(hold.ReleaseResult() == VK_SUCCESS, "cannot signal the semaphore that holds the copy's batch");
+    check(restoredAtDepth, "the depth restore found a GPU result pending over the source and left the delta to the held path");
+    const auto holds = [](const std::byte* range, std::byte value) { return std::all_of(range, range + CopyBytes, [value](std::byte each) { return each == value; }); };
+    if (same) {
+        check(seconds < 0.5, ("the depth restore of bytes that do not change waited " + std::to_string(seconds) + " s for the held GPU batch that reads them in place").c_str());
+        check(replay.readWaits.load() == 0 && !replay.firstRead, "the depth restore of bytes that do not change counted a wait for a GPU batch that reads them");
+        check(holds(source, std::byte{0x11}) && holds(target, std::byte{0x11}), "the depth restore of bytes that do not change, or the copy that reads them, changed them");
+        return;
+    }
+    check(seconds >= 0.9, ("the depth restore returned after " + std::to_string(seconds) + " s, before the held GPU batch that reads the bytes it changes in place ran").c_str());
+    check(sourceAtRelease == 0x11111111u, ("the source held " + addressText(sourceAtRelease) + " when the held GPU batch that reads it in place was released: the depth restore changed it before that batch ran").c_str());
+    check(holds(target, std::byte{0x11}), "the held GPU copy read the bytes the depth restore wrote");
+    check(holds(source, std::byte{0x22}), "the depth restore did not restore the source");
+    check(replay.readWaits.load() == 1 && replay.firstRead && readKindName(replay.firstRead->read.kind) == "CopySource" && replay.firstRead->address == address(source), ("the depth restore counted " + std::to_string(replay.readWaits.load()) + " waits for GPU readers, not 1 for the copy that reads the source").c_str());
+}
+
+void testPacingReadTracking(const std::filesystem::path& directory) {
+    openDevice();
+    std::filesystem::create_directories(directory);
+    constexpr auto Base = DepthBase;
+    constexpr std::uint32_t Marked = 0x5a5a5a5au;
+    auto* block = allocate(FrameCaptureWriter::BlockBytes);
+    auto* sentinel = reinterpret_cast<std::uint32_t*>(block);
+    auto* nop = reinterpret_cast<std::uint32_t*>(block + 4096);
+    std::vector<std::byte> snapshot(FrameCaptureWriter::BlockBytes);
+    std::memcpy(snapshot.data(), &Marked, sizeof(Marked));
+    std::memcpy(snapshot.data() + 4096, NopPacket.data(), sizeof(NopPacket));
+    std::uintptr_t base = 0;
+    std::size_t arenaSize = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &arenaSize);
+    {
+        FrameCaptureWriter writer(directory);
+        writer.WriteRange(address(block), FrameCaptureWriter::BlockBytes, FrameRangeKind::Watched, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu);
+        writer.WriteSnapshot(address(block), snapshot);
+        writer.WriteCall(depthFrameStart());
+        writer.WriteCall(pacedCall(FrameCallKind::Suspend, 1, Base + 1));
+        writer.WriteCall(pacedCall(FrameCallKind::Submit, 2, Base + 2, nop, NopPacket.size()));
+        writer.Finish("{\"arena_base\":" + std::to_string(base) + "}");
+    }
+    check(!AgcDriverGpuReadTracking_nid_postfix(), "APS5_COPY_READ_TRACKING=0 did not turn the GPU read tracking off");
+    Options options;
+    options.directory = directory;
+    options.release = false;
+    options.depth = depthProfile({{1, 1}, {1, 1}});
+    *sentinel = 0;
+    std::string failure;
+    try {
+        run(options);
+    } catch (const std::runtime_error& error) {
+        failure = error.what();
+    }
+    if (failure.empty()) throw std::runtime_error("the replay at depth ran with the GPU read tracking off instead of refusing");
+    const std::string expected = "frame replay: --depth-profile waits for recorded GPU work that reads a delta's bytes in place, and APS5_COPY_READ_TRACKING=0 turned that tracking off";
+    check(failure == expected, ("the replay at depth did not refuse to run with the GPU read tracking off with '" + expected + "': " + failure).c_str());
+    check(*sentinel == 0, "the replay restored the capture's snapshot before it refused to run with the GPU read tracking off");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -3093,6 +3207,8 @@ int main(int argc, char** argv) {
         else if (mode == "pacing_parked" || mode == "pacing_parked_diverged") testPacingParked(directory, mode == "pacing_parked_diverged");
         else if (mode == "pacing_held_causes") testPacingHeldCauses(directory);
         else if (mode == "pacing_refusals") testPacingRefusals(directory);
+        else if (mode == "pacing_gpu_read" || mode == "pacing_gpu_read_same") testPacingGpuRead(directory, mode == "pacing_gpu_read_same");
+        else if (mode == "pacing_read_tracking") testPacingReadTracking(directory);
         else throw std::runtime_error("unknown test");
         if (mode != "reservation_failure" && mode != "gate_failure" && mode != "pacing_failure") AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");

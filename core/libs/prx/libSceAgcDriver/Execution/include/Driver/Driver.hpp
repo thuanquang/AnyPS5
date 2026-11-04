@@ -97,6 +97,7 @@ public:
     void TrackGpuEpochs(bool tracking);
     bool WaitSerialsOnGpuFor(std::uint64_t through, std::span<const std::uint64_t> serials, std::chrono::milliseconds timeout, GpuSerialsWait* outcome);
     bool GuestStoreSettled(std::uint64_t address, std::size_t bytes);
+    bool WaitGpuBatchFor(std::uint64_t batch, std::chrono::milliseconds timeout);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void AttachWindow(const PresentationWindow& window);

@@ -425,6 +425,23 @@ bool Driver::GuestStoreSettled(std::uint64_t address, std::size_t bytes) {
     return !localDevice->StoresPendingOver(address, bytes);
 }
 
+bool Driver::WaitGpuBatchFor(std::uint64_t batch, std::chrono::milliseconds timeout) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    if (batch == 0) return true;
+    const auto localDevice = device.Load();
+    if (localDevice == nullptr) throw std::runtime_error("GPU batch " + std::to_string(batch) + " that reads guest memory in place has no device");
+    if (localDevice->SubmittedEpoch() < batch) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (localDevice->SubmittedEpoch() < batch) localDevice->SubmitRecorded(false);
+        if (localDevice->SubmittedEpoch() < batch) throw std::runtime_error("GPU batch " + std::to_string(batch) + " that reads guest memory in place was never submitted");
+    }
+    if (!localDevice->CanWaitUnlocked()) throw std::runtime_error("waiting for GPU batch " + std::to_string(batch) + " that reads guest memory in place needs timeline semaphores");
+    const auto remaining = (std::max)(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
+    return localDevice->WaitRecordedFor(batch, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count()));
+}
+
 std::vector<AwaitedWait> Driver::AwaitedWaits() {
     std::vector<AwaitedWait> result;
     for (const auto& slot : awaitedSlots) {

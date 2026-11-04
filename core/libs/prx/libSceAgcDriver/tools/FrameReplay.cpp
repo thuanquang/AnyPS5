@@ -445,6 +445,11 @@ enum class Restore { Held, AtDepth };
 constexpr std::size_t HeldCauses = static_cast<std::size_t>(DepthCause::Ahead);
 constexpr std::array<std::string_view, HeldCauses> HeldNames{"forced", "tail", "parked", "store_unknown", "wait_incomplete", "wait_lost", "wait_order", "releases", "pending"};
 constexpr std::array<std::string_view, HeldCauses> HeldReasons{"held by --depth-hold", "the last delta", "read parked by the capture", "unknown store floor", "wait after an unfinished submission", "wait value lost", "wait order lost", "releases a wait", "GPU results pending"};
+constexpr std::array<std::string_view, 8> ReadKindNames{"DispatchElement", "GpuCopy", "AddressBased", "Indirect", "StorageUpload", "CopySource", "DrawInput", "AddressBasedReadOnly"};
+
+std::string readKindName(std::uint32_t kind) {
+    return kind < ReadKindNames.size() ? std::string(ReadKindNames[kind]) : "kind " + std::to_string(kind);
+}
 
 struct PositionCensus {
     std::vector<std::uint64_t> issue, restore, ceiling;
@@ -735,6 +740,15 @@ struct Replay {
     std::uint64_t tailHeld = 0;
     std::atomic<std::uint64_t> fastDeltas{0};
     std::atomic<std::int64_t> gateWaitedNs{0};
+    struct ReadHit {
+        std::uint64_t call = 0;
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        AgcDriver::PendingGpuRead read;
+    };
+    std::atomic<std::uint64_t> readWaits{0};
+    std::atomic<std::int64_t> readCheckNs{0};
+    std::optional<ReadHit> firstRead;
 
     struct SettledHold {
         bool held;
@@ -1175,6 +1189,13 @@ struct Replay {
             }
         }
         for (const auto& [first, last] : runs) {
+            const auto checked = Clock::now();
+            const auto begin = chunks[first]->address;
+            const auto end = chunks[last - 1]->address + chunks[last - 1]->bytes;
+            const bool reading = mode == Restore::AtDepth && AgcDriverPendingGpuRead_nid_postfix(begin, static_cast<std::size_t>(end - begin), nullptr);
+            if (mode == Restore::AtDepth) readCheckNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - checked).count();
+            const auto firstControl = controls.size();
+            std::vector<std::vector<std::byte>> contents;
             for (auto index = first; index < last; ++index) {
                 const auto* const chunk = chunks[index];
                 auto bytes = reader.Read(*chunk);
@@ -1190,13 +1211,55 @@ struct Replay {
                     controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
                     std::memcpy(bytes.data() + at, target + at, sizeof(value));
                 }
+                if (reading) {
+                    contents.push_back(std::move(bytes));
+                    continue;
+                }
                 std::memcpy(target, bytes.data(), bytes.size());
                 deltaBytes += chunk->bytes;
+            }
+            if (!reading) continue;
+            const auto compared = Clock::now();
+            waitForReaders(call, std::span(chunks).subspan(first, last - first), contents, std::span(controls).subspan(firstControl));
+            readCheckNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - compared).count();
+            for (auto index = first; index < last; ++index) {
+                const auto& bytes = contents[index - first];
+                std::memcpy(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunks[index]->address)), bytes.data(), bytes.size());
+                deltaBytes += chunks[index]->bytes;
             }
         }
         for (const auto& [control, value] : controls) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
         restoredNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
         return true;
+    }
+
+    void waitForReaders(const FrameCall& call, std::span<const FrameMemoryChunk* const> run, const std::vector<std::vector<std::byte>>& contents, std::span<const std::pair<std::uint32_t*, std::uint32_t>> deferred) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+        for (std::size_t index = 0; index < run.size(); ++index) {
+            const auto address = run[index]->address;
+            const auto& bytes = contents[index];
+            const auto* const current = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address));
+            for (std::size_t at = 0; at < bytes.size();) {
+                const auto differs = std::mismatch(bytes.begin() + static_cast<std::ptrdiff_t>(at), bytes.end(), current + at).first;
+                if (differs == bytes.end()) break;
+                const auto dword = (address + static_cast<std::uint64_t>(differs - bytes.begin())) & ~std::uint64_t{3};
+                if (!spans.empty() && spans.back().second >= dword) spans.back().second = std::max(spans.back().second, dword + 4);
+                else spans.emplace_back(dword, dword + 4);
+                at = static_cast<std::size_t>(dword + 4 - address);
+            }
+        }
+        for (const auto& [control, value] : deferred) {
+            if (std::atomic_ref<std::uint32_t>(*control).load(std::memory_order_acquire) != value) spans.emplace_back(reinterpret_cast<std::uintptr_t>(control), reinterpret_cast<std::uintptr_t>(control) + 4);
+        }
+        for (const auto& [begin, end] : spans) {
+            const auto bytes = static_cast<std::size_t>(end - begin);
+            AgcDriver::PendingGpuRead read;
+            while (AgcDriverPendingGpuRead_nid_postfix(begin, bytes, &read)) {
+                if (!firstRead) firstRead = ReadHit{call.ordinal, begin, bytes, read};
+                if (!AgcDriverWaitGpuBatchFor_nid_postfix(read.batch, options.busyTimeout.count())) throw std::runtime_error("frame replay: GPU batch " + std::to_string(read.batch) + ", which reads " + addressText(begin) + " (" + std::to_string(bytes) + " bytes) of the memory delta at call " + std::to_string(call.ordinal) + " in place, did not finish within " + std::to_string(options.busyTimeout.count()) + " ms");
+                ++readWaits;
+            }
+        }
     }
 
     bool releaseRewind(const FrameCall& call, const AgcDriver::AwaitedWait& wait) {
@@ -1560,7 +1623,8 @@ int usage() {
                          "                      captured frames that are not one thread's suspend points, each followed by the queue 0\n"
                          "                      submissions <file> bounds, or whose calls do not take the serials the capture recorded;\n"
                          "                      needs --no-release; restores a memory delta read with no work in flight once the submissions\n"
-                         "                      its store and wait floors name, and those the next call's bound leaves out of flight, have run\n"
+                         "                      its store and wait floors name, and those the next call's bound leaves out of flight, have run,\n"
+                         "                      and the recorded GPU batches that read the bytes it changes in place have finished\n"
                          "  --depth-cap <n>     lowers every bound of the depth profile to at most n\n"
                          "  --depth-probe <n>   sets every bound of the depth profile to n, for sensitivity runs\n"
                          "  --depth-hold <position>\n"
@@ -1992,8 +2056,17 @@ std::string depthJson(const Options& options, const Replay& replay) {
     const auto name = profile.path.filename().u8string();
     char gate[32];
     std::snprintf(gate, sizeof(gate), "%.3f", Replay::secondsOf(replay.gateWaitedNs));
+    char reads[32];
+    std::snprintf(reads, sizeof(reads), "%.3f", Replay::secondsOf(replay.readCheckNs));
+    std::string first = "null";
+    if (replay.firstRead) {
+        const auto& hit = *replay.firstRead;
+        first = "{\"call\":" + std::to_string(hit.call) + ",\"address\":\"" + addressText(hit.address) + "\",\"bytes\":" + std::to_string(hit.bytes) + ",\"batch\":" + std::to_string(hit.read.batch) + ",\"queue\":\"" + addressText(hit.read.queue) + "\",\"kind\":" + jsonText(readKindName(hit.read.kind)) +
+                ",\"open\":" + (hit.read.open ? "true" : "false") + "}";
+    }
     std::string text = "{\"profile\":" + jsonText(std::string(name.begin(), name.end())) + ",\"cap\":" + number(options.depthCap) + ",\"probe\":" + number(options.depthProbe) + ",\"frames\":" + std::to_string(replay.plan ? replay.plan->frames : 0) +
-                       ",\"fast_deltas\":" + std::to_string(replay.fastDeltas.load()) + ",\"gate_wait_s\":" + gate + ",\"tail\":" + std::to_string(replay.tailHeld) + ",\"positions\":[";
+                       ",\"fast_deltas\":" + std::to_string(replay.fastDeltas.load()) + ",\"gate_wait_s\":" + gate + ",\"tail\":" + std::to_string(replay.tailHeld) + ",\"read_waits\":" + std::to_string(replay.readWaits.load()) + ",\"read_wait_first\":" + first +
+                       ",\"read_check_s\":" + reads + ",\"positions\":[";
     const auto spread = [](std::vector<std::uint64_t> values, bool deepest) {
         if (values.empty()) return std::string("null");
         std::sort(values.begin(), values.end());
@@ -2031,6 +2104,7 @@ int run(const Options& options) {
     if (options.depth) {
         requireDepthOptions(options);
         requireDepthCapture(reader, options);
+        if (!AgcDriverGpuReadTracking_nid_postfix()) throw std::runtime_error("frame replay: --depth-profile waits for recorded GPU work that reads a delta's bytes in place, and APS5_COPY_READ_TRACKING=0 turned that tracking off");
         if (!frameStartSerial(reader)) throw std::runtime_error(std::string(DepthWithoutFrameStart));
         const auto& captured = reader.Calls();
         const auto start = std::find_if(captured.begin(), captured.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
