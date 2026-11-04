@@ -23,6 +23,7 @@ void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> by
 }
 
 void Driver::noteLabelPass(std::span<const std::uint32_t> packet, std::uint32_t queue) {
+    titleWaitsPassed.fetch_add(1, std::memory_order_release);
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     if ((opcode != 0x3c && opcode != 0x93) || packet.size() < 7 || ((packet[1] >> 4u) & 3u) != 1u) return;
     const auto bytes = Pm4::WaitAwaitedBytes(packet);

@@ -412,6 +412,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
             PollSleep();
         }
     }
+    titleWaitsPassed.fetch_add(1, std::memory_order_release);
     Submission tail{};
     tail.queue = stalled.queue;
     if (APS5_ENABLE_TIMING_LOG) tail.receivedAt = std::chrono::steady_clock::now();
