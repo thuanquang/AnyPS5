@@ -215,6 +215,10 @@ extern "C" void AgcDriverPrepareGuestStore_nid_postfix(std::uint64_t address, st
     AgcDriver::GuestMemory::FlushGpuWrites(address, bytes);
 }
 
+extern "C" bool AgcDriverGuestStoreSettled_nid_postfix(std::uint64_t address, std::size_t bytes) {
+    return AgcDriver::DriverDetail::Driver::Get().GuestStoreSettled(address, bytes);
+}
+
 extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {
     const AgcDriver::GuestMemory::StoreSerialScope titleCall(AgcDriver::GuestMemory::TitleCallStoreSerial);
     auto* const recorder = AgcDriver::FrameRecorder::Active();

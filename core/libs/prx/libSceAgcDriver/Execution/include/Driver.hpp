@@ -63,6 +63,7 @@ extern "C" bool AgcDriverWaitRecordedOnGpuFor_nid_postfix(std::int64_t milliseco
 extern "C" void AgcDriverTrackGpuEpochs_nid_postfix(bool tracking);
 extern "C" bool AgcDriverWaitSerialsOnGpuFor_nid_postfix(std::uint64_t through, const std::uint64_t* serials, std::size_t count, std::int64_t milliseconds, AgcDriver::GpuSerialsWait* outcome);
 extern "C" void AgcDriverPrepareGuestStore_nid_postfix(std::uint64_t address, std::size_t bytes);
+extern "C" bool AgcDriverGuestStoreSettled_nid_postfix(std::uint64_t address, std::size_t bytes);
 extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait* waits, std::size_t capacity);
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix();
 extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix();

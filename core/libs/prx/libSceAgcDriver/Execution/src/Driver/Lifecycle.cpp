@@ -12,6 +12,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "ShaderDiskCache.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -408,6 +411,18 @@ bool Driver::WaitSerialsOnGpuFor(std::uint64_t through, std::span<const std::uin
     if (outcome != nullptr) outcome->waited = true;
     const auto remaining = (std::max)(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
     return localDevice->WaitRecordedFor(epoch, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count()));
+}
+
+bool Driver::GuestStoreSettled(std::uint64_t address, std::size_t bytes) {
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Store);
+    GuestMemory::FlushGpuWrites(address, bytes);
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
+    if (Graphics::Recorder::SnapshotWriteOverlaps(address, bytes) || Graphics::StorageTexture::AnyPendingOverlaps(range) || Graphics::AnyShadowedOverlaps(address, bytes)) return false;
+    const auto localDevice = device.Load();
+    if (localDevice == nullptr) return true;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    return !localDevice->StoresPendingOver(address, bytes);
 }
 
 std::vector<AwaitedWait> Driver::AwaitedWaits() {
