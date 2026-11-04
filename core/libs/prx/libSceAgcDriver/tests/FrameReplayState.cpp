@@ -1316,6 +1316,301 @@ void testColdPipelines() {
     check(std::getenv("APS5_HEADLESS_PIPELINE_CACHE") == nullptr, "cold replay kept a present zero pipeline cache setting");
 }
 
+constexpr std::uint64_t DepthBase = 40;
+constexpr std::array<std::uint32_t, 2> NopPacket{0xc0001000u, 0u};
+
+DepthProfile depthProfile(std::initializer_list<std::pair<std::uint64_t, std::uint64_t>> lines) {
+    DepthProfile profile;
+    profile.path = "pacing-profile.txt";
+    for (const auto& [bound, observed] : lines) {
+        profile.names.push_back(profile.names.empty() ? std::string("suspend") : "s" + std::to_string(profile.names.size()));
+        profile.bounds.push_back(bound);
+        profile.observed.push_back(observed);
+    }
+    return profile;
+}
+
+FrameCall depthFrameStart() {
+    FrameCall start;
+    start.kind = FrameCallKind::FrameStart;
+    start.accepted = DepthBase;
+    start.completed = DepthBase;
+    return start;
+}
+
+FrameCall pacedCall(FrameCallKind kind, std::uint64_t ordinal, std::uint64_t taken, const std::uint32_t* words = nullptr, std::size_t size = 0) {
+    FrameCall call;
+    call.kind = kind;
+    call.ordinal = ordinal;
+    call.thread = 1;
+    call.address = address(words);
+    call.size = size;
+    call.accepted = taken - 1;
+    call.completed = taken - 1;
+    call.values = {taken};
+    return call;
+}
+
+FrameCall depthRecord(std::uint64_t ordinal, std::uint64_t group) {
+    auto call = memoryCall(group, 1);
+    call.ordinal = ordinal;
+    return call;
+}
+
+std::string windowFailure(Replay& replay, std::span<const FrameCall> calls) {
+    std::string failure;
+    try {
+        replay.runWindow(calls);
+    } catch (const std::runtime_error& error) {
+        failure = error.what();
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    return failure;
+}
+
+void testPacingProfile(const std::filesystem::path& directory) {
+    std::filesystem::create_directories(directory);
+    const auto profileAt = [&](const std::string& name) { return directory / (name + ".txt"); };
+    const auto written = [&](const std::string& name, std::string_view text) {
+        const auto path = profileAt(name);
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        file.write(text.data(), static_cast<std::streamsize>(text.size()));
+        file.close();
+        check(!file.fail(), "cannot write a depth profile of the test");
+        return path;
+    };
+    const auto refusal = [](const std::filesystem::path& path) {
+        try {
+            readDepthProfile(path);
+        } catch (const std::runtime_error& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    const auto refused = [&](const std::string& name, std::string_view text, const std::string& expected, const std::string& accepted) {
+        const auto path = written(name, text);
+        const auto message = refusal(path);
+        if (message.empty()) throw std::runtime_error(accepted + " (" + path.string() + ")");
+        check(message == expected, ("the depth profile " + path.string() + " was refused with '" + message + "', not '" + expected + "'").c_str());
+    };
+    const auto line = [&](const std::string& name, int number) { return "frame replay: line " + std::to_string(number) + " of " + profileAt(name).string(); };
+    const auto missing = profileAt("missing");
+    std::filesystem::remove(missing);
+    check(refusal(missing) == "frame replay: cannot open " + missing.string(), ("a missing depth profile was not refused as unopened: " + refusal(missing)).c_str());
+    struct Text {
+        std::string name;
+        std::string_view text;
+        int line = 0;
+    };
+    const std::vector<Text> unmarked{{"magic", "aps5-depth-profile 2\nsuspend 4 6\ns1 5 5\n"}, {"empty", ""}, {"unterminated_magic", "aps5-depth-profile 1"}};
+    for (const auto& entry : unmarked) refused(entry.name, entry.text, "frame replay: " + profileAt(entry.name).string() + " does not start with the line 'aps5-depth-profile 1'", "a depth profile without the line 'aps5-depth-profile 1' was accepted");
+    const std::vector<Text> malformed{
+        {"short", "aps5-depth-profile 1\nsuspend 4\ns1 5 5\n", 2},
+        {"long", "aps5-depth-profile 1\nsuspend 4 6\ns1 5 5 5\n", 3},
+        {"carriage", "aps5-depth-profile 1\nsuspend 4 6\r\ns1 5 5\n", 2},
+        {"unterminated", "aps5-depth-profile 1\nsuspend 4 6\ns1 5 5", 3},
+        {"negative", "aps5-depth-profile 1\nsuspend 4 6\ns1 -5 5\n", 3},
+        {"blank", "aps5-depth-profile 1\nsuspend 4 6\n\ns1 5 5\n", 3},
+        {"spaced", "aps5-depth-profile 1\nsuspend  4 6\ns1 5 5\n", 2},
+        {"trailing", "aps5-depth-profile 1\nsuspend 4 6 \ns1 5 5\n", 2},
+        {"unnamed", "aps5-depth-profile 1\n 4 6\ns1 5 5\n", 2},
+        {"overflow", "aps5-depth-profile 1\nsuspend 4 18446744073709551616\ns1 5 5\n", 2},
+        {"hexadecimal", "aps5-depth-profile 1\nsuspend 0x4 6\ns1 5 5\n", 2},
+    };
+    for (const auto& entry : malformed) refused(entry.name, entry.text, line(entry.name, entry.line) + " is not '<position> <bound> <observed>'", "a depth profile with a malformed line was accepted");
+    refused("first", "aps5-depth-profile 1\ns1 5 5\n", line("first", 2) + " names s1 where its frame needs suspend", "a depth profile without its suspend line was accepted");
+    refused("skipped", "aps5-depth-profile 1\nsuspend 4 6\ns2 6 6\n", line("skipped", 3) + " names s2 where its frame needs s1", "a depth profile that skips s1 was accepted");
+    refused("above", "aps5-depth-profile 1\nsuspend 7 6\ns1 5 5\n", line("above", 2) + " bounds suspend at 7, above the 6 it observed", "a bound above the observed depth was accepted");
+    const std::vector<Text> frameless{{"frameless", "aps5-depth-profile 1\nsuspend 4 6\n"}, {"bare", "aps5-depth-profile 1\n"}};
+    for (const auto& entry : frameless) refused(entry.name, entry.text, "frame replay: " + profileAt(entry.name).string() + " lists no submission after its suspend point", "a depth profile without a submission was accepted");
+    const auto casino = written("casino", "aps5-depth-profile 1\nsuspend 4 6\ns1 5 5\ns2 6 6\ns3 7 7\ns4 8 8\ns5 9 9\ns6 6 7\n");
+    const auto loaded = readDepthProfile(casino);
+    check(loaded.path == casino && loaded.names == std::vector<std::string>{"suspend", "s1", "s2", "s3", "s4", "s5", "s6"} && loaded.bounds == std::vector<std::uint64_t>{4, 5, 6, 7, 8, 9, 6} &&
+              loaded.observed == std::vector<std::uint64_t>{6, 5, 6, 7, 8, 9, 7},
+          "the casino depth profile did not load as written");
+    const auto usageCode = [&](std::vector<std::string> arguments) {
+        arguments.insert(arguments.begin(), {"agc_frame_replay", (directory / "no-capture").string()});
+        std::vector<char*> pointers;
+        for (auto& argument : arguments) pointers.push_back(argument.data());
+        pointers.push_back(nullptr);
+        return frameReplayToolMain(static_cast<int>(arguments.size()), pointers.data());
+    };
+    const auto profile = casino.string();
+    const std::vector<std::pair<std::string, std::vector<std::string>>> usages{
+        {"a repeated --depth-profile", {"--depth-profile", profile, "--depth-profile", profile}},
+        {"a repeated --depth-cap", {"--depth-profile", profile, "--depth-cap", "4", "--depth-cap", "4"}},
+        {"--depth-cap without --depth-profile", {"--depth-cap", "4"}},
+        {"--depth-probe without --depth-profile", {"--depth-probe", "16"}},
+        {"--depth-cap with --depth-probe", {"--depth-profile", profile, "--depth-cap", "4", "--depth-probe", "16"}},
+        {"--depth-profile with --no-pace", {"--depth-profile", profile, "--no-pace"}},
+        {"--depth-profile with --shaders", {"--depth-profile", profile, "--shaders"}},
+        {"--depth-profile with --shader-code", {"--depth-profile", profile, "--shader-code", (directory / "code").string()}},
+        {"--depth-profile with --submits", {"--depth-profile", profile, "--submits", "1"}},
+        {"a --depth-cap that is not a number", {"--depth-profile", profile, "--depth-cap", "4x"}},
+        {"an empty --depth-profile", {"--depth-profile", ""}},
+    };
+    for (const auto& [what, arguments] : usages) check(usageCode(arguments) == 2, ("the replay did not return its usage for " + what).c_str());
+    auto* block = allocate(FrameCaptureWriter::BlockBytes);
+    auto* sentinel = reinterpret_cast<std::uint32_t*>(block);
+    constexpr std::uint32_t Marked = 0x5a5a5a5au;
+    std::vector<std::byte> snapshot(FrameCaptureWriter::BlockBytes);
+    std::memcpy(snapshot.data(), &Marked, sizeof(Marked));
+    std::uintptr_t base = 0;
+    std::size_t arenaSize = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &arenaSize);
+    const auto capture = [&](const std::string& name, bool started) {
+        const auto path = directory / name;
+        FrameCaptureWriter writer(path);
+        writer.WriteRange(address(block), FrameCaptureWriter::BlockBytes, FrameRangeKind::Watched, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu);
+        writer.WriteSnapshot(address(block), snapshot);
+        if (started) writer.WriteCall(depthFrameStart());
+        writer.Finish("{\"arena_base\":" + std::to_string(base) + "}");
+        return path;
+    };
+    const auto runFailure = [&](const Options& options) {
+        *sentinel = 0;
+        try {
+            run(options);
+        } catch (const std::runtime_error& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    Options released;
+    released.directory = capture("released", true);
+    released.depth = loaded;
+    const auto releaseFailure = runFailure(released);
+    check(releaseFailure == "frame replay: --depth-profile needs --no-release: a replay at depth never writes recorded or synthesized values to release a wait", ("the replay did not refuse --depth-profile with the breaker on: " + releaseFailure).c_str());
+    check(*sentinel == 0, "the replay restored the capture's snapshot before it refused --depth-profile with the breaker on");
+    Options unstarted;
+    unstarted.directory = capture("unstarted", false);
+    unstarted.release = false;
+    unstarted.depth = loaded;
+    const auto startFailure = runFailure(unstarted);
+    check(startFailure == DepthWithoutFrameStart, ("the replay did not refuse --depth-profile on a capture without a frame start: " + startFailure).c_str());
+    check(*sentinel == 0, "the replay restored the capture's snapshot before it refused a capture without a frame start");
+    restoreMemory(FrameCaptureReader(released.directory));
+    check(*sentinel == Marked, "the test capture does not restore its sentinel word, so its refusals could not show that nothing was restored");
+}
+
+void testPacingTemplate(const std::filesystem::path& directory) {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* nop = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* first = reinterpret_cast<std::uint32_t*>(bytes + 8192);
+    auto* last = reinterpret_cast<std::uint32_t*>(bytes + 8196);
+    std::copy(NopPacket.begin(), NopPacket.end(), nop);
+    *first = 0;
+    *last = 0;
+    const std::uint32_t firstValue = 0x11u;
+    const std::uint32_t lastValue = 0x22u;
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(first), std::as_bytes(std::span(&firstValue, 1)));
+    writer.WriteDelta(2, 0, address(last), std::as_bytes(std::span(&lastValue, 1)));
+    writer.WriteCall(depthFrameStart());
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.depth = depthProfile({{1, 1}, {1, 1}, {1, 1}});
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    constexpr auto Base = DepthBase;
+    const auto suspend = [](std::uint64_t ordinal, std::uint64_t taken) { return pacedCall(FrameCallKind::Suspend, ordinal, taken); };
+    const auto submit = [&](std::uint64_t ordinal, std::uint64_t taken) { return pacedCall(FrameCallKind::Submit, ordinal, taken, nop, NopPacket.size()); };
+    auto threaded = depthRecord(4, 1);
+    threaded.thread = 2;
+    auto flip = pacedCall(FrameCallKind::Flip, 3, Base + 3);
+    flip.values = {7, static_cast<std::uint64_t>(-1), 1, 0, Base + 3};
+    auto reservation = reservationCall(AgcDriver::EopFlipTokenBase);
+    reservation.ordinal = 2;
+    reservation.thread = 1;
+    auto compute = submit(2, Base + 2);
+    compute.queue = 0x20;
+    auto unrecorded = submit(2, Base + 2);
+    unrecorded.values.clear();
+    auto untaken = suspend(1, Base + 1);
+    untaken.values = {0};
+    const auto profile = options.depth->path.string();
+    const auto counted = " queue 0 submissions where " + profile + " lists s1-s2";
+    struct Case {
+        std::string what;
+        std::vector<FrameCall> calls;
+        std::string expected;
+    };
+    const std::vector<Case> cases{
+        {"a second thread's call", {suspend(1, Base + 1), submit(2, Base + 2), submit(3, Base + 3), threaded}, "frame replay: --depth-profile replays one calling thread, but call 1 is on thread 1 and call 4 on thread 2"},
+        {"a flip", {suspend(1, Base + 1), submit(2, Base + 2), flip}, "frame replay: --depth-profile does not order flips or EOP flip reservations inside the captured frames, and call 3 is a flip"},
+        {"an EOP flip reservation", {suspend(1, Base + 1), reservation}, "frame replay: --depth-profile does not order flips or EOP flip reservations inside the captured frames, and call 2 is a reserve-eop-flip"},
+        {"a submission to queue 0x20", {suspend(1, Base + 1), compute}, "frame replay: call 2 submits to queue 0x20, and --depth-profile replays queue 0 submissions only"},
+        {"a submission before the first suspend point", {submit(1, Base + 1), suspend(2, Base + 2), submit(3, Base + 3), submit(4, Base + 4)}, "frame replay: call 1 (submit) comes before the first suspend point of the captured frames, so it has no position in " + profile},
+        {"a frame with one submission", {suspend(1, Base + 1), submit(2, Base + 2), suspend(3, Base + 3), submit(4, Base + 4), submit(5, Base + 5)}, "frame replay: frame 1 of the captured frames (from call 1) has 1" + counted},
+        {"a frame with three submissions", {suspend(1, Base + 1), submit(2, Base + 2), submit(3, Base + 3), submit(4, Base + 4)}, "frame replay: frame 1 of the captured frames (from call 1) has 3" + counted},
+        {"a short last frame", {suspend(1, Base + 1), submit(2, Base + 2), submit(3, Base + 3), suspend(4, Base + 4), submit(5, Base + 5)}, "frame replay: frame 2 of the captured frames (from call 4) has 1" + counted},
+        {"frames without a suspend point", {depthRecord(1, 1)}, "frame replay: the captured frames have no suspend point, so the frame of " + profile + " never starts"},
+        {"a submission without its serial", {suspend(1, Base + 1), unrecorded}, "frame replay: call 2 (submit) has no recorded serial, so --depth-profile cannot map the floors and bounds that wait for it"},
+        {"a suspend point that took no serial", {untaken, submit(2, Base + 2), submit(3, Base + 3)}, "frame replay: call 1 (suspend) has no recorded serial, so --depth-profile cannot map the floors and bounds that wait for it"},
+    };
+    const auto refusedBeforeIssue = [&](Replay& target, const std::string& what, std::span<const FrameCall> calls, const std::string& expected) {
+        const auto before = progress();
+        const auto failure = windowFailure(target, calls);
+        if (failure.empty()) throw std::runtime_error("a frame that differs from the profile replayed: " + what);
+        check(failure == expected, ("the replay refused " + what + " with '" + failure + "', not '" + expected + "'").c_str());
+        check(progress() == before, ("the replay issued calls of " + what + " before it refused them").c_str());
+    };
+    for (const auto& entry : cases) refusedBeforeIssue(replay, entry.what, entry.calls, entry.expected);
+    const auto bare = directory / "bare";
+    {
+        FrameCaptureWriter bareWriter(bare);
+        bareWriter.Finish("{}");
+    }
+    const FrameCaptureReader bareReader(bare);
+    Replay unstarted{options, bareReader};
+    unstarted.recording = true;
+    const std::array frameOnly{suspend(1, Base + 1), submit(2, Base + 2), submit(3, Base + 3)};
+    refusedBeforeIssue(unstarted, "a window of a capture without a frame start", frameOnly, std::string(DepthWithoutFrameStart));
+    const std::array frames{suspend(1, Base + 1), depthRecord(2, 1), submit(3, Base + 2), submit(4, Base + 3), suspend(5, Base + 4), submit(6, Base + 5), submit(7, Base + 6), depthRecord(8, 2)};
+    const auto failure = windowFailure(replay, frames);
+    check(failure.empty(), ("two frames that follow the profile did not replay: " + failure).c_str());
+    check(replay.unfinished == 0 && *first == firstValue && *last == lastValue, "the two frames that follow the profile did not finish with both memory deltas restored");
+    check(replay.plan && replay.plan->frames == 2, "the replay did not count the two captured frames");
+    check(replay.plan->next[1] == 2 && replay.plan->position[2] == 1, "the memory delta between the first suspend point and its first submission did not take position s1");
+    check(replay.plan->next[7] == DepthPlan::Tail, "the memory delta after the last submission did not take the tail");
+    check(replay.replaySerials.size() == 6, ("the replay mapped " + std::to_string(replay.replaySerials.size()) + " of the six calls that took a serial").c_str());
+}
+
+void testPacingSerials(const std::filesystem::path& directory) {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* nop = reinterpret_cast<std::uint32_t*>(bytes);
+    std::copy(NopPacket.begin(), NopPacket.end(), nop);
+    FrameCaptureWriter writer(directory);
+    writer.WriteCall(depthFrameStart());
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.depth = depthProfile({{1, 1}, {1, 1}});
+    Replay replay{options, reader};
+    replay.recording = true;
+    constexpr auto Base = DepthBase;
+    const auto suspend = [](std::uint64_t ordinal, std::uint64_t taken) { return pacedCall(FrameCallKind::Suspend, ordinal, taken); };
+    const auto submit = [&](std::uint64_t ordinal, std::uint64_t taken) { return pacedCall(FrameCallKind::Submit, ordinal, taken, nop, NopPacket.size()); };
+    const std::array diverged{suspend(1, Base + 1), submit(2, Base + 3)};
+    const auto skipped = windowFailure(replay, diverged);
+    const auto expected = "frame replay: call 2 (submit) took replay serial " + std::to_string(replay.replayBase + 2) + " where the capture's serial " + std::to_string(Base + 3) + " maps to " + std::to_string(replay.replayBase + 3) + std::string(DepthUnmapped);
+    check(!skipped.empty(), "a submission recorded as taking the third serial after the frame start, after a suspend point that took the first, replayed at depth");
+    check(skipped == expected, ("the replay at depth did not refuse the submission that took another serial than its recorded one maps to with '" + expected + "': " + skipped).c_str());
+    const std::array divergedSuspend{suspend(1, Base + 2), submit(2, Base + 3)};
+    const auto early = windowFailure(replay, divergedSuspend);
+    const auto expectedEarly = "frame replay: call 1 (suspend) took replay serial " + std::to_string(replay.replayBase + 1) + " where the capture's serial " + std::to_string(Base + 2) + " maps to " + std::to_string(replay.replayBase + 2) + std::string(DepthUnmapped);
+    check(early == expectedEarly, ("the replay at depth did not refuse the suspend point that took another serial than its recorded one maps to with '" + expectedEarly + "': " + early).c_str());
+    const std::array matched{suspend(1, Base + 1), submit(2, Base + 2)};
+    const auto replayed = windowFailure(replay, matched);
+    check(replayed.empty(), ("the replay at depth refused a suspend point and a submission that took the serials they recorded: " + replayed).c_str());
+    const std::map<std::uint64_t, std::optional<std::uint64_t>> mapped{{Base + 1, replay.replayBase + 1}, {Base + 2, replay.replayBase + 2}};
+    check(replay.unfinished == 0 && replay.replaySerials == mapped, "the replay at depth did not map the suspend point and the submission to the replay serials they took");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1350,6 +1645,9 @@ int main(int argc, char** argv) {
         else if (mode == "shader_host_rewritten" || mode == "shader_host_restored" || mode == "shader_unaligned_restored") testDeltaPaths(directory, mode);
         else if (mode == "shader_hole") testShaderBlockHole(directory);
         else if (mode == "delta_hole") testDeltaOutsideRanges(directory);
+        else if (mode == "pacing_profile") testPacingProfile(directory);
+        else if (mode == "pacing_template") testPacingTemplate(directory);
+        else if (mode == "pacing_serials") testPacingSerials(directory);
         else throw std::runtime_error("unknown test");
         if (mode != "reservation_failure" && mode != "gate_failure") AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");
