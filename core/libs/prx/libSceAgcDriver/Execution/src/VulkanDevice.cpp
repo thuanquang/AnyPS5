@@ -4142,6 +4142,17 @@ void VulkanDevice::FlipBatches(std::uint64_t& submissions, std::uint64_t& unsign
     unsignaled = profile && state->recorder ? state->recorder->UnsignaledBatches() : 0;
 }
 
+void VulkanDevice::CountHeadlessPresent() {
+    if (Window() != nullptr) throw std::runtime_error("a replayed flip was counted as a present on a device that presents to a window");
+    Graphics::Recorder::CountPresent();
+    if (!state->recorder) return;
+    std::lock_guard lock(state->presentMutex);
+    const auto newest = state->recorder->NewestSubmitted();
+    state->retiredRanges.push_back({state->lastPresentSerial, newest});
+    state->lastPresentSerial = newest;
+    state->SettleRetired(false);
+}
+
 double VulkanDevice::RetirePresents(std::size_t keepInFlight) {
     auto& slots = state->presentSlots;
     if (slots.empty()) return 0;

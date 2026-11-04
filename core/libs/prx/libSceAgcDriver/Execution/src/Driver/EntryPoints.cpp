@@ -244,6 +244,14 @@ extern "C" void AgcDriverRequestBatchStamps_nid_postfix() {
     AgcDriver::Graphics::Recorder::RequestBatchStamps();
 }
 
+extern "C" void AgcDriverCountReplayPresents_nid_postfix() {
+    AgcDriver::DriverDetail::Driver::Get().CountReplayPresents();
+}
+
+extern "C" std::uint64_t AgcDriverReplayPresents_nid_postfix() {
+    return AgcDriver::Graphics::Recorder::Presents();
+}
+
 extern "C" void AgcDriverBatchGpuTime_nid_postfix(std::uint64_t* nanoseconds, std::uint64_t* untimed) {
     const auto totals = AgcDriver::Graphics::Recorder::BatchGpuTotals();
     *nanoseconds = totals.nanoseconds;

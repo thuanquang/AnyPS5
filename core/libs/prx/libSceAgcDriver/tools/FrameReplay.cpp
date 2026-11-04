@@ -254,10 +254,15 @@ public:
     void Wait() override {}
 };
 
+constexpr std::uint32_t OverlayOutput = 2;
+
 class ReplayOutput final : public AgcDriver::IVideoOutput {
 public:
     explicit ReplayOutput(Frames& frames) : frames(frames) {}
-    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override { return std::make_shared<ReplayFlip>(frames); }
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info) override {
+        if (info.handle == OverlayOutput) throw std::runtime_error("frame replay: the capture flips video output 2, the overlay bus, which a live run does not present, so the replay cannot count its flips as presents");
+        return std::make_shared<ReplayFlip>(frames);
+    }
     std::shared_ptr<AgcDriver::IRenderingWait> CaptureRenderingWait(std::uint32_t) override { return std::make_shared<ReplayRenderingWait>(); }
     void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
 
@@ -2196,6 +2201,7 @@ struct Pass {
     std::uint64_t paceTimeouts = 0;
     std::uint64_t synthesized = 0;
     std::optional<std::uint64_t> gpuNs;
+    std::optional<std::uint64_t> presents;
 };
 
 std::string milliseconds(std::optional<std::uint64_t> nanoseconds) {
@@ -2314,6 +2320,7 @@ int run(const Options& options) {
         else ++titleUnknown;
     }
     AgcDriverRequestBatchStamps_nid_postfix();
+    AgcDriverCountReplayPresents_nid_postfix();
     for (auto call = calls.begin(); call != frameStart; ++call) replay.execute(*call);
     const auto journalStart = Clock::now();
     AgcDriverWaitForPipelineJournal_nid_postfix();
@@ -2350,6 +2357,7 @@ int run(const Options& options) {
         std::uint64_t gpuBefore = 0;
         std::uint64_t untimedBefore = 0;
         AgcDriverBatchGpuTime_nid_postfix(&gpuBefore, &untimedBefore);
+        const auto presentsBefore = AgcDriverReplayPresents_nid_postfix();
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
@@ -2363,6 +2371,7 @@ int run(const Options& options) {
             std::uint64_t untimedAfter = 0;
             AgcDriverBatchGpuTime_nid_postfix(&gpuAfter, &untimedAfter);
             if (untimedAfter == untimedBefore) measured.gpuNs = gpuAfter - gpuBefore;
+            measured.presents = AgcDriverReplayPresents_nid_postfix() - presentsBefore;
         }
         measured.frames = replay.frames.Times().size() - measured.firstFrame;
         measured.seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
@@ -2390,8 +2399,8 @@ int run(const Options& options) {
         std::vector<double> passMs;
         for (auto frame = measured.firstFrame + 1; frame < measured.firstFrame + measured.frames; ++frame) passMs.push_back(std::chrono::duration<double, std::milli>(ready[frame] - ready[frame - 1]).count());
         char entry[256];
-        std::snprintf(entry, sizeof(entry), "%s{\"replay_s\":%.3f,\"frames\":%zu,\"p50\":%.3f,\"pace_timeouts\":%llu,\"synthesized\":%llu,\"gpu_ms\":%s}", passList.empty() ? "" : ",", measured.seconds, measured.frames,
-                      percentile(passMs, 0.5), static_cast<unsigned long long>(measured.paceTimeouts), static_cast<unsigned long long>(measured.synthesized), milliseconds(measured.gpuNs).c_str());
+        std::snprintf(entry, sizeof(entry), "%s{\"replay_s\":%.3f,\"frames\":%zu,\"p50\":%.3f,\"pace_timeouts\":%llu,\"synthesized\":%llu,\"gpu_ms\":%s,\"presents\":%s}", passList.empty() ? "" : ",", measured.seconds, measured.frames,
+                      percentile(passMs, 0.5), static_cast<unsigned long long>(measured.paceTimeouts), static_cast<unsigned long long>(measured.synthesized), milliseconds(measured.gpuNs).c_str(), measured.presents ? std::to_string(*measured.presents).c_str() : "null");
         passList += entry;
         if (index < firstMeasured) continue;
         for (const auto value : passMs) frameList += (frameList.empty() ? "" : ",") + std::to_string(static_cast<long long>(value));

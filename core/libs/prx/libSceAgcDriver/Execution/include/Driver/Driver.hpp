@@ -95,6 +95,7 @@ public:
     bool Settled();
     bool WaitRecordedOnGpuFor(std::chrono::milliseconds timeout);
     void TrackGpuEpochs(bool tracking);
+    void CountReplayPresents();
     bool WaitSerialsOnGpuFor(std::uint64_t through, std::span<const std::uint64_t> serials, std::chrono::milliseconds timeout, GpuSerialsWait* outcome);
     bool GuestStoreSettled(std::uint64_t address, std::size_t bytes);
     bool WaitGpuBatchFor(std::uint64_t batch, std::chrono::milliseconds timeout);
@@ -414,6 +415,7 @@ private:
     void execute(const Submission& submission);
     void deliverGuestEopInterrupt(std::uint32_t queue);
     void deliverFlipEopInterrupt(std::uint32_t queue);
+    void countReplayPresent();
     void markCompleted(std::uint64_t serial);
     std::uint64_t gpuEpochOf(std::uint64_t serial) const;
     static const std::atomic<std::uint64_t>*& workerQueued();
@@ -514,6 +516,7 @@ private:
     std::set<std::uint64_t> startedAhead;
     static constexpr std::size_t GpuEpochHistory = 4096;
     std::atomic<std::uint32_t> gpuEpochTrackers{0};
+    std::atomic<bool> replayPresents{false};
     std::deque<std::pair<std::uint64_t, std::uint64_t>> completedGpuEpochs;
     std::map<std::uint64_t, std::uint64_t> outOfOrderGpuEpochs;
     std::map<std::uint64_t, std::vector<AwaitedDword>> unfinishedWaits;

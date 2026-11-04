@@ -355,6 +355,15 @@ bool Driver::WaitRecordedOnGpuFor(std::chrono::milliseconds timeout) {
     return localDevice->WaitRecordedFor(epoch, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count()));
 }
 
+void Driver::CountReplayPresents() {
+    replayPresents.store(true, std::memory_order_relaxed);
+}
+
+void Driver::countReplayPresent() {
+    if (!replayPresents.load(std::memory_order_relaxed)) return;
+    if (const auto localDevice = device.Load()) localDevice->CountHeadlessPresent();
+}
+
 void Driver::TrackGpuEpochs(bool tracking) {
     std::shared_lock use(deviceReplacement);
     std::lock_guard lock(mutex);
