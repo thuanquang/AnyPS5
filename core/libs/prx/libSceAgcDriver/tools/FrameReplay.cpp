@@ -64,6 +64,12 @@ struct Dump {
     std::filesystem::path path;
 };
 
+struct DepthProfile {
+    std::filesystem::path path;
+    std::vector<std::string> names;
+    std::vector<std::uint64_t> bounds, observed;
+};
+
 struct Options {
     std::filesystem::path directory;
     std::vector<Dump> dumps;
@@ -84,6 +90,9 @@ struct Options {
     bool coldPipelines = false;
     std::filesystem::path flipHashes;
     std::filesystem::path expectedFlipHashes;
+    std::filesystem::path depthFile;
+    std::optional<DepthProfile> depth;
+    std::optional<std::uint64_t> depthCap, depthProbe;
 };
 
 std::uint64_t contentHash(const std::byte* bytes, std::size_t size);
@@ -326,6 +335,108 @@ void requireRecordedSerials(const FrameCaptureReader& reader) {
 std::optional<std::uint64_t> titleNs(const FrameCaptureReader& reader, const FrameCall& call) {
     if (reader.Version() < AgcDriver::ExitCallsVersion || !AgcDriver::FrameTitleCall(call.kind) || call.previousExitNs == 0) return std::nullopt;
     return call.timeNs - call.previousExitNs;
+}
+
+constexpr std::string_view DepthProfileMagic = "aps5-depth-profile 1";
+constexpr std::string_view DepthWithoutFrameStart = "frame replay: --depth-profile needs a capture with a frame start, so that its gates can map the capture's serials to this replay's";
+constexpr std::string_view DepthUnmapped = ", so --depth-profile cannot map the floors and bounds of the memory deltas after it to this replay's submissions";
+
+DepthProfile readDepthProfile(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) throw std::runtime_error("frame replay: cannot open " + path.string());
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const auto magic = std::string(DepthProfileMagic) + '\n';
+    if (!text.starts_with(magic)) throw std::runtime_error("frame replay: " + path.string() + " does not start with the line '" + std::string(DepthProfileMagic) + "'");
+    const auto parse = [](std::string_view line, std::string_view& name, std::uint64_t& bound, std::uint64_t& observed) {
+        const auto space = line.find(' ');
+        if (space == 0 || space == std::string_view::npos) return false;
+        name = line.substr(0, space);
+        const auto* cursor = line.data() + space;
+        const auto* const end = line.data() + line.size();
+        const auto number = [&](std::uint64_t& value) {
+            if (cursor == end || *cursor != ' ') return false;
+            const auto [last, error] = std::from_chars(cursor + 1, end, value);
+            if (error != std::errc{}) return false;
+            cursor = last;
+            return true;
+        };
+        return number(bound) && number(observed) && cursor == end;
+    };
+    DepthProfile profile{path, {}, {}, {}};
+    for (std::size_t begin = magic.size(), number = 2; begin < text.size(); ++number) {
+        const auto end = text.find('\n', begin);
+        const auto where = "frame replay: line " + std::to_string(number) + " of " + path.string();
+        std::string_view name;
+        std::uint64_t bound = 0;
+        std::uint64_t observed = 0;
+        if (end == std::string::npos || !parse(std::string_view(text).substr(begin, end - begin), name, bound, observed)) throw std::runtime_error(where + " is not '<position> <bound> <observed>'");
+        const auto expected = profile.names.empty() ? std::string("suspend") : "s" + std::to_string(profile.names.size());
+        if (name != expected) throw std::runtime_error(where + " names " + std::string(name) + " where its frame needs " + expected);
+        if (bound > observed) throw std::runtime_error(where + " bounds " + expected + " at " + std::to_string(bound) + ", above the " + std::to_string(observed) + " it observed");
+        profile.names.push_back(expected);
+        profile.bounds.push_back(bound);
+        profile.observed.push_back(observed);
+        begin = end + 1;
+    }
+    if (profile.names.size() < 2) throw std::runtime_error("frame replay: " + path.string() + " lists no submission after its suspend point");
+    return profile;
+}
+
+struct DepthPlan {
+    std::vector<std::uint32_t> position, frame;
+    std::vector<std::size_t> next;
+    std::size_t frames = 0;
+    static constexpr std::uint32_t NoPosition = ~0u;
+    static constexpr std::size_t Tail = ~std::size_t{0};
+};
+
+DepthPlan planDepth(std::span<const FrameCall> calls, const DepthProfile& profile) {
+    const auto submissions = profile.names.size() - 1;
+    DepthPlan plan;
+    plan.position.assign(calls.size(), DepthPlan::NoPosition);
+    plan.frame.assign(calls.size(), 0);
+    plan.next.assign(calls.size(), DepthPlan::Tail);
+    std::size_t opened = 0;
+    std::size_t inFrame = 0;
+    const auto unfit = [&](std::size_t count) {
+        return std::runtime_error("frame replay: frame " + std::to_string(plan.frames) + " of the captured frames (from call " + std::to_string(calls[opened].ordinal) + ") has " + std::to_string(count) + " queue 0 submissions where " + profile.path.string() + " lists s1-s" + std::to_string(submissions));
+    };
+    for (std::size_t index = 0; index < calls.size(); ++index) {
+        const auto& call = calls[index];
+        if (call.thread != calls.front().thread) throw std::runtime_error("frame replay: --depth-profile replays one calling thread, but call " + std::to_string(calls.front().ordinal) + " is on thread " + std::to_string(calls.front().thread) + " and call " + std::to_string(call.ordinal) + " on thread " + std::to_string(call.thread));
+        if (call.kind == FrameCallKind::Flip || call.kind == FrameCallKind::ReserveEopFlip) throw std::runtime_error("frame replay: --depth-profile does not order flips or EOP flip reservations inside the captured frames, and call " + std::to_string(call.ordinal) + " is a " + std::string(AgcDriver::FrameCallName(call.kind)));
+        plan.frame[index] = static_cast<std::uint32_t>(plan.frames);
+        if (call.kind != FrameCallKind::Suspend && call.kind != FrameCallKind::Submit) continue;
+        if (call.values.size() != 1 || call.values.back() == 0) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + std::string(AgcDriver::FrameCallName(call.kind)) + ") has no recorded serial, so --depth-profile cannot map the floors and bounds that wait for it");
+        if (call.kind == FrameCallKind::Suspend) {
+            if (plan.frames != 0 && inFrame != submissions) throw unfit(inFrame);
+            ++plan.frames;
+            opened = index;
+            inFrame = 0;
+            plan.position[index] = 0;
+            plan.frame[index] = static_cast<std::uint32_t>(plan.frames);
+            continue;
+        }
+        if (call.queue != 0) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " submits to queue " + addressText(call.queue) + ", and --depth-profile replays queue 0 submissions only");
+        if (plan.frames == 0) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + std::string(AgcDriver::FrameCallName(call.kind)) + ") comes before the first suspend point of the captured frames, so it has no position in " + profile.path.string());
+        if (inFrame == submissions) {
+            auto count = inFrame;
+            for (auto later = index; later < calls.size() && calls[later].kind != FrameCallKind::Suspend; ++later) count += calls[later].kind == FrameCallKind::Submit && calls[later].queue == 0 ? 1 : 0;
+            throw unfit(count);
+        }
+        plan.position[index] = static_cast<std::uint32_t>(++inFrame);
+    }
+    if (plan.frames == 0) throw std::runtime_error("frame replay: the captured frames have no suspend point, so the frame of " + profile.path.string() + " never starts");
+    if (inFrame != submissions) throw unfit(inFrame);
+    for (auto index = calls.size(), paced = DepthPlan::Tail; index > 0; --index) {
+        plan.next[index - 1] = paced;
+        if (plan.position[index - 1] != DepthPlan::NoPosition) paced = index - 1;
+    }
+    return plan;
+}
+
+void requireDepthOptions(const Options& options) {
+    if (options.release) throw std::runtime_error("frame replay: --depth-profile needs --no-release: a replay at depth never writes recorded or synthesized values to release a wait");
 }
 
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
@@ -575,6 +686,9 @@ struct Replay {
     bool recording = false;
     Clock::time_point startedAt{};
     Clock::time_point endedAt{};
+    std::optional<DepthPlan> plan;
+    std::span<const FrameCall> window;
+    std::size_t current = 0;
 
     struct SettledHold {
         bool held;
@@ -994,6 +1108,12 @@ struct Replay {
     }
 
     void runWindow(std::span<const FrameCall> calls) {
+        window = calls;
+        plan.reset();
+        if (options.depth && recording) {
+            if (!captureBase) throw std::runtime_error(std::string(DepthWithoutFrameStart));
+            plan = planDepth(calls, *options.depth);
+        }
         std::map<std::uint64_t, std::vector<std::size_t>> byThread;
         for (std::size_t index = 0; index < calls.size(); ++index) byThread[calls[index].thread].push_back(index);
         threads = byThread.size();
@@ -1007,6 +1127,7 @@ struct Replay {
         for (const auto& call : calls) {
             if (options.pace && recording && reader.Version() >= AgcDriver::InFlightCallsVersion && captureBase && call.kind == FrameCallKind::Memory && (call.flags & AgcDriver::InFlightDeltaFlag) != 0 && call.ordinal <= singleThreadOrdinal) mappedOrdinal = std::max(mappedOrdinal, call.ordinal);
         }
+        if (plan) mappedOrdinal = calls.back().ordinal + 1;
         if (captureBase && *captureBase != 0 && progress().first == 0) primeAcceptedSerial();
         replayBase = progress().first;
         replayFlips = 0;
@@ -1055,6 +1176,7 @@ struct Replay {
                     std::unique_lock lock(mutex);
                     turn.wait(lock, [&] { return started == index || failure != nullptr; });
                     if (failure != nullptr) return;
+                    current = index;
                     const auto advance = [&] {
                         ++started;
                         sequenced.store(started);
@@ -1132,7 +1254,7 @@ struct Replay {
         }
         const std::string name(AgcDriver::FrameCallName(call.kind));
         const auto taken = takenSerial(call);
-        if (!taken) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + name + ") has no recorded serial, so the submissions in flight at the memory delta of call " + std::to_string(mappedOrdinal) + " cannot be mapped to this replay's");
+        if (!taken) throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + name + ") has no recorded serial" + (plan ? std::string(DepthUnmapped) : ", so the submissions in flight at the memory delta of call " + std::to_string(mappedOrdinal) + " cannot be mapped to this replay's"));
         const auto before = progress().first;
         traced(call, std::forward<TFunction>(function));
         const auto after = progress().first;
@@ -1155,7 +1277,7 @@ struct Replay {
             return;
         }
         throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + name + ") took " + (after == before ? std::string("no replay serial") : "replay serial " + std::to_string(after)) + " where " +
-                                 (*taken == 0 ? std::string("the capture's call took none") : "the capture's serial " + std::to_string(*taken) + " maps to " + std::to_string(mapped)) + ", so the memory delta of call " + std::to_string(mappedOrdinal) + " read in flight cannot be mapped to this replay's submissions");
+                                 (*taken == 0 ? std::string("the capture's call took none") : "the capture's serial " + std::to_string(*taken) + " maps to " + std::to_string(mapped)) + (plan ? std::string(DepthUnmapped) : ", so the memory delta of call " + std::to_string(mappedOrdinal) + " read in flight cannot be mapped to this replay's submissions"));
     }
 
     template <typename TFunction>
@@ -1190,6 +1312,7 @@ struct Replay {
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--pace-timeout-ms <n>] [--no-release] [--release-after-ms <n>] [--strict]\n"
                          "                        [--repeat <n>] [--cold-pipelines] [--flip-hashes <file>] [--expect-flip-hashes <file>] [--dump <address>:<bytes>:<file>]...\n"
+                         "                        [--depth-profile <file> [--depth-cap <n> | --depth-probe <n>]]\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
@@ -1219,7 +1342,13 @@ int usage() {
                          "                      them are flushed, and writes the hashes to <file> once the pass finished without a failure\n"
                          "  --expect-flip-hashes <file>\n"
                          "                      hashes every pass the same way and fails at the first flip whose hashes differ from <file>,\n"
-                         "                      or when a pass presents another number of flips than <file> lists\n");
+                         "                      or when a pass presents another number of flips than <file> lists\n"
+                         "  --depth-profile <file>\n"
+                         "                      refuses captured frames that are not one thread's suspend points, each followed by the queue 0\n"
+                         "                      submissions <file> (aps5-depth-profile 1) bounds, or whose calls do not take the serials the\n"
+                         "                      capture recorded; needs --no-release\n"
+                         "  --depth-cap <n>     lowers every bound of the depth profile to at most n\n"
+                         "  --depth-probe <n>   sets every bound of the depth profile to n, for sensitivity runs\n");
     return 2;
 }
 
@@ -1622,6 +1751,35 @@ double percentile(std::vector<double> values, double fraction) {
     return values[std::min(values.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(values.size())))];
 }
 
+std::string jsonText(std::string_view value) {
+    std::string text = "\"";
+    for (const char character : value) {
+        if (character == '"' || character == '\\') {
+            text += '\\';
+            text += character;
+        } else if (static_cast<unsigned char>(character) < 0x20u) {
+            char escaped[8];
+            std::snprintf(escaped, sizeof(escaped), "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(character)));
+            text += escaped;
+        } else {
+            text += character;
+        }
+    }
+    return text + "\"";
+}
+
+std::string depthJson(const Options& options, const Replay& replay) {
+    if (!options.depth) return "null";
+    const auto& profile = *options.depth;
+    const auto number = [](const std::optional<std::uint64_t>& value) { return value ? std::to_string(*value) : std::string("null"); };
+    const auto name = profile.path.filename().u8string();
+    std::string text = "{\"profile\":" + jsonText(std::string(name.begin(), name.end())) + ",\"cap\":" + number(options.depthCap) + ",\"probe\":" + number(options.depthProbe) + ",\"frames\":" + std::to_string(replay.plan ? replay.plan->frames : 0) + ",\"positions\":[";
+    for (std::size_t position = 0; position < profile.names.size(); ++position) {
+        text += std::string(position == 0 ? "" : ",") + "{\"position\":" + jsonText(profile.names[position]) + ",\"bound\":" + std::to_string(profile.bounds[position]) + ",\"observed\":" + std::to_string(profile.observed[position]) + "}";
+    }
+    return text + "]}";
+}
+
 int run(const Options& options) {
     if (std::error_code error; !options.flipHashes.empty() && !options.expectedFlipHashes.empty() && std::filesystem::equivalent(options.flipHashes, options.expectedFlipHashes, error)) throw std::runtime_error("frame replay: --flip-hashes and --expect-flip-hashes name the same file " + options.flipHashes.string());
     const auto loadStart = Clock::now();
@@ -1635,6 +1793,13 @@ int run(const Options& options) {
         if (!options.expectedFlipHashes.empty()) expected = readFlipHashes(options.expectedFlipHashes, ranges);
     }
     if (options.pace) requireRecordedSerials(reader);
+    if (options.depth) {
+        requireDepthOptions(options);
+        if (!frameStartSerial(reader)) throw std::runtime_error(std::string(DepthWithoutFrameStart));
+        const auto& captured = reader.Calls();
+        const auto start = std::find_if(captured.begin(), captured.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
+        planDepth(std::span(captured).subspan(static_cast<std::size_t>(start - captured.begin()) + 1), *options.depth);
+    }
     auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
     Replay replay{options, reader};
@@ -1727,7 +1892,7 @@ int run(const Options& options) {
         frames += measured.frames;
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"memory_gpu_wait_s\":%.3f,\"memory_gpu_drains\":%llu,\"memory_gpu_waits\":%llu,\"memory_gpu_submits\":%llu,\"restore_s\":%.3f,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"title_s\":%.3f,\"title_unknown\":%llu,\"load_s\":%.3f,\"journal_s\":%.3f,\"flips_hashed\":%llu,\"flip_hash_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"memory_gpu_wait_s\":%.3f,\"memory_gpu_drains\":%llu,\"memory_gpu_waits\":%llu,\"memory_gpu_submits\":%llu,\"restore_s\":%.3f,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"title_s\":%.3f,\"title_unknown\":%llu,\"load_s\":%.3f,\"journal_s\":%.3f,\"flips_hashed\":%llu,\"flip_hash_s\":%.3f,\"depth\":%s}\n",
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
@@ -1736,7 +1901,7 @@ int run(const Options& options) {
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, titleSeconds, static_cast<unsigned long long>(titleUnknown), std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds,
-                static_cast<unsigned long long>(replay.frames.HashedFlips()), replay.frames.HashSeconds());
+                static_cast<unsigned long long>(replay.frames.HashedFlips()), replay.frames.HashSeconds(), depthJson(options, replay).c_str());
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }
@@ -1780,15 +1945,28 @@ int main(int argc, char** argv) {
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (argument == "--flip-hashes" && index + 1 < argc) options.flipHashes = argv[++index];
         else if (argument == "--expect-flip-hashes" && index + 1 < argc) options.expectedFlipHashes = argv[++index];
-        else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
+        else if (argument == "--depth-profile" && index + 1 < argc) {
+            if (!options.depthFile.empty() || *argv[index + 1] == '\0') return usage();
+            options.depthFile = argv[++index];
+        } else if ((argument == "--depth-cap" || argument == "--depth-probe") && index + 1 < argc) {
+            auto& bound = argument == "--depth-cap" ? options.depthCap : options.depthProbe;
+            const std::string_view value = argv[++index];
+            std::uint64_t parsed = 0;
+            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+            if (bound || error != std::errc{} || end != value.data() + value.size()) return usage();
+            bound = parsed;
+        } else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
     if (options.directory.empty()) return usage();
     if ((options.shaders || options.submits != 0) && (!options.flipHashes.empty() || !options.expectedFlipHashes.empty())) return usage();
+    if ((options.depthCap || options.depthProbe) && (options.depthFile.empty() || (options.depthCap && options.depthProbe))) return usage();
+    if (!options.depthFile.empty() && (!options.pace || options.shaders || options.submits != 0)) return usage();
     configureEnvironment(options);
     int code = 2;
     const bool listing = options.shaders || options.submits != 0;
     try {
+        if (!options.depthFile.empty()) options.depth = readDepthProfile(options.depthFile);
         code = options.shaders ? listShaders(options) : options.submits != 0 ? listSubmits(options) : run(options);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
