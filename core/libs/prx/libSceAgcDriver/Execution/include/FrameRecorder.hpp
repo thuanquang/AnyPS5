@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_FRAMERECORDER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "SceShaders.hpp"
@@ -16,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -57,6 +59,18 @@ public:
     static void NoteGpuFill(std::uint64_t address, std::uint64_t bytes, const std::array<std::uint32_t, 4>& pattern) {
         if (notingGpuStores.load(std::memory_order_relaxed)) Active()->noteGpuFill(address, bytes, pattern);
     }
+    static void NoteAwaits(std::uint64_t serial, std::span<const DriverDetail::AwaitedDword> waits) {
+        if (notingGpuStores.load(std::memory_order_relaxed)) Active()->noteAwaits(serial, waits, true);
+    }
+    static void NoteTailAwaits(std::uint64_t serial, std::span<const DriverDetail::AwaitedDword> waits) {
+        if (notingGpuStores.load(std::memory_order_relaxed)) Active()->noteAwaits(serial, waits, false);
+    }
+    static void NoteAwaitPassed(std::uint64_t serial, std::size_t index, std::optional<std::uint64_t> pendingLabel) {
+        if (notingGpuStores.load(std::memory_order_relaxed)) Active()->noteAwaitPassed(serial, index, pendingLabel);
+    }
+    static void NoteAwaitsFinished(std::uint64_t serial) {
+        if (notingGpuStores.load(std::memory_order_relaxed)) Active()->noteAwaitsFinished(serial);
+    }
 
 private:
     enum class State { Waiting, Recording, Done };
@@ -90,13 +104,47 @@ private:
         std::uint32_t unknown = 0;
         std::uint64_t newestEvent = 0;
     };
+    using WaitKey = std::pair<std::uint64_t, std::size_t>;
+    struct WaitedDword {
+        std::uint32_t value = 0;
+        bool known = false;
+        std::uint32_t before = 0;
+        bool beforeKnown = false;
+        std::uint64_t noteSerial = 0;
+        std::vector<WaitKey> waits;
+    };
+    enum class WaitStage : std::uint8_t { Unpassed, Passed, Visible };
+    struct TrackedWait {
+        DriverDetail::AwaitedDword wait;
+        std::uint64_t passSequence = 0;
+        bool anchored = false;
+        WaitStage stage = WaitStage::Unpassed;
+    };
+    struct WaitVerdicts {
+        std::uint64_t floor = 0;
+        std::uint64_t floorEvent = 0;
+        std::uint64_t neededSerial = UINT64_MAX;
+        std::uint64_t neededPass = UINT64_MAX;
+        std::uint64_t neededDword = 0;
+        std::uint32_t flags = 0;
+        std::uint64_t lostSerial = 0;
+        std::uint64_t lostDword = 0;
+    };
     static constexpr std::size_t FloorPieceLimit = std::size_t{1} << 20;
+    static constexpr std::size_t WaitWarningLimit = 16;
     static void observeDriverStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
     void noteDriverStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
     static void observeGpuWriteNote(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
     void noteGpuWriteNote(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
     void addFloorPiece(std::uint64_t begin, std::uint64_t end, std::uint64_t serial, std::uint32_t unknown);
     void takeStoreFloor(std::uint64_t address, std::span<const std::pair<std::size_t, std::size_t>> runs, std::uint64_t before, std::uint64_t completed, StoreFloor& storeFloor);
+    void noteAwaits(std::uint64_t serial, std::span<const DriverDetail::AwaitedDword> waits, bool afterDelta);
+    void noteAwaitPassed(std::uint64_t serial, std::size_t index, std::optional<std::uint64_t> pendingLabel);
+    void noteAwaitsFinished(std::uint64_t serial);
+    static void noteWaitedStore(WaitedDword& waited, std::uint32_t value, std::uint64_t serial);
+    bool anchors(const DriverDetail::AwaitedDword& wait, std::uint64_t serial) const;
+    void forgetWait(WaitKey key, const DriverDetail::AwaitedDword& wait);
+    void judgeWaits(std::uint64_t address, std::span<const std::byte> bytes, std::span<const std::pair<std::size_t, std::size_t>> runs, std::span<const std::pair<std::uint64_t, std::uint64_t>> skipped, std::uint64_t readStart, WaitVerdicts& verdicts);
     std::uint32_t holdMask(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t& checked);
     void countUnwatched(std::vector<std::pair<std::uint64_t, std::uint64_t>>& unwatched, std::vector<std::pair<std::uint64_t, std::uint64_t>>& blocks);
     void recordUnwatched(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stores);
@@ -138,7 +186,7 @@ private:
     void start();
     void finish();
     void snapshot(const Range& range);
-    void readGuest(std::uint64_t address, std::span<std::byte> bytes);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> readGuest(std::uint64_t address, std::span<std::byte> bytes);
     void noteGpuStore(std::uint64_t address, std::span<const std::byte> bytes);
     void noteGpuFill(std::uint64_t address, std::uint64_t bytes, const std::array<std::uint32_t, 4>& pattern);
     void endGpuStores();
@@ -170,6 +218,11 @@ private:
     std::map<std::uint64_t, std::uint32_t> gpuWords;
     std::map<std::uint64_t, GpuFill> gpuFills;
     std::uint64_t gpuStoreBytes = 0;
+    std::map<std::uint64_t, WaitedDword> waitedDwords;
+    std::map<WaitKey, TrackedWait> trackedWaits;
+    std::map<std::uint64_t, std::size_t> awaitIndices;
+    bool multiQueue = false;
+    std::size_t waitWarnings = 0;
     std::mutex displayMutex;
     std::map<std::uint64_t, DisplayBuffer> displayBuffers;
     std::uint64_t ordinal = 0;

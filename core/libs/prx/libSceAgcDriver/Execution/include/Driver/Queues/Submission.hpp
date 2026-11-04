@@ -42,6 +42,8 @@ struct AwaitedDword {
     std::array<std::optional<LabelValue>, 2> ahead{};
 };
 
+bool AwaitedAccepts(const AwaitedDword& wait, std::uint64_t value);
+
 struct Submission {
     std::uint64_t serial;
     std::uint32_t queue;

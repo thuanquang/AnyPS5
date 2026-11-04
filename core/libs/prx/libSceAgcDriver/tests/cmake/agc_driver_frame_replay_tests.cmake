@@ -42,7 +42,7 @@ if(BUILD_TESTING)
             set_tests_properties(agc_driver_frame_replay_concurrent agc_driver_frame_replay_rewind PROPERTIES ENVIRONMENT_MODIFICATION
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
-        foreach(mode IN ITEMS rewind_store rewind_copy rewind_compute rewind_release rewind_fill rewind_split wait_label gpu_store gpu_fill gpu_restore_cached unwatched_start unwatched_late unwatched_shared gpu_cleared fence_reuse busy_queue in_flight_delta in_flight_store hold_diagnostics late_store wait_after_read wait_before_read unwatched_in_flight unwatched_restored host_page_restored in_flight_gate wait64_after_read semaphore_after_read rewind_after_read late_wait flip_hashes flip_hashes_lists flip_hashes_cpu wait_labelled_after wait_labelled_before wait_labelled_skipped wait_labelled_elsewhere flip_serial_start exit_times store_floor store_floor_unknown store_floor_noted store_floor_note store_floor_parked store_floor_in_flight)
+        foreach(mode IN ITEMS rewind_store rewind_copy rewind_compute rewind_release rewind_fill rewind_split wait_label gpu_store gpu_fill gpu_restore_cached unwatched_start unwatched_late unwatched_shared gpu_cleared fence_reuse busy_queue in_flight_delta in_flight_store hold_diagnostics late_store wait_after_read wait_before_read unwatched_in_flight unwatched_restored host_page_restored in_flight_gate wait64_after_read semaphore_after_read rewind_after_read late_wait flip_hashes flip_hashes_lists flip_hashes_cpu wait_labelled_after wait_labelled_before wait_labelled_skipped wait_labelled_elsewhere flip_serial_start exit_times store_floor store_floor_unknown store_floor_noted store_floor_note store_floor_parked store_floor_in_flight wait_floor wait_floor_once wait_floor_later wait_floor_label wait_floor_overwritten wait_floor_order wait_floor_order_queues wait_floor_semaphore wait_floor_parked wait_floor_tail wait_floor_tail_once wait_floor_tail_semaphore)
             add_test(NAME agc_driver_frame_replay_${mode} COMMAND agc_driver_frame_replay_tests $<TARGET_FILE:agc_frame_replay> ${mode})
             set_tests_properties(agc_driver_frame_replay_${mode} PROPERTIES
                     ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-${mode}-capture;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=2;APS5_FRAME_CAPTURE_MIN_FREE_BYTES=0"
@@ -50,6 +50,10 @@ if(BUILD_TESTING)
             if(mode STREQUAL "late_store" OR mode STREQUAL "late_wait")
                 set_tests_properties(agc_driver_frame_replay_${mode} PROPERTIES ENVIRONMENT
                         "ANYPS5_NO_SHADER_CACHE=1;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-${mode}-capture;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=1;APS5_FRAME_CAPTURE_MIN_FREE_BYTES=0")
+            endif()
+            if(mode STREQUAL "wait_floor_label" OR mode STREQUAL "wait_floor_overwritten")
+                set_tests_properties(agc_driver_frame_replay_${mode} PROPERTIES ENVIRONMENT
+                        "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=0;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-${mode}-capture;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=2;APS5_FRAME_CAPTURE_MIN_FREE_BYTES=0")
             endif()
             if(WIN32)
                 set_tests_properties(agc_driver_frame_replay_${mode} PROPERTIES ENVIRONMENT_MODIFICATION

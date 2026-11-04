@@ -2459,7 +2459,7 @@ std::string flagsText(std::uint32_t flags) {
 }
 
 std::string floorsOf(const AgcDriver::FrameCall& delta) {
-    return "memory delta " + std::to_string(delta.ordinal) + " has store floor " + std::to_string(delta.storeFloor) + ", flags " + flagsText(delta.floorFlags);
+    return "memory delta " + std::to_string(delta.ordinal) + " has store floor " + std::to_string(delta.storeFloor) + ", wait floor " + std::to_string(delta.waitFloor) + ", flags " + flagsText(delta.floorFlags);
 }
 
 std::uint64_t acceptedSerial() {
@@ -2750,14 +2750,437 @@ void testStoreFloorInFlight(const std::filesystem::path&) {
     check(settled.storeFloor == busySerial && settled.floorFlags == 0, floorsOf(settled) + ", not submission " + std::to_string(busySerial) + ", whose noted write the delta read in flight left for the next delta of its page: " + header);
 }
 
+Packet awaitedLabel(std::uint32_t* words, std::byte* flag, const std::uint32_t* label) {
+    auto buffer = commands(words);
+    emitAwait(buffer, WaitKind::Wait32, flag);
+    writeDone(buffer, label);
+    return Packet{words, static_cast<std::uint32_t>(buffer.cursor_up - words), 0, {}};
+}
+
+std::string hexAddress(const volatile void* address) {
+    char text[32];
+    std::snprintf(text, sizeof text, "0x%llx", static_cast<unsigned long long>(at(address)));
+    return text;
+}
+
+void waitForLabel(std::uint32_t* label, const char* message) {
+    waitUntil([&] { return std::atomic_ref<std::uint32_t>(*label).load(std::memory_order_acquire) == Done; }, message);
+}
+
+std::vector<std::byte> wordBytes(std::uint32_t value) {
+    std::vector<std::byte> bytes(sizeof(value));
+    std::memcpy(bytes.data(), &value, sizeof(value));
+    return bytes;
+}
+
+void checkWaitFloor(const std::filesystem::path& tool, bool changedAgain) {
+    const auto layout = allocate();
+    auto* const flag = reinterpret_cast<std::uint32_t*>(layout.secondTarget);
+    const auto waiting = awaitedLabel(layout.secondCommands, layout.secondTarget, layout.label + 1);
+    auto* const next = layout.firstCommands + 64;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    check(sceAgcDriverSubmitDcb(&waiting) == 0, "the submission that waits on the title's flag failed");
+    waitUntil([&] { return awaits(flag); }, "the submission never waited on the title's flag");
+    storeTitleWord(flag, Done);
+    waitForLabel(layout.label + 1, "the submission did not pass its wait on the title's flag");
+    AgcDriverWaitIdle_nid_postfix();
+    if (changedAgain) storeTitleWord(flag, 2);
+    submitLabel(next, layout.label + 2);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    const auto capture = finishedCapture(reader);
+    const auto& header = reader.Header();
+    const auto waited = submitted(reader, layout.secondCommands).values.back();
+    const auto& delta = deltaBefore(reader, submitted(reader, next));
+    if (changedAgain) {
+        check(delta.floorFlags == AgcDriver::FrameFloorFlag::WaitValueLost && delta.waitFloor == 0, floorsOf(delta) + ", not a lost wait value: the title set the flag submission " + std::to_string(waited) + " passed on and changed it again before the recorder read it: " + header);
+        check(header.find("restores the dword at " + hexAddress(flag) + " after submission " + std::to_string(waited) + " passed a wait on it") != std::string::npos, "no capture warning names the flag whose value submission " + std::to_string(waited) + " passed on was lost: " + header);
+        return;
+    }
+    check(delta.floorFlags == 0 && delta.waitFloor == 0, floorsOf(delta) + ", although it supplies the flag value submission " + std::to_string(waited) + " passed on and still holds: " + header);
+    check(replayed(tool, capture, flag, sizeof(*flag), " --no-release --no-synthesize") == wordBytes(Done), "the replay did not restore the flag the waiting submission passed on");
+}
+
+void testWaitFloor(const std::filesystem::path& tool) {
+    checkWaitFloor(tool, true);
+}
+
+void testWaitFloorOnce(const std::filesystem::path& tool) {
+    checkWaitFloor(tool, false);
+}
+
+void testWaitFloorLater(const std::filesystem::path& tool) {
+    const auto layout = allocate();
+    auto* const flag = reinterpret_cast<std::uint32_t*>(layout.secondTarget);
+    const auto waiting = awaitedLabel(layout.secondCommands, layout.secondTarget, layout.label + 1);
+    auto* const supplying = layout.firstCommands + 64;
+    auto* const changing = layout.firstCommands + 128;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    check(sceAgcDriverSubmitDcb(&waiting) == 0, "the submission that waits on the title's flag failed");
+    waitUntil([&] { return awaits(flag); }, "the submission never waited on the title's flag");
+    storeTitleWord(flag, Done);
+    submitLabel(supplying, layout.label + 2);
+    waitForLabel(layout.label + 1, "the submission did not pass its wait on the title's flag");
+    AgcDriverWaitIdle_nid_postfix();
+    storeTitleWord(flag, 2);
+    submitLabel(changing, layout.label + 3);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    const auto capture = finishedCapture(reader);
+    const auto& header = reader.Header();
+    const auto waited = submitted(reader, layout.secondCommands).values.back();
+    const auto& supplied = deltaBefore(reader, submitted(reader, supplying));
+    const auto& changed = deltaBefore(reader, submitted(reader, changing));
+    check(supplied.floorFlags == 0 && supplied.waitFloor == 0, floorsOf(supplied) + ", although it only supplies the flag value submission " + std::to_string(waited) + " passed on: " + header);
+    check(changed.waitFloor == waited && changed.floorFlags == 0, floorsOf(changed) + ", not submission " + std::to_string(waited) + ", whose wait passed on the value an earlier delta supplied and this one replaces: " + header);
+    check(replayed(tool, capture, flag, sizeof(*flag), " --no-synthesize") == wordBytes(2), "the replay did not restore the title's later flag value");
+}
+
+void testWaitFloorLabel(const std::filesystem::path&) {
+    const auto layout = allocate();
+    auto* const flag = reinterpret_cast<std::uint32_t*>(layout.secondTarget);
+    auto labelled = commands(layout.secondCommands);
+    writeDone(labelled, flag);
+    emitAwait(labelled, WaitKind::Wait32, layout.secondTarget);
+    writeDone(labelled, layout.label + 1);
+    const Packet storing{layout.secondCommands, static_cast<std::uint32_t>(labelled.cursor_up - layout.secondCommands), 0, {}};
+    auto* const next = layout.firstCommands + 64;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    check(sceAgcDriverSubmitDcb(&storing) == 0, "the submission that stores its own flag and waits on it failed");
+    waitForLabel(layout.label + 1, "the submission did not pass its wait on its own flag");
+    AgcDriverWaitIdle_nid_postfix();
+    storeTitleWord(flag, 0);
+    submitLabel(next, layout.label + 2);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto stored = submitted(reader, layout.secondCommands).values.back();
+    const auto& delta = deltaBefore(reader, submitted(reader, next));
+    check(delta.waitFloor == stored && delta.storeFloor == stored && delta.floorFlags == 0, floorsOf(delta) + ", not submission " + std::to_string(stored) + " for both floors: it stored the flag, passed its wait on that noted value, and the delta clears the flag: " + reader.Header());
+}
+
+void testWaitFloorOverwritten(const std::filesystem::path&) {
+    const auto layout = allocate();
+    auto* const flag = reinterpret_cast<std::uint32_t*>(layout.secondTarget);
+    const auto earlier = awaitedLabel(layout.secondCommands, layout.secondTarget, layout.label + 1);
+    auto clearing = commands(layout.secondCommands + 64);
+    const std::uint32_t cleared = 0;
+    sceAgcDcbWriteData(&clearing, GraphicsMemory, 0, at(flag), &cleared, 1, 0, 1);
+    writeDone(clearing, layout.label + 2);
+    const Packet clear{layout.secondCommands + 64, static_cast<std::uint32_t>(clearing.cursor_up - (layout.secondCommands + 64)), 0, {}};
+    const auto later = awaitedLabel(layout.secondCommands + 128, layout.secondTarget, layout.label + 3);
+    auto* const supplying = layout.firstCommands + 64;
+    auto* const changing = layout.firstCommands + 128;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    check(sceAgcDriverSubmitDcb(&earlier) == 0, "the first submission that waits on the title's flag failed");
+    waitUntil([&] { return awaits(flag); }, "the first submission never waited on the title's flag");
+    storeTitleWord(flag, Done);
+    waitForLabel(layout.label + 1, "the first submission did not pass its wait on the title's flag");
+    submitLabel(supplying, layout.label + 4);
+    check(sceAgcDriverSubmitDcb(&clear) == 0, "the submission that clears the flag failed");
+    waitForLabel(layout.label + 2, "the submission that clears the flag did not run");
+    AgcDriverWaitIdle_nid_postfix();
+    check(sceAgcDriverSubmitDcb(&later) == 0, "the second submission that waits on the title's flag failed");
+    waitUntil([&] { return awaits(flag); }, "the second submission never waited on the cleared flag");
+    storeTitleWord(flag, Done);
+    waitForLabel(layout.label + 3, "the second submission did not pass its wait on the title's flag");
+    AgcDriverWaitIdle_nid_postfix();
+    storeTitleWord(flag, 2);
+    submitLabel(changing, layout.label + 5);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto& header = reader.Header();
+    const auto lost = submitted(reader, layout.secondCommands + 128).values.back();
+    const auto& delta = deltaBefore(reader, submitted(reader, changing));
+    check(delta.floorFlags == AgcDriver::FrameFloorFlag::WaitValueLost && delta.waitFloor == 0, floorsOf(delta) + ", not a lost wait value: submission " + std::to_string(lost) + " passed on a title value set after a driver store cleared the flag that an earlier delta held: " + header);
+    check(header.find("restores the dword at " + hexAddress(flag) + " after submission " + std::to_string(lost) + " passed a wait on it") != std::string::npos, "no capture warning names submission " + std::to_string(lost) + ", whose wait value was lost: " + header);
+}
+
+void testWaitFloorOrder(const std::filesystem::path&) {
+    const auto layout = allocate();
+    auto* const flag = reinterpret_cast<std::uint32_t*>(layout.secondTarget);
+    auto* const fence = reinterpret_cast<std::uint32_t*>(layout.secondTarget + 64);
+    const auto labelling = labelPacket(layout.secondCommands, fence);
+    auto both = commands(layout.secondCommands + 64);
+    emitAwait(both, WaitKind::Wait32, layout.secondTarget);
+    emitAwait(both, WaitKind::Wait32, layout.secondTarget + 64);
+    writeDone(both, layout.label + 1);
+    const Packet waiting{layout.secondCommands + 64, static_cast<std::uint32_t>(both.cursor_up - (layout.secondCommands + 64)), 0, {}};
+    auto* const next = layout.firstCommands + 64;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    check(sceAgcDriverSubmitDcb(&labelling) == 0, "the submission that stores the fence failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(sceAgcDriverSubmitDcb(&waiting) == 0, "the submission that waits on the flag and the fence failed");
+    waitUntil([&] { return awaits(flag); }, "the submission never waited on the title's flag");
+    storeTitleWord(flag, Done);
+    waitForLabel(layout.label + 1, "the submission did not pass its waits");
+    storeTitleWord(fence, 0);
+    submitLabel(next, layout.label + 2);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto waited = submitted(reader, layout.secondCommands + 64).values.back();
+    const auto& delta = deltaBefore(reader, submitted(reader, next));
+    check(delta.floorFlags == AgcDriver::FrameFloorFlag::WaitOrderLost && delta.waitFloor == 0, floorsOf(delta) + ", not a lost order: it supplies the flag submission " + std::to_string(waited) + " waited for and clears the fence that submission passed on, so it must also follow it: " + reader.Header());
+}
+
+void testWaitFloorOrderQueues(const std::filesystem::path&) {
+    constexpr std::uint32_t ComputeQueue = 0x20;
+    constexpr std::size_t CopyBytes = 128u * 1024u;
+    const auto layout = allocate();
+    const auto big = allocate(2 * BlockBytes);
+    auto* const target = big.base + BlockBytes;
+    for (std::size_t index = 0; index < CopyBytes; ++index) big.base[index] = static_cast<std::byte>((index * 11 + 5) & 0xff);
+    std::memset(target, 0, CopyBytes);
+    auto* const flag = reinterpret_cast<std::uint32_t*>(layout.secondTarget);
+    auto* const released = reinterpret_cast<std::uint32_t*>(layout.firstTarget);
+    auto* const computeWords = layout.firstCommands + 1024;
+    auto compute = commands(computeWords);
+    sceAgcAcbWaitRegMem(&compute, 0, 3, 0, released, Done, 0xffffffffu, 0);
+    sceAgcAcbDmaData(&compute, DmaMemory, 0, at(target), DmaMemory, 0, at(big.base), CopyBytes, 0, 1);
+    sceAgcAcbWriteData(&compute, ComputeMemory, 0, at(layout.label + 2), &Done, 1, 0, 1);
+    const Packet copying{computeWords, static_cast<std::uint32_t>(compute.cursor_up - computeWords), 0, {}};
+    auto graphics = commands(layout.secondCommands);
+    emitAwait(graphics, WaitKind::Wait32, layout.secondTarget);
+    writeDone(graphics, released);
+    writeDone(graphics, layout.label + 1);
+    const Packet releasing{layout.secondCommands, static_cast<std::uint32_t>(graphics.cursor_up - layout.secondCommands), 0, {}};
+    auto* const next = layout.firstCommands + 64;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    check(sceAgcDriverSubmitAcb(ComputeQueue, &copying) == 0, "the compute submission that copies behind the label failed");
+    waitUntil([&] { return awaits(released); }, "the compute submission never waited on the label");
+    check(sceAgcDriverSubmitDcb(&releasing) == 0, "the graphics submission that waits on the title's flag failed");
+    waitUntil([&] { return awaits(flag); }, "the graphics submission never waited on the title's flag");
+    storeTitleWord(flag, Done);
+    waitForLabel(layout.label + 1, "the graphics submission did not pass its wait on the title's flag");
+    waitForLabel(layout.label + 2, "the compute submission did not copy after the label");
+    AgcDriverWaitIdle_nid_postfix();
+    storeTitleWord(target + 0x40, 0x12345678u);
+    submitLabel(next, layout.label + 3);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto copied = submitted(reader, computeWords).values.back();
+    const auto waited = submitted(reader, layout.secondCommands).values.back();
+    check(copied < waited, "the compute submission did not take the earlier serial: " + reader.Header());
+    const auto& delta = deltaBefore(reader, submitted(reader, next));
+    check(delta.floorFlags == AgcDriver::FrameFloorFlag::WaitOrderLost && delta.storeFloor == copied && delta.waitFloor == 0, floorsOf(delta) + ", not store floor " + std::to_string(copied) + " with a lost order: the delta supplies the flag submission " + std::to_string(waited) + " waited for, and the copy of submission " + std::to_string(copied) + " that it restores over ran after that wait passed: " + reader.Header());
+}
+
+void testWaitFloorSemaphore(const std::filesystem::path&) {
+    const auto layout = allocate();
+    auto* const counter = reinterpret_cast<std::uint64_t*>(layout.label + 8);
+    auto first = commands(layout.secondCommands);
+    emitAwait(first, WaitKind::Semaphore, reinterpret_cast<std::byte*>(counter));
+    writeDone(first, layout.label + 1);
+    const Packet taking{layout.secondCommands, static_cast<std::uint32_t>(first.cursor_up - layout.secondCommands), 0, {}};
+    auto second = commands(layout.secondCommands + 64);
+    emitAwait(second, WaitKind::Semaphore, reinterpret_cast<std::byte*>(counter));
+    writeDone(second, layout.label + 2);
+    const Packet retaking{layout.secondCommands + 64, static_cast<std::uint32_t>(second.cursor_up - (layout.secondCommands + 64)), 0, {}};
+    auto* const next = layout.firstCommands + 64;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    const auto count = [&](std::uint64_t value) { std::atomic_ref<std::uint64_t>(*counter).store(value, std::memory_order_release); };
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    count(1);
+    check(sceAgcDriverSubmitDcb(&taking) == 0, "the first submission that takes the semaphore failed");
+    waitForLabel(layout.label + 1, "the first submission did not take the semaphore");
+    check(sceAgcDriverSubmitDcb(&retaking) == 0, "the second submission that takes the semaphore failed");
+    count(1);
+    waitForLabel(layout.label + 2, "the second submission did not take the semaphore the title signalled");
+    AgcDriverWaitIdle_nid_postfix();
+    count(5);
+    submitLabel(next, layout.label + 3);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto& header = reader.Header();
+    const auto retook = submitted(reader, layout.secondCommands + 64).values.back();
+    const auto& delta = deltaBefore(reader, submitted(reader, next));
+    check(delta.floorFlags == AgcDriver::FrameFloorFlag::WaitValueLost && delta.waitFloor == 0, floorsOf(delta) + ", not a lost wait value: submission " + std::to_string(retook) + " took a semaphore count the title signalled after the count the replay holds was taken: " + header);
+    check(header.find("restores the dword at " + hexAddress(counter) + " after submission " + std::to_string(retook) + " passed a wait on it") != std::string::npos, "no capture warning names submission " + std::to_string(retook) + ", whose semaphore count was lost: " + header);
+}
+
+void testWaitFloorParked(const std::filesystem::path&) {
+    const auto layout = allocate();
+    auto* const held = reinterpret_cast<std::uint32_t*>(layout.secondTarget);
+    auto* const parked = reinterpret_cast<std::uint32_t*>(layout.secondTarget + 64);
+    auto both = commands(layout.secondCommands);
+    emitAwait(both, WaitKind::Wait32, layout.secondTarget);
+    emitAwait(both, WaitKind::Wait32, layout.secondTarget + 64);
+    writeDone(both, layout.label + 1);
+    const Packet waiting{layout.secondCommands, static_cast<std::uint32_t>(both.cursor_up - layout.secondCommands), 0, {}};
+    auto* const supplying = layout.firstCommands + 64;
+    auto* const changing = layout.firstCommands + 128;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    storeTitleWord(held, Done);
+    submitLabel(supplying, layout.label + 2);
+    AgcDriverWaitIdle_nid_postfix();
+    check(sceAgcDriverSubmitDcb(&waiting) == 0, "the submission that waits on both flags failed");
+    waitUntil([&] { return awaits(parked); }, "the submission never parked on its second flag");
+    storeTitleWord(held, 2);
+    submitLabel(changing, layout.label + 3);
+    storeTitleWord(parked, Done);
+    AgcDriverWaitIdle_nid_postfix();
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto waited = submitted(reader, layout.secondCommands).values.back();
+    const auto& delta = deltaBefore(reader, submitted(reader, changing));
+    if (delta.completed >= waited) throw Inconclusive("the submission parked on its second flag completed before the delta was read");
+    check(delta.floorFlags == AgcDriver::FrameFloorFlag::IncompleteSerialWait && delta.waitFloor == 0, floorsOf(delta) + ", not an unknown wait floor for submission " + std::to_string(waited) + ", which passed its first wait but had not completed when the delta was read (completed " + std::to_string(delta.completed) + "): " + reader.Header());
+}
+
+void checkWaitFloorTail(WaitKind kind, bool lost) {
+    const auto layout = allocate();
+    auto* const flag = kind == WaitKind::Semaphore ? reinterpret_cast<std::byte*>(layout.label + 8) : layout.secondTarget;
+    auto* const next = layout.firstCommands + 64;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    std::uint32_t* word = nullptr;
+    auto* const control = submitRewound(layout.secondCommands, [](CommandBuffer&) {}, [&](CommandBuffer& buffer) {
+        word = emitAwait(buffer, kind, flag);
+        writeDone(buffer, layout.label + 1);
+    });
+    waitUntil([&] { return awaits(control); }, "the submission did not park at its unreleased REWIND");
+    passAwait(kind, word);
+    release(control);
+    waitForLabel(layout.label + 1, "the REWIND tail did not pass its wait on the value the title stored before it released the tail");
+    AgcDriverWaitIdle_nid_postfix();
+    if (lost && kind != WaitKind::Semaphore) storeTitleWord(word, 2);
+    submitLabel(next, layout.label + 2);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto& header = reader.Header();
+    const auto waited = submitted(reader, layout.secondCommands).values.back();
+    const auto& delta = deltaBefore(reader, submitted(reader, next));
+    if (!lost) {
+        check(delta.floorFlags == 0 && delta.waitFloor == 0, floorsOf(delta) + ", although it supplies the release and the flag value the REWIND tail of submission " + std::to_string(waited) + " passed on: " + header);
+        return;
+    }
+    check((delta.floorFlags & AgcDriver::FrameFloorFlag::WaitValueLost) != 0 && delta.waitFloor == 0, floorsOf(delta) + ", not a lost wait value: the REWIND tail of submission " + std::to_string(waited) + " passed its wait on a value the title stored after the delta before it, which no delta holds: " + header);
+    check(header.find("restores the dword at " + hexAddress(word) + " after submission " + std::to_string(waited) + " passed a wait on it") != std::string::npos, "no capture warning names submission " + std::to_string(waited) + ", whose REWIND tail passed its wait on a lost value: " + header);
+}
+
+void testWaitFloorTail(const std::filesystem::path&) {
+    checkWaitFloorTail(WaitKind::Wait32, true);
+}
+
+void testWaitFloorTailOnce(const std::filesystem::path&) {
+    checkWaitFloorTail(WaitKind::Wait32, false);
+}
+
+void testWaitFloorTailSemaphore(const std::filesystem::path&) {
+    checkWaitFloorTail(WaitKind::Semaphore, true);
+}
+
 }
 
 int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
-        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"flip_serial_start", testFlipSerialAtStart}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"host_page_restored", testHostPageRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}, {"wait64_after_read", testWait64AfterRead}, {"semaphore_after_read", testSemaphoreAfterRead}, {"rewind_after_read", testRewindAfterRead}, {"late_wait", testWaitAfterLastFrame}, {"wait_labelled_after", testWaitLabelledAfter}, {"wait_labelled_before", testWaitLabelledBefore}, {"wait_labelled_skipped", testWaitLabelledSkipped}, {"wait_labelled_elsewhere", testWaitLabelledElsewhere}, {"carried_label", testCarriedLabelKeepsSerial}, {"exit_times", testExitTimes}, {"store_floor", testStoreFloor}, {"store_floor_unknown", testStoreFloorUnknown}, {"store_floor_noted", testStoreFloorNoted}, {"store_floor_note", testStoreFloorNote}, {"store_floor_parked", testStoreFloorParked}, {"store_floor_in_flight", testStoreFloorInFlight}};
+        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"flip_serial_start", testFlipSerialAtStart}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"host_page_restored", testHostPageRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}, {"wait64_after_read", testWait64AfterRead}, {"semaphore_after_read", testSemaphoreAfterRead}, {"rewind_after_read", testRewindAfterRead}, {"late_wait", testWaitAfterLastFrame}, {"wait_labelled_after", testWaitLabelledAfter}, {"wait_labelled_before", testWaitLabelledBefore}, {"wait_labelled_skipped", testWaitLabelledSkipped}, {"wait_labelled_elsewhere", testWaitLabelledElsewhere}, {"carried_label", testCarriedLabelKeepsSerial}, {"exit_times", testExitTimes}, {"store_floor", testStoreFloor}, {"store_floor_unknown", testStoreFloorUnknown}, {"store_floor_noted", testStoreFloorNoted}, {"store_floor_note", testStoreFloorNote}, {"store_floor_parked", testStoreFloorParked}, {"store_floor_in_flight", testStoreFloorInFlight}, {"wait_floor", testWaitFloor}, {"wait_floor_once", testWaitFloorOnce}, {"wait_floor_later", testWaitFloorLater}, {"wait_floor_label", testWaitFloorLabel}, {"wait_floor_overwritten", testWaitFloorOverwritten}, {"wait_floor_order", testWaitFloorOrder}, {"wait_floor_order_queues", testWaitFloorOrderQueues}, {"wait_floor_semaphore", testWaitFloorSemaphore}, {"wait_floor_parked", testWaitFloorParked}, {"wait_floor_tail", testWaitFloorTail}, {"wait_floor_tail_once", testWaitFloorTailOnce}, {"wait_floor_tail_semaphore", testWaitFloorTailSemaphore}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "flip_hashes" || mode == "flip_hashes_lists" || mode == "flip_hashes_cpu" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|flip_hashes|flip_hashes_lists|flip_hashes_cpu|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|flip_serial_start|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|host_page_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read|late_wait|wait_labelled_after|wait_labelled_before|wait_labelled_skipped|wait_labelled_elsewhere|carried_label|exit_times|store_floor|store_floor_unknown|store_floor_noted|store_floor_note|store_floor_parked|store_floor_in_flight]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|flip_hashes|flip_hashes_lists|flip_hashes_cpu|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|flip_serial_start|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|host_page_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read|late_wait|wait_labelled_after|wait_labelled_before|wait_labelled_skipped|wait_labelled_elsewhere|carried_label|exit_times|store_floor|store_floor_unknown|store_floor_noted|store_floor_note|store_floor_parked|store_floor_in_flight|wait_floor|wait_floor_once|wait_floor_later|wait_floor_label|wait_floor_overwritten|wait_floor_order|wait_floor_order_queues|wait_floor_semaphore|wait_floor_parked|wait_floor_tail|wait_floor_tail_once|wait_floor_tail_semaphore]\n");
         return 2;
     }
     int status = 0;
