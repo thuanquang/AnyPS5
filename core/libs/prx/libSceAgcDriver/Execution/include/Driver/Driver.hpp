@@ -93,6 +93,7 @@ public:
     bool WaitSettledFor(std::chrono::milliseconds timeout);
     void ReleaseSettled();
     bool Settled();
+    bool WaitRecordedOnGpuFor(std::chrono::milliseconds timeout);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void AttachWindow(const PresentationWindow& window);

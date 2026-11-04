@@ -16,12 +16,14 @@
 #include "ShaderDiskCache.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cerrno>
 #include <exception>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 #ifdef _WIN32
@@ -329,6 +331,24 @@ void Driver::ReleaseSettled() {
         captureHold.store(false, std::memory_order_relaxed);
     }
     changed.notify_all();
+}
+
+bool Driver::WaitRecordedOnGpuFor(std::chrono::milliseconds timeout) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto localDevice = device.Load();
+    if (localDevice == nullptr) return true;
+    std::uint64_t epoch = 0;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        localDevice->SubmitRecorded(false);
+        epoch = localDevice->SubmittedEpoch();
+    }
+    if (epoch == 0) return true;
+    if (!localDevice->CanWaitUnlocked()) throw std::runtime_error("waiting for GPU batch " + std::to_string(epoch) + " of the recorded work needs timeline semaphores");
+    const auto remaining = (std::max)(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
+    return localDevice->WaitRecordedFor(epoch, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count()));
 }
 
 std::vector<AwaitedWait> Driver::AwaitedWaits() {
