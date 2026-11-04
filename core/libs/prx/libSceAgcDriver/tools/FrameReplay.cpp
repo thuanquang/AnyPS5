@@ -52,6 +52,7 @@ namespace {
 using AgcDriver::FrameCall;
 using AgcDriver::FrameCallKind;
 using AgcDriver::FrameCaptureReader;
+using AgcDriver::FrameFloorFlag;
 using AgcDriver::FrameMemoryChunk;
 using AgcDriver::FrameMemoryKind;
 using AgcDriver::FrameRangeAccess;
@@ -93,6 +94,7 @@ struct Options {
     std::filesystem::path depthFile;
     std::optional<DepthProfile> depth;
     std::optional<std::uint64_t> depthCap, depthProbe;
+    std::vector<std::string> depthHold;
 };
 
 std::uint64_t contentHash(const std::byte* bytes, std::size_t size);
@@ -385,6 +387,7 @@ DepthProfile readDepthProfile(const std::filesystem::path& path) {
 struct DepthPlan {
     std::vector<std::uint32_t> position, frame;
     std::vector<std::size_t> next;
+    std::vector<std::uint64_t> ceiling;
     std::size_t frames = 0;
     static constexpr std::uint32_t NoPosition = ~0u;
     static constexpr std::size_t Tail = ~std::size_t{0};
@@ -435,12 +438,47 @@ DepthPlan planDepth(std::span<const FrameCall> calls, const DepthProfile& profil
     return plan;
 }
 
+enum class DepthCause : std::uint8_t { Forced, Tail, Parked, StoreUnknown, WaitIncomplete, WaitLost, WaitOrder, Releases, Pending, Ahead };
+
+enum class Restore { Held, AtDepth };
+
+constexpr std::size_t HeldCauses = static_cast<std::size_t>(DepthCause::Ahead);
+constexpr std::array<std::string_view, HeldCauses> HeldNames{"forced", "tail", "parked", "store_unknown", "wait_incomplete", "wait_lost", "wait_order", "releases", "pending"};
+constexpr std::array<std::string_view, HeldCauses> HeldReasons{"held by --depth-hold", "the last delta", "read parked by the capture", "unknown store floor", "wait after an unfinished submission", "wait value lost", "wait order lost", "releases a wait", "GPU results pending"};
+
 struct PositionCensus {
-    std::vector<std::uint64_t> issue;
+    std::vector<std::uint64_t> issue, restore, ceiling;
+    std::uint64_t byDepth = 0, byStore = 0, byWait = 0, cpuWaits = 0, gpuWaits = 0;
+    std::array<std::uint64_t, HeldCauses> held{};
 };
+
+struct MemoryFloors {
+    std::optional<std::uint64_t> store, wait;
+    std::uint32_t flags = 0;
+};
+
+MemoryFloors memoryFloors(const FrameCall& call) {
+    MemoryFloors floors;
+    floors.flags = call.floorFlags;
+    if ((call.floorFlags & FrameFloorFlag::StoreUnknown) == 0) floors.store = call.storeFloor;
+    if ((call.floorFlags & FrameFloorFlag::WaitUnknown) == 0) floors.wait = call.waitFloor;
+    return floors;
+}
 
 void requireDepthOptions(const Options& options) {
     if (options.release) throw std::runtime_error("frame replay: --depth-profile needs --no-release: a replay at depth never writes recorded or synthesized values to release a wait");
+}
+
+void requireDepthCapture(const FrameCaptureReader& reader, const Options& options) {
+    if (reader.Version() < AgcDriver::ReleasesCallsVersion) throw std::runtime_error("frame replay: --depth-profile needs a capture whose memory deltas carry store and wait floors and mark the waits they release (calls format " + std::to_string(AgcDriver::ReleasesCallsVersion) + " or later), and this one has calls format " + std::to_string(reader.Version()));
+    if (!options.synthesize) {
+        const auto lost = std::count_if(reader.Calls().begin(), reader.Calls().end(), [](const FrameCall& call) { return call.kind == FrameCallKind::Memory && (call.floorFlags & FrameFloorFlag::WaitValueLost) != 0; });
+        if (lost != 0) throw std::runtime_error("frame replay: " + std::to_string(lost) + " memory deltas restore dwords that submissions passed waits on with values no delta or noted driver store holds (floor flags " + addressText(FrameFloorFlag::WaitValueLost) + "); only a synthesized release replays such a wait, and --no-synthesize forbids it");
+    }
+    const auto& names = options.depth->names;
+    for (const auto& position : options.depthHold) {
+        if (std::find(names.begin(), names.end(), position) == names.end()) throw std::runtime_error("frame replay: --depth-hold names " + position + ", which " + options.depth->path.string() + " does not list");
+    }
 }
 
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
@@ -694,6 +732,9 @@ struct Replay {
     std::span<const FrameCall> window;
     std::size_t current = 0;
     std::vector<PositionCensus> census;
+    std::uint64_t tailHeld = 0;
+    std::atomic<std::uint64_t> fastDeltas{0};
+    std::atomic<std::int64_t> gateWaitedNs{0};
 
     struct SettledHold {
         bool held;
@@ -885,15 +926,16 @@ struct Replay {
                 waitStarted(call);
                 memoryWaited(inFlightWaitedNs, began);
                 waitSerialsOnGpu(call);
-                restoreGroup(call.values.at(0));
+                restoreGroup(call, Restore::Held);
                 return;
             }
+            if (pacing && plan) return restoreAtDepth(call, began);
             const bool settled = !pacing || AgcDriverHoldSettled_nid_postfix(stalled.load() && progress().second == stalledAt.load() ? 0 : options.busyTimeout.count());
             const SettledHold hold{pacing};
             memoryWaited(heldWaitedNs, began);
-            if (!settled && (options.strict || plan)) throw std::runtime_error(plan ? "frame replay: memory delta at call " + std::to_string(call.ordinal) + " is restored with nothing running or every busy queue parked on title memory, but the replay did not settle within " + std::to_string(options.busyTimeout.count()) + " ms" : "frame replay: the replay did not settle before memory delta " + std::to_string(call.ordinal));
+            if (!settled && options.strict) throw std::runtime_error("frame replay: the replay did not settle before memory delta " + std::to_string(call.ordinal));
             if (pacing && settled) waitSettledOnGpu(call);
-            restoreGroup(call.values.at(0));
+            restoreGroup(call, Restore::Held);
             return;
         }
         case FrameCallKind::FrameStart:
@@ -998,9 +1040,108 @@ struct Replay {
         gpuWaitedThrough = std::max(gpuWaitedThrough, through);
     }
 
-    void restoreGroup(std::uint64_t group) {
-        const auto found = groups.find(group);
-        if (found == groups.end()) return;
+    bool heldPosition(std::uint32_t position) const {
+        const auto& name = options.depth->names[position];
+        return std::find(options.depthHold.begin(), options.depthHold.end(), name) != options.depthHold.end();
+    }
+
+    DepthCause depthCause(const FrameCall& call, std::size_t index) const {
+        const auto next = plan->next[index];
+        if (next != DepthPlan::Tail && heldPosition(plan->position[next])) return DepthCause::Forced;
+        if (next == DepthPlan::Tail) return DepthCause::Tail;
+        if (call.completed != call.accepted) return DepthCause::Parked;
+        const auto floors = memoryFloors(call);
+        if (!floors.store) return DepthCause::StoreUnknown;
+        if ((floors.flags & FrameFloorFlag::IncompleteSerialWait) != 0) return DepthCause::WaitIncomplete;
+        if ((floors.flags & FrameFloorFlag::WaitValueLost) != 0) return DepthCause::WaitLost;
+        if ((floors.flags & FrameFloorFlag::WaitOrderLost) != 0) return DepthCause::WaitOrder;
+        if ((floors.flags & FrameFloorFlag::ReleasesWait) != 0) return DepthCause::Releases;
+        return DepthCause::Ahead;
+    }
+
+    std::uint64_t floorDistance(const FrameCall& call, std::size_t index) const {
+        if (reader.Version() >= AgcDriver::InFlightCallsVersion && (call.flags & AgcDriver::InFlightDeltaFlag) != 0) {
+            auto newest = call.completed;
+            for (std::size_t value = 1; value < call.values.size(); ++value) newest = std::max(newest, call.values[value]);
+            return call.accepted > newest ? call.accepted - newest : 0;
+        }
+        if (depthCause(call, index) != DepthCause::Ahead) return 0;
+        const auto floors = memoryFloors(call);
+        const auto floor = std::max(floors.store.value_or(0), floors.wait.value_or(0));
+        return call.accepted > floor ? call.accepted - floor : 0;
+    }
+
+    std::uint64_t replayTarget(const FrameCall& call, std::uint64_t serial) const {
+        if (serial <= *captureBase) return replayBase;
+        const auto found = replaySerials.find(serial);
+        if (found == replaySerials.end() || !found->second) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for capture serial " + std::to_string(serial) + ", which no call since the frame start took");
+        return *found->second;
+    }
+
+    bool waitThroughOnGpu(const FrameCall& call, std::uint64_t through) {
+        if (through <= gpuWaitedThrough) return false;
+        const auto began = Clock::now();
+        AgcDriver::GpuSerialsWait outcome;
+        const bool ran = AgcDriverWaitSerialsOnGpuFor_nid_postfix(through, nullptr, 0, options.busyTimeout.count(), &outcome);
+        memoryGpuWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+        if (!ran) throw std::runtime_error("frame replay: the GPU work of the submissions memory delta " + std::to_string(call.ordinal) + " waits for did not finish within " + std::to_string(options.busyTimeout.count()) + " ms");
+        memoryGpuWaits += outcome.waited ? 1 : 0;
+        memoryGpuSubmits += outcome.submitted ? 1 : 0;
+        gpuWaitedThrough = through;
+        return outcome.waited;
+    }
+
+    void restoreHeld(const FrameCall& call, DepthCause cause) {
+        const auto began = Clock::now();
+        const bool settled = AgcDriverHoldSettled_nid_postfix(options.busyTimeout.count());
+        const SettledHold hold{true};
+        memoryWaited(heldWaitedNs, began);
+        if (!settled) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " (" + std::string(HeldReasons[static_cast<std::size_t>(cause)]) + ") is restored with nothing running or every busy queue parked on title memory, but the replay did not settle within " + std::to_string(options.busyTimeout.count()) + " ms");
+        waitSettledOnGpu(call);
+        restoreGroup(call, Restore::Held);
+        const auto next = plan->next[current];
+        if (next == DepthPlan::Tail) ++tailHeld;
+        else ++census[plan->position[next]].held[static_cast<std::size_t>(cause)];
+    }
+
+    void restoreAtDepth(const FrameCall& call, Clock::time_point began) {
+        const auto index = current;
+        if (const auto cause = depthCause(call, index); cause != DepthCause::Ahead) return restoreHeld(call, cause);
+        const auto next = plan->next[index];
+        const auto position = plan->position[next];
+        const auto bound = boundOf(next);
+        const auto floors = memoryFloors(call);
+        const auto store = floors.store.value_or(0);
+        const auto wait = floors.wait.value_or(0);
+        const auto& paced = window[next];
+        enum class Term { Depth, Store, Wait } by = Term::Depth;
+        auto serial = paced.accepted > bound ? paced.accepted - bound : 0;
+        if (store > serial) {
+            serial = store;
+            by = Term::Store;
+        }
+        if (wait > serial) {
+            serial = wait;
+            by = Term::Wait;
+        }
+        const auto target = replayTarget(call, serial);
+        auto& entry = census[position];
+        if (!AgcDriverSerialDone_nid_postfix(target) || progress().second < target) ++entry.cpuWaits;
+        awaitCompleted(target, began + options.busyTimeout, [&](const std::string& reason) {
+            return std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for capture serial " + std::to_string(serial) + " (replay serial " + std::to_string(target) + "; store floor " + std::to_string(store) + ", wait floor " + std::to_string(wait) + ", bound " + std::to_string(bound) + " at position " + options.depth->names[position] + "), but " + reason);
+        });
+        if (waitThroughOnGpu(call, target)) ++entry.gpuWaits;
+        memoryWaited(gateWaitedNs, began);
+        const auto [accepted, completed] = progress();
+        if (!restoreGroup(call, Restore::AtDepth)) return restoreHeld(call, DepthCause::Pending);
+        ++fastDeltas;
+        ++(by == Term::Depth ? entry.byDepth : by == Term::Store ? entry.byStore : entry.byWait);
+        if (plan->frame[next] >= 2) entry.restore.push_back(accepted - completed);
+    }
+
+    bool restoreGroup(const FrameCall& call, Restore mode) {
+        const auto found = groups.find(call.values.at(0));
+        if (found == groups.end()) return true;
         const auto began = Clock::now();
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
@@ -1022,9 +1163,16 @@ struct Replay {
                 end += chunks[last]->bytes;
                 ++last;
             }
-            AgcDriverPrepareGuestStore_nid_postfix(chunks[first]->address, static_cast<std::size_t>(end - chunks[first]->address));
+            if (mode == Restore::Held) AgcDriverPrepareGuestStore_nid_postfix(chunks[first]->address, static_cast<std::size_t>(end - chunks[first]->address));
             runs.emplace_back(first, last);
             first = last;
+        }
+        if (mode == Restore::AtDepth) {
+            for (const auto& [first, last] : runs) {
+                const auto begin = chunks[first]->address;
+                const auto end = chunks[last - 1]->address + chunks[last - 1]->bytes;
+                if (!AgcDriverGuestStoreSettled_nid_postfix(begin, static_cast<std::size_t>(end - begin))) return false;
+            }
         }
         for (const auto& [first, last] : runs) {
             for (auto index = first; index < last; ++index) {
@@ -1048,6 +1196,7 @@ struct Replay {
         }
         for (const auto& [control, value] : controls) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
         restoredNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+        return true;
     }
 
     bool releaseRewind(const FrameCall& call, const AgcDriver::AwaitedWait& wait) {
@@ -1062,7 +1211,7 @@ struct Replay {
             if ((value & AgcDriver::Pm4::RewindValid) == 0 || !AgcDriverHoldSettled_nid_postfix(0)) return false;
             const SettledHold hold{true};
             waitSettledOnGpu(call);
-            restoreGroup(call.values.at(0));
+            restoreGroup(call, Restore::Held);
             return true;
         }
         return false;
@@ -1158,6 +1307,14 @@ struct Replay {
         if (options.depth && recording) {
             if (!captureBase) throw std::runtime_error(std::string(DepthWithoutFrameStart));
             plan = planDepth(calls, *options.depth);
+            plan->ceiling.assign(calls.size(), 0);
+            for (std::size_t index = 0; index < calls.size(); ++index) {
+                if (plan->position[index] != DepthPlan::NoPosition) plan->ceiling[index] = boundOf(index);
+            }
+            for (std::size_t index = 0; index < calls.size(); ++index) {
+                const auto next = plan->next[index];
+                if (calls[index].kind == FrameCallKind::Memory && next != DepthPlan::Tail) plan->ceiling[next] = std::min(plan->ceiling[next], floorDistance(calls[index], index));
+            }
         }
         std::map<std::uint64_t, std::vector<std::size_t>> byThread;
         for (std::size_t index = 0; index < calls.size(); ++index) byThread[calls[index].thread].push_back(index);
@@ -1190,8 +1347,14 @@ struct Replay {
             depthTotal.store(0);
             depthMax.store(0);
             census.clear();
+            tailHeld = 0;
         }
-        if (plan) census.resize(options.depth->names.size());
+        if (plan) {
+            census.resize(options.depth->names.size());
+            for (std::size_t index = 0; index < calls.size(); ++index) {
+                if (plan->position[index] != DepthPlan::NoPosition && plan->frame[index] >= 2) census[plan->position[index]].ceiling.push_back(plan->ceiling[index]);
+            }
+        }
         std::thread breaker([&] {
             if (!options.release) return;
             try {
@@ -1359,7 +1522,7 @@ struct Replay {
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--pace-timeout-ms <n>] [--no-release] [--release-after-ms <n>] [--strict]\n"
                          "                        [--repeat <n>] [--cold-pipelines] [--flip-hashes <file>] [--expect-flip-hashes <file>] [--dump <address>:<bytes>:<file>]...\n"
-                         "                        [--depth-profile <file> [--depth-cap <n> | --depth-probe <n>]]\n"
+                         "                        [--depth-profile <file> [--depth-cap <n> | --depth-probe <n>] [--depth-hold <position>]...]\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
@@ -1396,9 +1559,13 @@ int usage() {
                          "                      than the capture had there, and fails once no queue runs for the pacing timeout; refuses\n"
                          "                      captured frames that are not one thread's suspend points, each followed by the queue 0\n"
                          "                      submissions <file> bounds, or whose calls do not take the serials the capture recorded;\n"
-                         "                      needs --no-release\n"
+                         "                      needs --no-release; restores a memory delta read with no work in flight once the submissions\n"
+                         "                      its store and wait floors name, and those the next call's bound leaves out of flight, have run\n"
                          "  --depth-cap <n>     lowers every bound of the depth profile to at most n\n"
-                         "  --depth-probe <n>   sets every bound of the depth profile to n, for sensitivity runs\n");
+                         "  --depth-probe <n>   sets every bound of the depth profile to n, for sensitivity runs\n"
+                         "  --depth-hold <position>\n"
+                         "                      restores the memory deltas before the calls at that position of the depth profile (suspend,\n"
+                         "                      s1, s2 and so on) with no queue running, as without the profile; repeatable\n");
     return 2;
 }
 
@@ -1823,17 +1990,27 @@ std::string depthJson(const Options& options, const Replay& replay) {
     const auto& profile = *options.depth;
     const auto number = [](const std::optional<std::uint64_t>& value) { return value ? std::to_string(*value) : std::string("null"); };
     const auto name = profile.path.filename().u8string();
-    std::string text = "{\"profile\":" + jsonText(std::string(name.begin(), name.end())) + ",\"cap\":" + number(options.depthCap) + ",\"probe\":" + number(options.depthProbe) + ",\"frames\":" + std::to_string(replay.plan ? replay.plan->frames : 0) + ",\"positions\":[";
-    const auto spread = [](std::vector<std::uint64_t> values) {
+    char gate[32];
+    std::snprintf(gate, sizeof(gate), "%.3f", Replay::secondsOf(replay.gateWaitedNs));
+    std::string text = "{\"profile\":" + jsonText(std::string(name.begin(), name.end())) + ",\"cap\":" + number(options.depthCap) + ",\"probe\":" + number(options.depthProbe) + ",\"frames\":" + std::to_string(replay.plan ? replay.plan->frames : 0) +
+                       ",\"fast_deltas\":" + std::to_string(replay.fastDeltas.load()) + ",\"gate_wait_s\":" + gate + ",\"tail\":" + std::to_string(replay.tailHeld) + ",\"positions\":[";
+    const auto spread = [](std::vector<std::uint64_t> values, bool deepest) {
         if (values.empty()) return std::string("null");
         std::sort(values.begin(), values.end());
         const auto at = [&](double fraction) { return std::to_string(values[std::min(values.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(values.size())))]); };
-        return "[" + std::to_string(values.front()) + "," + at(0.1) + "," + at(0.5) + "," + std::to_string(values.back()) + "]";
+        return "[" + std::to_string(values.front()) + "," + at(0.1) + "," + at(0.5) + (deepest ? "," + std::to_string(values.back()) : std::string()) + "]";
     };
+    const PositionCensus none{};
     for (std::size_t position = 0; position < profile.names.size(); ++position) {
-        const auto issue = position < replay.census.size() ? replay.census[position].issue : std::vector<std::uint64_t>{};
+        const auto& entry = position < replay.census.size() ? replay.census[position] : none;
+        std::string held;
+        for (std::size_t cause = 0; cause < HeldCauses; ++cause) {
+            if (static_cast<DepthCause>(cause) != DepthCause::Tail) held += std::string(held.empty() ? "" : ",") + "\"" + std::string(HeldNames[cause]) + "\":" + std::to_string(entry.held[cause]);
+        }
         text += std::string(position == 0 ? "" : ",") + "{\"position\":" + jsonText(profile.names[position]) + ",\"bound\":" + std::to_string(profile.bounds[position]) + ",\"observed\":" + std::to_string(profile.observed[position]) +
-                ",\"issued\":" + std::to_string(issue.size()) + ",\"issue_depth\":" + spread(issue) + "}";
+                ",\"issued\":" + std::to_string(entry.issue.size()) + ",\"issue_depth\":" + spread(entry.issue, true) + ",\"ceiling\":" + spread(entry.ceiling, false) + ",\"restored\":" + std::to_string(entry.restore.size()) +
+                ",\"restore_depth\":" + spread(entry.restore, true) + ",\"by_depth\":" + std::to_string(entry.byDepth) + ",\"by_store\":" + std::to_string(entry.byStore) + ",\"by_wait\":" + std::to_string(entry.byWait) +
+                ",\"cpu_waits\":" + std::to_string(entry.cpuWaits) + ",\"gpu_waits\":" + std::to_string(entry.gpuWaits) + ",\"held\":{" + held + "}}";
     }
     return text + "]}";
 }
@@ -1853,6 +2030,7 @@ int run(const Options& options) {
     if (options.pace) requireRecordedSerials(reader);
     if (options.depth) {
         requireDepthOptions(options);
+        requireDepthCapture(reader, options);
         if (!frameStartSerial(reader)) throw std::runtime_error(std::string(DepthWithoutFrameStart));
         const auto& captured = reader.Calls();
         const auto start = std::find_if(captured.begin(), captured.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
@@ -2013,12 +2191,16 @@ int main(int argc, char** argv) {
             const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
             if (bound || error != std::errc{} || end != value.data() + value.size()) return usage();
             bound = parsed;
+        } else if (argument == "--depth-hold" && index + 1 < argc) {
+            if (*argv[index + 1] == '\0') return usage();
+            options.depthHold.emplace_back(argv[++index]);
         } else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
     if (options.directory.empty()) return usage();
     if ((options.shaders || options.submits != 0) && (!options.flipHashes.empty() || !options.expectedFlipHashes.empty())) return usage();
     if ((options.depthCap || options.depthProbe) && (options.depthFile.empty() || (options.depthCap && options.depthProbe))) return usage();
+    if (!options.depthHold.empty() && options.depthFile.empty()) return usage();
     if (!options.depthFile.empty() && (!options.pace || options.shaders || options.submits != 0)) return usage();
     configureEnvironment(options);
     int code = 2;
