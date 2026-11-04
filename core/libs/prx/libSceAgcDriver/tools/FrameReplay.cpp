@@ -534,6 +534,22 @@ struct Replay {
     std::atomic<std::uint64_t> depthTotal{0};
     std::atomic<std::uint64_t> depthMax{0};
     std::atomic<std::int64_t> memoryGpuWaitedNs{0};
+    std::atomic<std::uint64_t> memoryGpuDrains{0};
+    std::atomic<std::uint64_t> memoryGpuWaits{0};
+    std::atomic<std::uint64_t> memoryGpuSubmits{0};
+    std::uint64_t gpuWaitedThrough = 0;
+    struct GpuEpochs {
+        bool tracked;
+        explicit GpuEpochs(bool tracked) : tracked(tracked) {
+            if (tracked) AgcDriverTrackGpuEpochs_nid_postfix(true);
+        }
+        ~GpuEpochs() {
+            if (tracked) AgcDriverTrackGpuEpochs_nid_postfix(false);
+        }
+        GpuEpochs(const GpuEpochs&) = delete;
+        GpuEpochs& operator=(const GpuEpochs&) = delete;
+    };
+    GpuEpochs gpuEpochs{options.pace};
     std::atomic<bool> stalled{false};
     std::atomic<std::uint64_t> stalledAt{0};
     std::atomic<std::uint64_t> earlyReleases{0};
@@ -721,7 +737,7 @@ struct Replay {
                 if (const auto accepted = progress().first; captureBase && accepted != mappedSerial(call.accepted)) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " was read in flight at capture serial " + std::to_string(call.accepted) + ", which maps to replay serial " + std::to_string(mappedSerial(call.accepted)) + ", but this replay had accepted " + std::to_string(accepted));
                 waitStarted(call);
                 memoryWaited(inFlightWaitedNs, began);
-                waitSettledOnGpu(call);
+                waitSerialsOnGpu(call);
                 restoreGroup(call.values.at(0));
                 return;
             }
@@ -793,10 +809,29 @@ struct Replay {
     }
 
     void waitSettledOnGpu(const FrameCall& call) {
+        ++memoryGpuDrains;
         const auto began = Clock::now();
         const bool ran = AgcDriverWaitRecordedOnGpuFor_nid_postfix(options.busyTimeout.count());
         memoryGpuWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
         if (!ran) throw std::runtime_error("frame replay: the GPU work recorded so far did not finish before memory delta " + std::to_string(call.ordinal));
+    }
+
+    void waitSerialsOnGpu(const FrameCall& call) {
+        const auto accepted = progress().first;
+        const auto through = completedSerial(call, accepted);
+        std::vector<std::uint64_t> started;
+        for (std::size_t index = 1; index < call.values.size(); ++index) {
+            if (const auto serial = startedSerial(call, accepted, call.values[index])) started.push_back(*serial);
+        }
+        if (started.empty() && through <= gpuWaitedThrough) return;
+        const auto began = Clock::now();
+        AgcDriver::GpuSerialsWait outcome;
+        const bool ran = AgcDriverWaitSerialsOnGpuFor_nid_postfix(through, started.data(), started.size(), options.busyTimeout.count(), &outcome);
+        memoryGpuWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+        if (!ran) throw std::runtime_error("frame replay: the GPU work of the submissions memory delta " + std::to_string(call.ordinal) + " waits for did not finish within " + std::to_string(options.busyTimeout.count()) + " ms");
+        memoryGpuWaits += outcome.waited ? 1 : 0;
+        memoryGpuSubmits += outcome.submitted ? 1 : 0;
+        gpuWaitedThrough = std::max(gpuWaitedThrough, through);
     }
 
     void restoreGroup(std::uint64_t group) {
@@ -1680,11 +1715,11 @@ int run(const Options& options) {
         frames += measured.frames;
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"memory_gpu_wait_s\":%.3f,\"restore_s\":%.3f,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f,\"flips_hashed\":%llu,\"flip_hash_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"memory_gpu_wait_s\":%.3f,\"memory_gpu_drains\":%llu,\"memory_gpu_waits\":%llu,\"memory_gpu_submits\":%llu,\"restore_s\":%.3f,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f,\"flips_hashed\":%llu,\"flip_hash_s\":%.3f}\n",
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
-                replay.paceWaitedSeconds(), Replay::secondsOf(replay.heldWaitedNs), Replay::secondsOf(replay.inFlightWaitedNs), Replay::secondsOf(replay.memoryGpuWaitedNs), Replay::secondsOf(replay.restoredNs), static_cast<unsigned long long>(replay.depthMax.load()), replay.depthMean(),
+                replay.paceWaitedSeconds(), Replay::secondsOf(replay.heldWaitedNs), Replay::secondsOf(replay.inFlightWaitedNs), Replay::secondsOf(replay.memoryGpuWaitedNs), static_cast<unsigned long long>(replay.memoryGpuDrains.load()), static_cast<unsigned long long>(replay.memoryGpuWaits.load()), static_cast<unsigned long long>(replay.memoryGpuSubmits.load()), Replay::secondsOf(replay.restoredNs), static_cast<unsigned long long>(replay.depthMax.load()), replay.depthMean(),
                 static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
