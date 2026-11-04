@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include <SDL_loadso.h>
 #include <string_view>
 #include <barrier>
 #include <new>
@@ -1631,6 +1632,363 @@ void testCompletedGateFlip(const std::filesystem::path& directory) {
     check(std::equal(rewritten.begin(), rewritten.end(), source), "the delta read in flight was not restored");
 }
 
+void waitDone(std::uint64_t serial, const char* reason) {
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    while (!AgcDriverSerialDone_nid_postfix(serial)) {
+        check(Clock::now() < deadline, reason);
+        std::this_thread::yield();
+    }
+}
+
+bool parkedOn(const void* dword) {
+    std::array<AgcDriver::AwaitedWait, 64> awaited{};
+    const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+    return std::any_of(awaited.begin(), awaited.begin() + static_cast<std::ptrdiff_t>(count), [&](const AgcDriver::AwaitedWait& slot) { return slot.address == address(dword); });
+}
+
+struct GpuEpochTracking {
+    GpuEpochTracking() {
+        AgcDriverTrackGpuEpochs_nid_postfix(true);
+    }
+    ~GpuEpochTracking() {
+        AgcDriverTrackGpuEpochs_nid_postfix(false);
+    }
+    GpuEpochTracking(const GpuEpochTracking&) = delete;
+    GpuEpochTracking& operator=(const GpuEpochTracking&) = delete;
+};
+
+class BatchHold {
+public:
+    explicit BatchHold(VkDevice device) : device(device) {
+#ifdef _WIN32
+        constexpr const char* libraryName = "vulkan-1.dll";
+#elif defined(__APPLE__)
+        constexpr const char* libraryName = "libvulkan.1.dylib";
+#else
+        constexpr const char* libraryName = "libvulkan.so.1";
+#endif
+        library.reset(SDL_LoadObject(libraryName));
+        check(library != nullptr, "cannot load Vulkan to hold a recorder batch");
+        resolve = reinterpret_cast<PFN_vkGetDeviceProcAddr>(SDL_LoadFunction(library.get(), "vkGetDeviceProcAddr"));
+        check(resolve != nullptr, "cannot resolve vkGetDeviceProcAddr to hold a recorder batch");
+        const auto createSemaphore = function<PFN_vkCreateSemaphore>("vkCreateSemaphore");
+        destroySemaphore = function<PFN_vkDestroySemaphore>("vkDestroySemaphore");
+        signalSemaphore = reinterpret_cast<PFN_vkSignalSemaphore>(resolve(device, "vkSignalSemaphoreKHR"));
+        if (signalSemaphore == nullptr) signalSemaphore = function<PFN_vkSignalSemaphore>("vkSignalSemaphore");
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        check(createSemaphore(device, &info, nullptr, &semaphore) == VK_SUCCESS, "cannot create the semaphore that holds a recorder batch");
+    }
+
+    ~BatchHold() {
+        Release();
+        try {
+            AgcDriverWaitIdle_nid_postfix();
+        } catch (...) {
+        }
+        destroySemaphore(device, semaphore, nullptr);
+    }
+
+    BatchHold(const BatchHold&) = delete;
+    BatchHold& operator=(const BatchHold&) = delete;
+
+    void SubmitHeld(AgcDriver::Graphics::Recorder& recorder) {
+        recorder.HoldNextSubmit(semaphore, 1);
+        recorder.Submit();
+    }
+
+    void Release() {
+        if (released.exchange(true)) return;
+        VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        info.semaphore = semaphore;
+        info.value = 1;
+        releaseResult = signalSemaphore(device, &info);
+    }
+
+    VkResult ReleaseResult() const {
+        return releaseResult;
+    }
+
+private:
+    template <typename TFunction>
+    TFunction function(const char* name) const {
+        const auto function = reinterpret_cast<TFunction>(resolve(device, name));
+        check(function != nullptr, "cannot resolve a Vulkan function to hold a recorder batch");
+        return function;
+    }
+
+    VkDevice device;
+    std::unique_ptr<void, decltype(&SDL_UnloadObject)> library{nullptr, &SDL_UnloadObject};
+    PFN_vkGetDeviceProcAddr resolve = nullptr;
+    PFN_vkDestroySemaphore destroySemaphore = nullptr;
+    PFN_vkSignalSemaphore signalSemaphore = nullptr;
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    std::atomic<bool> released{false};
+    VkResult releaseResult = VK_NOT_READY;
+};
+
+VkDevice recorderDevice() {
+    std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+    const auto* const recorder = AgcDriver::Graphics::Recorder::Active();
+    check(recorder != nullptr, "the device has no active recorder");
+    return recorder->Device();
+}
+
+void testGpuGateQueues() {
+    constexpr std::uint32_t ComputeQueue = 0x20;
+    constexpr std::size_t CopyBytes = 128u * 1024u;
+    openDevice();
+    const GpuEpochTracking tracking;
+    auto* source = allocate(CopyBytes);
+    auto* target = allocate(CopyBytes);
+    auto* words = reinterpret_cast<std::uint32_t*>(allocate(65536, false));
+    auto* nop = words + 32;
+    auto* gate = words + 64;
+    std::fill_n(source, CopyBytes, std::byte{0x11});
+    std::fill_n(target, CopyBytes, std::byte{0});
+    *gate = 0;
+    struct OpenGate {
+        std::uint32_t* gate;
+        ~OpenGate() {
+            std::atomic_ref<std::uint32_t>(*gate).store(1, std::memory_order_release);
+        }
+    } openGate{gate};
+    const std::array<std::uint32_t, 14> gated{0xc0053c00u, 0x13u, low(gate), high(gate), 1u, 0xffffffffu, 4u, 0xc0055000u, 0x80000000u, low(source), high(source), low(target), high(target), static_cast<std::uint32_t>(CopyBytes)};
+    std::copy(gated.begin(), gated.end(), words);
+    const std::array<std::uint32_t, 2> empty{0xc0001000u, 0u};
+    std::copy(empty.begin(), empty.end(), nop);
+    const auto before = progress().first;
+    const Packet packet{words, static_cast<std::uint32_t>(gated.size()), 0, {}};
+    check(sceAgcDriverSubmitAcb(ComputeQueue, &packet) == 0, "the compute submission failed");
+    const auto parkDeadline = Clock::now() + std::chrono::seconds(10);
+    while (!parkedOn(gate)) {
+        check(Clock::now() < parkDeadline, "the compute submission did not wait on its unwritten gate");
+        std::this_thread::yield();
+    }
+    AgcDriverSubmitGraphics_nid_postfix(nop, static_cast<std::uint32_t>(empty.size()));
+    waitDone(before + 2, "the graphics submission did not complete while the compute submission before it waited on its gate");
+    check(!AgcDriverSerialDone_nid_postfix(before + 1), "the graphics submission did not complete ahead of the compute submission that waits on its gate");
+    check(AgcDriverWaitRecordedOnGpuFor_nid_postfix(10000), "the GPU work recorded before the gate opened did not finish");
+    std::atomic_ref<std::uint32_t>(*gate).store(1, std::memory_order_release);
+    const auto runDeadline = Clock::now() + std::chrono::seconds(10);
+    while (progress() != std::pair{before + 2, before + 2}) {
+        check(Clock::now() < runDeadline, "the compute submission did not complete after its gate opened");
+        std::this_thread::yield();
+    }
+    const bool pending = copySourcePending(address(source), CopyBytes);
+    const bool open = readInOpenBatch(address(source), CopyBytes);
+    if (!pending || !open) {
+        AgcDriverWaitIdle_nid_postfix();
+        throw Inconclusive(pending ? "inconclusive: the compute copy that reads its source was not in the open batch after its submission completed on the CPU" : "inconclusive: no GPU copy read the compute submission's source in place after it completed on the CPU");
+    }
+    AgcDriver::GpuSerialsWait outcome;
+    check(AgcDriverWaitSerialsOnGpuFor_nid_postfix(before + 2, nullptr, 0, 10000, &outcome), "the GPU work of the completed submissions did not finish");
+    check(!readStillPending(address(source), CopyBytes), "a GPU wait through a submission returned before the GPU ran an earlier submission that completed after it on another queue");
+    std::fill_n(source, CopyBytes, std::byte{0x22});
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::all_of(target, target + CopyBytes, [](std::byte value) { return value == std::byte{0x11}; }), "the compute copy read its source after a GPU wait through its submission returned");
+}
+
+void testGpuGateDepth(const std::filesystem::path& directory) {
+    constexpr std::size_t CopyBytes = 128u * 1024u;
+    openDevice();
+    auto* bytes = allocate(CopyBytes * 4);
+    auto* first = bytes;
+    auto* firstTarget = bytes + CopyBytes;
+    auto* second = bytes + CopyBytes * 2;
+    auto* secondTarget = bytes + CopyBytes * 3;
+    auto* words = reinterpret_cast<std::uint32_t*>(allocate(65536, false));
+    std::fill_n(first, CopyBytes, std::byte{0x11});
+    std::fill_n(firstTarget, CopyBytes, std::byte{0});
+    std::fill_n(second, CopyBytes, std::byte{0x44});
+    std::fill_n(secondTarget, CopyBytes, std::byte{0});
+    const std::array<std::uint32_t, 7> firstCopy{0xc0055000u, 0x80000000u, low(first), high(first), low(firstTarget), high(firstTarget), static_cast<std::uint32_t>(CopyBytes)};
+    const std::array<std::uint32_t, 7> secondCopy{0xc0055000u, 0x80000000u, low(second), high(second), low(secondTarget), high(secondTarget), static_cast<std::uint32_t>(CopyBytes)};
+    std::copy(firstCopy.begin(), firstCopy.end(), words);
+    std::copy(secondCopy.begin(), secondCopy.end(), words + 16);
+    const std::vector<std::byte> rewritten(CopyBytes, std::byte{0x22});
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(first), rewritten);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.busyTimeout = std::chrono::milliseconds(20000);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    BatchHold hold(recorderDevice());
+    const auto before = progress().first;
+    AgcDriverSubmitGraphics_nid_postfix(words, static_cast<std::uint32_t>(firstCopy.size()));
+    waitDone(before + 1, "the first copy's submission did not complete on the CPU");
+    const bool firstPending = copySourcePending(address(first), CopyBytes);
+    if (!firstPending || !readInOpenBatch(address(first), CopyBytes)) {
+        AgcDriverWaitIdle_nid_postfix();
+        throw Inconclusive(firstPending ? "inconclusive: the first copy was not in the open batch after its submission completed on the CPU" : "inconclusive: no GPU copy read the restored range in place after its submission completed on the CPU");
+    }
+    {
+        std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+        auto* const recorder = AgcDriver::Graphics::Recorder::Active();
+        check(recorder != nullptr, "the device has no active recorder");
+        hold.SubmitHeld(*recorder);
+    }
+    AgcDriverSubmitGraphics_nid_postfix(words + 16, static_cast<std::uint32_t>(secondCopy.size()));
+    waitDone(before + 2, "the second copy's submission did not complete on the CPU while the first copy's batch was held");
+    check(readStillPending(address(first), CopyBytes) && !readInOpenBatch(address(first), CopyBytes), "the first copy's batch was not held on the GPU after its submit");
+    const bool secondPending = copySourcePending(address(second), CopyBytes);
+    if (!secondPending || !readInOpenBatch(address(second), CopyBytes)) throw Inconclusive(secondPending ? "inconclusive: the second copy was not in the open batch after its submission completed on the CPU" : "inconclusive: no GPU copy read the second source in place after its submission completed on the CPU");
+    std::uint32_t firstAtRelease = 0;
+    std::thread title([&] {
+        const auto limit = Clock::now() + std::chrono::seconds(1);
+        do {
+            firstAtRelease = std::atomic_ref<std::uint32_t>(*reinterpret_cast<std::uint32_t*>(first)).load(std::memory_order_acquire);
+            std::this_thread::yield();
+        } while (firstAtRelease != 0x22222222u && Clock::now() < limit);
+        hold.Release();
+    });
+    auto call = memoryCall(1, 1);
+    call.ordinal = 1;
+    call.flags = AgcDriver::InFlightDeltaFlag;
+    call.accepted = 2;
+    call.completed = 1;
+    call.values = {1};
+    std::string failure;
+    try {
+        replay.runWindow(std::span(&call, 1));
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    title.join();
+    const bool drained = !readInOpenBatch(address(second), CopyBytes);
+    AgcDriverWaitIdle_nid_postfix();
+    check(failure.empty(), failure.c_str());
+    check(hold.ReleaseResult() == VK_SUCCESS, "cannot signal the semaphore that holds the first copy's batch");
+    check(firstAtRelease == 0x11111111u, "a delta read in flight was restored before the GPU ran the batch of a submission the capture had completed");
+    check(!drained, "a delta read in flight drained the GPU work of a submission it does not wait for");
+    check(std::equal(rewritten.begin(), rewritten.end(), first), "the delta read in flight was not restored");
+    check(std::all_of(firstTarget, firstTarget + CopyBytes, [](std::byte value) { return value == std::byte{0x11}; }), "the copy of a submission the capture had completed read the bytes of a delta read in flight after it");
+    check(std::all_of(secondTarget, secondTarget + CopyBytes, [](std::byte value) { return value == std::byte{0x44}; }), "the copy of the submission after the delta's read did not run");
+}
+
+bool gpuEpochsTracked() {
+    try {
+        return AgcDriverWaitSerialsOnGpuFor_nid_postfix(0, nullptr, 0, 0, nullptr);
+    } catch (const std::runtime_error& error) {
+        if (std::string_view(error.what()).find("needs AgcDriverTrackGpuEpochs") == std::string_view::npos) throw;
+        return false;
+    }
+}
+
+void testGpuEpochsUntracked(const std::filesystem::path& directory) {
+    FrameCaptureWriter writer(directory);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    check(!gpuEpochsTracked(), "the GPU batches of completed submissions were known with no frame replay tracking them");
+    Options unpaced;
+    unpaced.pace = false;
+    {
+        Replay replay{unpaced, reader};
+        check(!gpuEpochsTracked(), "an unpaced frame replay tracked the GPU batches of completed submissions");
+    }
+    Options paced;
+    {
+        Replay replay{paced, reader};
+        check(gpuEpochsTracked(), "a paced frame replay did not track the GPU batches of completed submissions");
+        {
+            Replay second{paced, reader};
+        }
+        check(gpuEpochsTracked(), "a second paced frame replay stopped the tracking when it ended while the first one was alive");
+    }
+    check(!gpuEpochsTracked(), "the tracking of the GPU batches of completed submissions outlived the frame replay that asked for it");
+}
+
+void testGpuEpochsFlip(const std::filesystem::path& directory) {
+    constexpr std::uint64_t Base = 40;
+    constexpr std::uint32_t ComputeQueue = 0x20;
+    if (APS5_ENABLE_TIMING_LOG) return;
+    const char* dump = std::getenv("APS5_DUMP_SUBMITS");
+    check(std::getenv("APS5_CPU_FLIP_IN_ORDER") == nullptr && std::getenv("APS5_SYNC_FLIP") == nullptr && (dump == nullptr || *dump == '\0'), "the environment orders CPU flips or captures submissions, so the replay's CPU flip would take a serial");
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* commands = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* label = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    auto* restored = reinterpret_cast<std::uint32_t*>(bytes + 8192);
+    auto* waiting = reinterpret_cast<std::uint32_t*>(bytes + 12288);
+    *label = 0;
+    *restored = 0;
+    const std::array<std::uint32_t, 2> nop{0xc0001000u, 0u};
+    std::copy(nop.begin(), nop.end(), commands);
+    const std::array<std::uint32_t, 7> wait{0xc0053c00u, 0x13u, low(label), high(label), 1u, 0xffffffffu, 4u};
+    std::copy(wait.begin(), wait.end(), waiting);
+    const std::uint32_t stored = 7;
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(restored), std::as_bytes(std::span(&stored, 1)));
+    FrameCall start;
+    start.kind = FrameCallKind::FrameStart;
+    start.accepted = Base;
+    start.completed = Base;
+    writer.WriteCall(start);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.busyTimeout = std::chrono::milliseconds(5000);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    auto output = std::make_shared<ReplayOutput>(replay.frames);
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    const auto submit = [&](std::uint64_t ordinal, const std::uint32_t* words, std::size_t size, std::uint64_t taken) {
+        FrameCall call;
+        call.kind = FrameCallKind::Submit;
+        call.ordinal = ordinal;
+        call.thread = 1;
+        call.queue = ComputeQueue;
+        call.address = address(words);
+        call.size = size;
+        call.accepted = taken - 1;
+        call.completed = taken - 1;
+        call.values = {taken};
+        return call;
+    };
+    FrameCall flip;
+    flip.kind = FrameCallKind::Flip;
+    flip.ordinal = 3;
+    flip.thread = 1;
+    flip.cpuFlip = true;
+    flip.accepted = Base + 2;
+    flip.completed = Base + 1;
+    flip.values = {7, static_cast<std::uint64_t>(-1), 1, 0, Base + 3};
+    auto delta = memoryCall(1, 1);
+    delta.ordinal = 4;
+    delta.flags = AgcDriver::InFlightDeltaFlag;
+    delta.accepted = Base + 3;
+    delta.completed = Base + 1;
+    delta.values = {1, Base + 3};
+    std::uint32_t restoredAtRelease = 0;
+    std::thread title([&] {
+        const auto limit = Clock::now() + std::chrono::seconds(1);
+        do {
+            restoredAtRelease = std::atomic_ref<std::uint32_t>(*restored).load(std::memory_order_acquire);
+            std::this_thread::yield();
+        } while (restoredAtRelease != stored && Clock::now() < limit);
+        std::atomic_ref<std::uint32_t>(*label).store(1, std::memory_order_release);
+    });
+    const std::array calls{submit(1, commands, nop.size(), Base + 1), submit(2, waiting, wait.size(), Base + 2), flip, delta};
+    std::string failure;
+    try {
+        replay.runWindow(calls);
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    title.join();
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+    check(failure.empty(), ("a delta read in flight that lists the serial of a CPU flip that took one only in the capture made the GPU wait ask for a submission the flip did not take: " + failure).c_str());
+    check(replay.frames.Times().size() == 1, "the replay did not present the CPU flip that took a serial only in the capture");
+    check(restoredAtRelease == stored && *restored == stored, "the delta read in flight that lists the serial of a CPU flip that took one only in the capture was not restored while the submission before the flip, which it does not wait for, was parked");
+}
+
 struct PendingResults {
     std::uint64_t address = 0;
     std::size_t bytes = 0;
@@ -1742,6 +2100,10 @@ int main(int argc, char** argv) {
         else if (mode == "delta_hole") testDeltaOutsideRanges(directory);
         else if (mode == "gpu_gate" || mode == "gpu_gate_in_flight") testGpuGate(directory, mode == "gpu_gate_in_flight");
         else if (mode == "gpu_gate_parked") testGpuGateParked(directory);
+        else if (mode == "gpu_gate_queues") testGpuGateQueues();
+        else if (mode == "gpu_gate_depth") testGpuGateDepth(directory);
+        else if (mode == "gpu_epochs_untracked") testGpuEpochsUntracked(directory);
+        else if (mode == "gpu_epochs_flip") testGpuEpochsFlip(directory);
         else if (mode == "restore_pending_store") testRestorePendingStore(directory);
         else throw std::runtime_error("unknown test");
         if (mode != "reservation_failure" && mode != "gate_failure") AgcDriverShutdown_nid_postfix();
