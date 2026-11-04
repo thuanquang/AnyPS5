@@ -146,7 +146,7 @@ std::string hex(std::uint64_t value) {
 }
 
 std::uint32_t floorFlagsOf(std::uint32_t version) {
-    return (version >= StoreFloorCallsVersion ? FrameFloorFlag::StoreUnknown : 0u) | (version >= WaitFloorCallsVersion ? FrameFloorFlag::WaitUnknown : 0u);
+    return (version >= StoreFloorCallsVersion ? FrameFloorFlag::StoreUnknown : 0u) | (version >= WaitFloorCallsVersion ? FrameFloorFlag::WaitUnknown : 0u) | (version >= ReleasesCallsVersion ? FrameFloorFlag::ReleasesWait : 0u);
 }
 
 void checkCall(const FrameCall& call, std::uint32_t version) {
@@ -160,7 +160,7 @@ void checkCall(const FrameCall& call, std::uint32_t version) {
     }
     const auto delta = [&] { return "memory delta " + std::to_string(call.ordinal); };
     if (const auto unknown = call.floorFlags & ~floorFlagsOf(version); unknown != 0) refuseCapture(delta() + " carries unknown floor flags " + hex(unknown));
-    const auto settledOnly = FrameFloorFlag::StoreUnknown | FrameFloorFlag::IncompleteSerialWait;
+    const auto settledOnly = FrameFloorFlag::StoreUnknown | FrameFloorFlag::IncompleteSerialWait | FrameFloorFlag::ReleasesWait;
     if ((call.flags & InFlightDeltaFlag) != 0 && (call.storeFloor != 0 || call.waitFloor != 0 || (call.floorFlags & settledOnly) != 0)) refuseCapture(delta() + " was read in flight but carries a floor");
     if (call.storeFloor != 0 && (call.floorFlags & FrameFloorFlag::StoreUnknown) != 0) refuseCapture(delta() + " marks its store floor unknown but names submission " + std::to_string(call.storeFloor));
     if (call.storeFloor > call.completed) refuseCapture(delta() + " names store floor " + std::to_string(call.storeFloor) + " above its completed serial " + std::to_string(call.completed));

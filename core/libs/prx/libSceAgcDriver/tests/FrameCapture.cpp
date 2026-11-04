@@ -113,6 +113,7 @@ std::vector<FrameCall> sampleCalls() {
     floored.completed = 19;
     floored.storeFloor = 18;
     floored.waitFloor = 17;
+    floored.floorFlags = AgcDriver::FrameFloorFlag::ReleasesWait;
     floored.values = {1};
     calls.push_back(floored);
     FrameCall unknown;
@@ -254,6 +255,7 @@ std::vector<FrameCall> callsOfFormat(std::uint32_t version) {
             call.waitFloor = 0;
             call.floorFlags &= ~AgcDriver::FrameFloorFlag::WaitUnknown;
         }
+        if (version < AgcDriver::ReleasesCallsVersion) call.floorFlags &= ~AgcDriver::FrameFloorFlag::ReleasesWait;
     }
     return calls;
 }
@@ -326,6 +328,9 @@ void testCallsInvariants(const std::filesystem::path& directory) {
     floored.completed = 10;
     floored.storeFloor = 4;
     refusedRecord(directory, "F1", floored, "call 3 (submit) is not a memory delta but carries a floor");
+    floored.storeFloor = 0;
+    floored.floorFlags = AgcDriver::FrameFloorFlag::ReleasesWait;
+    refusedRecord(directory, "F1 releases", floored, "call 3 (submit) is not a memory delta but carries a floor");
     const auto memory = [](std::uint64_t ordinal) {
         FrameCall call;
         call.kind = FrameCallKind::Memory;
@@ -358,6 +363,8 @@ void testCallsInvariants(const std::filesystem::path& directory) {
     inFlight.waitFloor = 0;
     inFlight.floorFlags = AgcDriver::FrameFloorFlag::IncompleteSerialWait;
     refusedRecord(directory, "F5 wait flags", inFlight, "memory delta 7 was read in flight but carries a floor");
+    inFlight.floorFlags = AgcDriver::FrameFloorFlag::ReleasesWait;
+    refusedRecord(directory, "F5 releases", inFlight, "memory delta 7 was read in flight but carries a floor");
     auto waitNamed = memory(8);
     waitNamed.waitFloor = 6;
     waitNamed.floorFlags = AgcDriver::FrameFloorFlag::WaitValueLost;
@@ -368,6 +375,8 @@ void testCallsInvariants(const std::filesystem::path& directory) {
     auto earlier = memory(10);
     earlier.floorFlags = AgcDriver::FrameFloorFlag::WaitValueLost;
     refusedRecord(directory, "F2 store format", earlier, "memory delta 10 carries unknown floor flags 0x200", AgcDriver::StoreFloorCallsVersion);
+    earlier.floorFlags = AgcDriver::FrameFloorFlag::ReleasesWait;
+    refusedRecord(directory, "F2 wait format", earlier, "memory delta 10 carries unknown floor flags 0x800", AgcDriver::WaitFloorCallsVersion);
     auto refusedInFlight = memory(11);
     refusedInFlight.flags = AgcDriver::InFlightDeltaFlag;
     refusedInFlight.floorFlags = AgcDriver::FrameFloorFlag::WaitValueLost | AgcDriver::FrameFloorFlag::WaitOrderLost;

@@ -38,7 +38,8 @@ inline constexpr std::uint32_t InFlightCallsVersion = 2;
 inline constexpr std::uint32_t ExitCallsVersion = InFlightCallsVersion + 1;
 inline constexpr std::uint32_t StoreFloorCallsVersion = InFlightCallsVersion + 2;
 inline constexpr std::uint32_t WaitFloorCallsVersion = InFlightCallsVersion + 3;
-inline constexpr std::uint32_t CallsVersion = WaitFloorCallsVersion;
+inline constexpr std::uint32_t ReleasesCallsVersion = InFlightCallsVersion + 4;
+inline constexpr std::uint32_t CallsVersion = ReleasesCallsVersion;
 
 struct FrameFloorFlag {
     static constexpr std::uint32_t UnattributedStore = 1u << 0;
@@ -53,6 +54,7 @@ struct FrameFloorFlag {
     static constexpr std::uint32_t WaitValueLost = 1u << 9;
     static constexpr std::uint32_t WaitOrderLost = 1u << 10;
     static constexpr std::uint32_t WaitUnknown = 0x700u;
+    static constexpr std::uint32_t ReleasesWait = 1u << 11;
 };
 
 struct FrameCall {
@@ -105,7 +107,7 @@ public:
     static constexpr std::string_view MemoryName = "memory.bin";
     static constexpr std::string_view HeaderName = "capture.json";
     static constexpr std::string_view CallsMagicPrefix = "aps5-frame-calls ";
-    static constexpr std::string_view CallsMagic = "aps5-frame-calls 5\n";
+    static constexpr std::string_view CallsMagic = "aps5-frame-calls 6\n";
     static constexpr std::string_view MemoryMagic = "aps5-frame-memory 1\n";
     static constexpr std::size_t BlockBytes = 64u * 1024u;
     static constexpr std::size_t ChunkBytes = 4u * 1024u * 1024u;
