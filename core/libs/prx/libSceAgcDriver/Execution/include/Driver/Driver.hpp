@@ -171,8 +171,8 @@ private:
     void noteHeldAtSubmit(Submission& submission, std::size_t cursor, bool tracking);
     static void forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission);
     static void forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites);
-    void passAwaited(const Submission& submission, std::span<const std::uint32_t> packet);
-    void passAwaitedLocked(std::uint64_t serial, std::uint64_t address);
+    void passAwaited(const Submission& submission, std::span<const std::uint32_t> packet, std::optional<std::uint64_t> pendingLabel = std::nullopt);
+    void passAwaitedLocked(std::uint64_t serial, std::uint64_t address, std::optional<std::uint64_t> pendingLabel = std::nullopt);
     void finishAwaited(std::uint64_t serial);
     bool gpuSatisfies(std::uint64_t serial, const AwaitedDword& wait) const;
     static bool& completionDeferred();

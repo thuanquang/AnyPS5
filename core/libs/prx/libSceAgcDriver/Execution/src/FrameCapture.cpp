@@ -97,6 +97,7 @@ std::vector<std::byte> encodeCall(const FrameCall& call, std::uint32_t version) 
         encoder.Put(call.storeFloor);
         encoder.Put(call.floorFlags);
     }
+    if (version >= WaitFloorCallsVersion) encoder.Put(call.waitFloor);
     encoder.Put(static_cast<std::uint32_t>(call.values.size()));
     for (const auto value : call.values) encoder.Put(value);
     putRegisters(encoder, call.context);
@@ -125,6 +126,7 @@ FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload, std
         call.storeFloor = decoder.Take<std::uint64_t>("store floor");
         call.floorFlags = decoder.Take<std::uint32_t>("floor flags");
     }
+    if (version >= WaitFloorCallsVersion) call.waitFloor = decoder.Take<std::uint64_t>("wait floor");
     call.values.resize(decoder.Count(8, "values"));
     for (auto& value : call.values) value = decoder.Take<std::uint64_t>("value");
     call.context = takeRegisters(decoder);
@@ -144,23 +146,26 @@ std::string hex(std::uint64_t value) {
 }
 
 std::uint32_t floorFlagsOf(std::uint32_t version) {
-    return version >= StoreFloorCallsVersion ? FrameFloorFlag::StoreUnknown : 0u;
+    return (version >= StoreFloorCallsVersion ? FrameFloorFlag::StoreUnknown : 0u) | (version >= WaitFloorCallsVersion ? FrameFloorFlag::WaitUnknown : 0u);
 }
 
 void checkCall(const FrameCall& call, std::uint32_t version) {
     const auto name = [&] { return "call " + std::to_string(call.ordinal) + " (" + std::string(FrameCallName(call.kind)) + ")"; };
     if (call.previousExitNs != 0 && !FrameTitleCall(call.kind)) refuseCapture(name() + " is not a title call but carries a previous exit time");
     if (call.previousExitNs > call.timeNs) refuseCapture(name() + " was entered at " + std::to_string(call.timeNs) + " ns, before its thread's previous call returned at " + std::to_string(call.previousExitNs) + " ns");
-    const bool floored = call.storeFloor != 0 || call.floorFlags != 0;
+    const bool floored = call.storeFloor != 0 || call.floorFlags != 0 || call.waitFloor != 0;
     if (call.kind != FrameCallKind::Memory) {
         if (floored) refuseCapture(name() + " is not a memory delta but carries a floor");
         return;
     }
     const auto delta = [&] { return "memory delta " + std::to_string(call.ordinal); };
     if (const auto unknown = call.floorFlags & ~floorFlagsOf(version); unknown != 0) refuseCapture(delta() + " carries unknown floor flags " + hex(unknown));
-    if ((call.flags & InFlightDeltaFlag) != 0 && (call.storeFloor != 0 || (call.floorFlags & FrameFloorFlag::StoreUnknown) != 0)) refuseCapture(delta() + " was read in flight but carries a floor");
+    const auto settledOnly = FrameFloorFlag::StoreUnknown | FrameFloorFlag::IncompleteSerialWait;
+    if ((call.flags & InFlightDeltaFlag) != 0 && (call.storeFloor != 0 || call.waitFloor != 0 || (call.floorFlags & settledOnly) != 0)) refuseCapture(delta() + " was read in flight but carries a floor");
     if (call.storeFloor != 0 && (call.floorFlags & FrameFloorFlag::StoreUnknown) != 0) refuseCapture(delta() + " marks its store floor unknown but names submission " + std::to_string(call.storeFloor));
     if (call.storeFloor > call.completed) refuseCapture(delta() + " names store floor " + std::to_string(call.storeFloor) + " above its completed serial " + std::to_string(call.completed));
+    if (call.waitFloor != 0 && (call.floorFlags & FrameFloorFlag::WaitUnknown) != 0) refuseCapture(delta() + " marks its wait floor unknown but names submission " + std::to_string(call.waitFloor));
+    if (call.waitFloor > call.completed) refuseCapture(delta() + " names wait floor " + std::to_string(call.waitFloor) + " above its completed serial " + std::to_string(call.completed));
 }
 
 bool knownCall(std::uint32_t kind) {
@@ -285,6 +290,7 @@ void FrameCaptureWriter::WriteCall(const FrameCall& call) {
     };
     recorded(version >= ExitCallsVersion || call.previousExitNs == 0, "the previous exit time");
     recorded(version >= StoreFloorCallsVersion || (call.storeFloor == 0 && call.floorFlags == 0), "store floors");
+    recorded(version >= WaitFloorCallsVersion || call.waitFloor == 0, "wait floors");
     const auto payload = encodeCall(call, version);
     requireCapture(payload.size() <= UINT32_MAX, "call record too large");
     std::lock_guard lock(mutex);

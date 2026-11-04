@@ -624,6 +624,7 @@ bool FrameRecorder::recordLocked(FrameCall& call, bool prologueCall, std::span<c
     call.accepted = entry.accepted;
     call.completed = entry.completed;
     if (call.kind == FrameCallKind::Submit) ++submitDepths[static_cast<std::size_t>(std::min<std::uint64_t>(entry.accepted - entry.completed, submitDepths.size() - 1))];
+    if (call.kind == FrameCallKind::Submit && call.queue != 0) multiQueue = true;
     return true;
 }
 
@@ -826,7 +827,9 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         stores = driverStores;
     }
     readStores = stores;
+    const auto readStart = floorEvents.load(std::memory_order_acquire);
     StoreFloor storeFloor;
+    WaitVerdicts waitVerdicts;
     const auto prepareRead = [&](std::uint64_t at, std::span<std::byte> part) {
         if (!inFlightRead) {
             const RecorderFlushScope flushing;
@@ -837,9 +840,10 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     bool any = false;
     std::vector<std::byte> bytes;
     std::vector<std::pair<std::size_t, std::size_t>> runs;
-    const auto writeTitleWords = [&](std::uint64_t address, std::uint64_t before, bool zero = false) {
+    const auto writeTitleWords = [&](std::uint64_t address, std::uint64_t before, std::span<const std::pair<std::uint64_t, std::uint64_t>> skipped, bool zero = false) {
         keepTitleWords(address, bytes, runs, zero);
         if (!inFlightRead) takeStoreFloor(address, runs, before, completed, storeFloor);
+        judgeWaits(address, bytes, runs, skipped, readStart, waitVerdicts);
         for (const auto& [offset, length] : runs) {
             writer->WriteDelta(group, completed, address + offset, std::span<const std::byte>(bytes).subspan(offset, length));
             deltaBytes += length;
@@ -865,8 +869,8 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         for (std::uint64_t at = 0; at < range.bytes;) {
             bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
             const auto before = prepareRead(range.address + at, bytes);
-            readGuest(range.address + at, bytes);
-            writeTitleWords(range.address + at, before, std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; }));
+            const auto skipped = readGuest(range.address + at, bytes);
+            writeTitleWords(range.address + at, before, skipped, std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; }));
             if (!GuestMemory::Watched(range.address + at, bytes.size())) recordUnwatched(range.address + at, bytes, stores);
             at += bytes.size();
         }
@@ -877,14 +881,16 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         const auto before = floorEvents.load(std::memory_order_acquire);
         std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes);
         const auto hash = contentHash(bytes);
-        if (const auto found = hostPageHashes.find(page); found != hostPageHashes.end() && found->second == hash) continue;
+        if (const auto found = hostPageHashes.find(page); found != hostPageHashes.end() && found->second == hash) {
+            judgeWaits(page, bytes, {}, {}, readStart, waitVerdicts);
+            continue;
+        }
         forget(page, page + HostPageBytes);
         hostPageHashes[page] = hash;
         writer->WriteDelta(group, completed, page, bytes);
-        if (!inFlightRead) {
-            const std::array<std::pair<std::size_t, std::size_t>, 1> whole{{{0, HostPageBytes}}};
-            takeStoreFloor(page, whole, before, completed, storeFloor);
-        }
+        const std::array<std::pair<std::size_t, std::size_t>, 1> whole{{{0, HostPageBytes}}};
+        if (!inFlightRead) takeStoreFloor(page, whole, before, completed, storeFloor);
+        judgeWaits(page, bytes, whole, {}, readStart, waitVerdicts);
         recordUnwatched(page, bytes, stores);
         deltaBytes += bytes.size();
         any = true;
@@ -892,19 +898,22 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     for (const auto& [begin, end] : blocks) {
         bytes.resize(static_cast<std::size_t>(end - begin));
         const auto before = prepareRead(begin, bytes);
-        readGuest(begin, bytes);
+        const auto skipped = readGuest(begin, bytes);
         if (accepted == completed && !GuestMemory::Watched(begin, bytes.size())) {
             const auto key = std::pair{begin, static_cast<std::uint64_t>(bytes.size())};
             const auto sample = std::pair{contentHash(bytes), accepted};
             const auto found = unwatchedHashes.find(key);
-            if (found != unwatchedHashes.end() && found->second == sample) continue;
+            if (found != unwatchedHashes.end() && found->second == sample) {
+                judgeWaits(begin, bytes, {}, skipped, readStart, waitVerdicts);
+                continue;
+            }
             forget(begin, end);
             unwatchedHashes[key] = sample;
         } else {
             forget(begin, end);
         }
         if (!GuestMemory::Watched(begin, bytes.size())) recordUnwatched(begin, bytes, stores);
-        writeTitleWords(begin, before);
+        writeTitleWords(begin, before, skipped);
     }
     if (!inFlightRead) {
         std::lock_guard lock(storeMutex);
@@ -915,7 +924,16 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             }
         }
     }
-    if (!any) return;
+    auto waitFlags = waitVerdicts.flags;
+    const bool needed = waitVerdicts.neededSerial != UINT64_MAX;
+    const auto follows = inFlightRead ? waitVerdicts.neededSerial : std::max(storeFloor.serial, waitVerdicts.floor);
+    if (inFlightRead) {
+        if (needed) waitFlags |= FrameFloorFlag::WaitOrderLost;
+    } else {
+        if (waitVerdicts.floor > completed) waitFlags |= FrameFloorFlag::IncompleteSerialWait;
+        if (needed && (waitVerdicts.neededSerial <= follows || (multiQueue && waitVerdicts.neededPass < std::max(waitVerdicts.floorEvent, storeFloor.newestEvent)))) waitFlags |= FrameFloorFlag::WaitOrderLost;
+    }
+    if (!any && waitFlags == 0) return;
     deltaGroups = group;
     auto call = make(FrameCallKind::Memory);
     call.ordinal = ++ordinal;
@@ -925,9 +943,27 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     call.values.insert(call.values.end(), started.begin(), started.end());
     if (inFlightRead) {
         call.flags = InFlightDeltaFlag;
+        call.floorFlags = waitFlags;
     } else {
-        call.floorFlags = storeFloor.unknown;
+        call.floorFlags = storeFloor.unknown | waitFlags;
         call.storeFloor = (storeFloor.unknown & FrameFloorFlag::StoreUnknown) != 0 ? 0 : storeFloor.serial;
+        call.waitFloor = (waitFlags & FrameFloorFlag::WaitUnknown) != 0 ? 0 : waitVerdicts.floor;
+    }
+    if ((waitFlags & (FrameFloorFlag::WaitValueLost | FrameFloorFlag::WaitOrderLost)) != 0 && waitWarnings < WaitWarningLimit) {
+        const auto dword = [](std::uint64_t address) {
+            char text[32];
+            std::snprintf(text, sizeof text, "0x%llx", static_cast<unsigned long long>(address));
+            return std::string(text);
+        };
+        const auto delta = "memory delta " + std::to_string(group) + " (call " + std::to_string(call.ordinal) + ")";
+        if ((waitFlags & FrameFloorFlag::WaitValueLost) != 0 && waitWarnings < WaitWarningLimit) {
+            ++waitWarnings;
+            warnings.push_back(delta + " restores the dword at " + dword(waitVerdicts.lostDword) + " after submission " + std::to_string(waitVerdicts.lostSerial) + " passed a wait on it with a value no earlier delta or noted driver store held");
+        }
+        if ((waitFlags & FrameFloorFlag::WaitOrderLost) != 0 && waitWarnings < WaitWarningLimit) {
+            ++waitWarnings;
+            warnings.push_back(delta + " supplies the dword at " + dword(waitVerdicts.neededDword) + " that submission " + std::to_string(waitVerdicts.neededSerial) + " waited for but must follow submission " + std::to_string(follows));
+        }
     }
     writer->WriteCall(call);
 }
@@ -938,13 +974,26 @@ void FrameRecorder::endGpuStores() {
     std::lock_guard lock(gpuStoresMutex);
     gpuWords.clear();
     gpuFills.clear();
+    waitedDwords.clear();
+    trackedWaits.clear();
+    awaitIndices.clear();
 }
 
 void FrameRecorder::noteGpuStore(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return;
     const auto end = address + bytes.size();
+    const auto serial = GuestMemory::CurrentStoreSerial();
     std::lock_guard lock(gpuStoresMutex);
     forgetGpuStores(address, end);
+    for (auto dword = waitedDwords.lower_bound(address - std::min<std::uint64_t>(address, 3)); dword != waitedDwords.end() && dword->first < end; ++dword) {
+        if (dword->first < address || dword->first + 4 > end) {
+            dword->second.known = false;
+            continue;
+        }
+        std::uint32_t value = 0;
+        std::memcpy(&value, bytes.data() + (dword->first - address), sizeof(value));
+        noteWaitedStore(dword->second, value, serial);
+    }
     if (bytes.size() > GpuStoreWordLimit) return;
     for (auto word = (address + 3) & ~std::uint64_t{3}; word + 4 <= end; word += 4) {
         std::uint32_t value = 0;
@@ -955,9 +1004,203 @@ void FrameRecorder::noteGpuStore(std::uint64_t address, std::span<const std::byt
 
 void FrameRecorder::noteGpuFill(std::uint64_t address, std::uint64_t bytes, const std::array<std::uint32_t, 4>& pattern) {
     if (bytes == 0) return;
+    const auto serial = GuestMemory::CurrentStoreSerial();
+    const bool aligned = address % 16 == 0 && bytes % 16 == 0;
     std::lock_guard lock(gpuStoresMutex);
     forgetGpuStores(address, address + bytes);
-    if (address % 16 == 0 && bytes % 16 == 0) gpuFills.emplace(address, GpuFill{address + bytes, pattern});
+    for (auto dword = waitedDwords.lower_bound(address - std::min<std::uint64_t>(address, 3)); dword != waitedDwords.end() && dword->first < address + bytes; ++dword) {
+        if (!aligned || dword->first < address || dword->first + 4 > address + bytes) {
+            dword->second.known = false;
+            continue;
+        }
+        noteWaitedStore(dword->second, pattern[(dword->first % 16) / 4], serial);
+    }
+    if (aligned) gpuFills.emplace(address, GpuFill{address + bytes, pattern});
+}
+
+void FrameRecorder::noteWaitedStore(WaitedDword& waited, std::uint32_t value, std::uint64_t serial) {
+    waited.before = waited.value;
+    waited.beforeKnown = waited.known;
+    waited.value = value;
+    waited.known = true;
+    waited.noteSerial = serial;
+}
+
+void FrameRecorder::noteAwaits(std::uint64_t serial, std::span<const DriverDetail::AwaitedDword> waits, bool afterDelta) {
+    if (waits.empty()) return;
+    std::lock_guard lock(gpuStoresMutex);
+    auto& next = awaitIndices[serial];
+    for (const auto& wait : waits) {
+        const WaitKey key{serial, next++};
+        auto& tracked = trackedWaits[key];
+        tracked.wait = wait;
+        for (auto address = wait.address; address < wait.address + std::max<std::uint64_t>(wait.bytes, 4); address += 4) {
+            const auto [dword, created] = waitedDwords.try_emplace(address);
+            dword->second.waits.push_back(key);
+            if (!created) continue;
+            dword->second.known = true;
+            if (const auto word = gpuWords.find(address); word != gpuWords.end()) {
+                dword->second.value = word->second;
+                continue;
+            }
+            if (auto fill = gpuFills.upper_bound(address); fill != gpuFills.begin() && std::prev(fill)->second.end > address) {
+                dword->second.value = std::prev(fill)->second.pattern[(address % 16) / 4];
+                continue;
+            }
+            dword->second.known = afterDelta;
+            if (afterDelta) dword->second.value = *reinterpret_cast<const volatile std::uint32_t*>(static_cast<std::uintptr_t>(address));
+        }
+        if (!wait.satisfied) continue;
+        tracked.stage = WaitStage::Passed;
+        tracked.anchored = afterDelta || anchors(wait, serial);
+        tracked.passSequence = ++floorEvents;
+    }
+}
+
+void FrameRecorder::noteAwaitPassed(std::uint64_t serial, std::size_t index, std::optional<std::uint64_t> pendingLabel) {
+    std::lock_guard lock(gpuStoresMutex);
+    const auto found = trackedWaits.find({serial, index});
+    if (found == trackedWaits.end() || found->second.wait.satisfied) return;
+    auto& tracked = found->second;
+    tracked.stage = WaitStage::Passed;
+    tracked.passSequence = ++floorEvents;
+    tracked.anchored = pendingLabel.has_value() || anchors(tracked.wait, serial);
+}
+
+void FrameRecorder::noteAwaitsFinished(std::uint64_t serial) {
+    std::lock_guard lock(gpuStoresMutex);
+    awaitIndices.erase(serial);
+    for (auto found = trackedWaits.lower_bound({serial, 0}); found != trackedWaits.end() && found->first.first == serial;) {
+        if (found->second.stage != WaitStage::Unpassed) {
+            ++found;
+            continue;
+        }
+        forgetWait(found->first, found->second.wait);
+        found = trackedWaits.erase(found);
+    }
+}
+
+bool FrameRecorder::anchors(const DriverDetail::AwaitedDword& wait, std::uint64_t serial) const {
+    std::array<const WaitedDword*, 2> parts{};
+    for (std::size_t part = 0; part < (wait.bytes == 8 ? 2u : 1u); ++part) {
+        const auto found = waitedDwords.find(wait.address + 4 * part);
+        if (found == waitedDwords.end()) return false;
+        parts[part] = &found->second;
+    }
+    std::uint64_t value = 0;
+    std::uint64_t before = 0;
+    for (std::size_t part = 0; part < parts.size() && parts[part] != nullptr; ++part) {
+        value |= std::uint64_t{parts[part]->value} << (32 * part);
+        before |= std::uint64_t{parts[part]->before} << (32 * part);
+    }
+    if (wait.kind == DriverDetail::AwaitKind::Semaphore) {
+        const bool counted = std::all_of(parts.begin(), parts.end(), [&](const WaitedDword* dword) { return dword != nullptr && dword->noteSerial == serial && dword->beforeKnown && dword->known; });
+        return counted && before != 0 && value == before - 1;
+    }
+    return std::all_of(parts.begin(), parts.end(), [](const WaitedDword* dword) { return dword == nullptr || dword->known; }) && DriverDetail::AwaitedAccepts(wait, value);
+}
+
+void FrameRecorder::forgetWait(WaitKey key, const DriverDetail::AwaitedDword& wait) {
+    for (auto address = wait.address; address < wait.address + std::max<std::uint64_t>(wait.bytes, 4); address += 4) {
+        const auto dword = waitedDwords.find(address);
+        if (dword == waitedDwords.end()) continue;
+        std::erase(dword->second.waits, key);
+        if (dword->second.waits.empty()) waitedDwords.erase(dword);
+    }
+}
+
+void FrameRecorder::judgeWaits(std::uint64_t address, std::span<const std::byte> bytes, std::span<const std::pair<std::size_t, std::size_t>> runs, std::span<const std::pair<std::uint64_t, std::uint64_t>> skipped, std::uint64_t readStart, WaitVerdicts& verdicts) {
+    const auto end = address + bytes.size();
+    std::lock_guard lock(gpuStoresMutex);
+    const auto first = waitedDwords.lower_bound(address);
+    if (first == waitedDwords.end() || first->first >= end) return;
+    const auto readable = [&](std::uint64_t dword) {
+        return dword >= address && dword + 4 <= end && std::none_of(skipped.begin(), skipped.end(), [&](const auto& range) { return dword < range.first + range.second && range.first < dword + 4; });
+    };
+    const auto valueAt = [&](std::uint64_t dword) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, bytes.data() + (dword - address), sizeof(value));
+        return value;
+    };
+    const auto restored = [&](std::uint64_t dword) {
+        const auto offset = dword - address;
+        return std::any_of(runs.begin(), runs.end(), [&](const auto& run) { return offset < run.first + run.second && run.first < offset + 4; });
+    };
+    std::vector<WaitKey> judged;
+    std::vector<WaitKey> done;
+    for (auto dword = first; dword != waitedDwords.end() && dword->first < end; ++dword) {
+        for (const auto& key : dword->second.waits) {
+            if (std::find(judged.begin(), judged.end(), key) != judged.end()) continue;
+            judged.push_back(key);
+            auto& tracked = trackedWaits.at(key);
+            if (tracked.stage == WaitStage::Unpassed || tracked.passSequence > readStart) continue;
+            const auto& wait = tracked.wait;
+            std::uint64_t value = 0;
+            bool visible = true;
+            bool included = false;
+            for (std::size_t part = 0; part < (wait.bytes == 8 ? 2u : 1u) && visible; ++part) {
+                const auto at = wait.address + 4 * part;
+                visible = readable(at);
+                if (!visible) continue;
+                value |= std::uint64_t{valueAt(at)} << (32 * part);
+                included = included || restored(at);
+            }
+            if (!visible) continue;
+            const auto serial = key.first;
+            const auto floored = [&] {
+                verdicts.floor = std::max(verdicts.floor, serial);
+                verdicts.floorEvent = std::max(verdicts.floorEvent, tracked.passSequence);
+            };
+            const auto lost = [&] {
+                if ((verdicts.flags & FrameFloorFlag::WaitValueLost) == 0) {
+                    verdicts.lostSerial = serial;
+                    verdicts.lostDword = wait.address;
+                }
+                verdicts.flags |= FrameFloorFlag::WaitValueLost;
+                done.push_back(key);
+            };
+            if (wait.kind == DriverDetail::AwaitKind::Semaphore) {
+                if (!tracked.anchored) {
+                    lost();
+                    continue;
+                }
+                if (included) floored();
+                done.push_back(key);
+                continue;
+            }
+            const bool satisfied = DriverDetail::AwaitedAccepts(wait, value);
+            if (tracked.stage == WaitStage::Visible || tracked.anchored) {
+                if (satisfied) {
+                    tracked.stage = WaitStage::Visible;
+                    continue;
+                }
+                if (included) floored();
+                done.push_back(key);
+                continue;
+            }
+            if (!satisfied || !included) {
+                lost();
+                continue;
+            }
+            if (serial < verdicts.neededSerial) {
+                verdicts.neededSerial = serial;
+                verdicts.neededDword = wait.address;
+            }
+            verdicts.neededPass = std::min(verdicts.neededPass, tracked.passSequence);
+            tracked.stage = WaitStage::Visible;
+        }
+    }
+    for (auto dword = first; dword != waitedDwords.end() && dword->first < end; ++dword) {
+        if (!readable(dword->first)) continue;
+        dword->second.value = valueAt(dword->first);
+        dword->second.known = true;
+        dword->second.beforeKnown = false;
+    }
+    for (const auto& key : done) {
+        const auto found = trackedWaits.find(key);
+        forgetWait(key, found->second.wait);
+        trackedWaits.erase(found);
+    }
 }
 
 void FrameRecorder::forgetGpuStores(std::uint64_t begin, std::uint64_t end) {
@@ -1034,8 +1277,10 @@ void FrameRecorder::snapshot(const Range& range) {
     }
 }
 
-void FrameRecorder::readGuest(std::uint64_t address, std::span<std::byte> bytes) {
-    hostOnlySampleBytes += ReadAroundRanges(address, bytes, Graphics::HostOnlySampleRanges(address, bytes.size()), GuestMemory::ReadCommitted);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> FrameRecorder::readGuest(std::uint64_t address, std::span<std::byte> bytes) {
+    auto skipped = Graphics::HostOnlySampleRanges(address, bytes.size());
+    hostOnlySampleBytes += ReadAroundRanges(address, bytes, skipped, GuestMemory::ReadCommitted);
+    return skipped;
 }
 
 bool FrameRecorder::abandonIfDiskLow() {
@@ -1088,6 +1333,14 @@ void FrameRecorder::start() {
     writer = std::make_unique<FrameCaptureWriter>(directory);
     notingGpuStores = true;
     finishedWaitDwords.clear();
+    {
+        std::lock_guard lock(gpuStoresMutex);
+        waitedDwords.clear();
+        trackedWaits.clear();
+        awaitIndices.clear();
+    }
+    multiQueue = false;
+    waitWarnings = 0;
     driver.TrackAwaitedDwords(true);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     for (const auto& range : ranges) {

@@ -309,7 +309,7 @@ void Driver::execute(const Submission& submission) {
                 ++waitOutcomes().fromRecorderSameQueue;
                 gateOpened() = true;
                 noteLabelPass(packet, submission.queue);
-                passAwaited(submission, packet);
+                passAwaited(submission, packet, *value);
                 recent.Record(cursor);
                 cursor = nextCursor;
                 continue;

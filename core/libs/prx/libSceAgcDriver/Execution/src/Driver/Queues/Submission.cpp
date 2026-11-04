@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -459,6 +460,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
             passAwaitedLocked(stalled.serial, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));
             auto& waits = unfinishedWaits[tail.serial];
             waits.insert(waits.end(), tail.awaitedDwords.begin(), tail.awaitedDwords.end());
+            FrameRecorder::NoteTailAwaits(tail.serial, tail.awaitedDwords);
         }
         tail.received = ++eventSerial;
         const auto& waiting = workers[tail.queue].pending;
@@ -697,6 +699,7 @@ void Driver::enqueue(Submission submission) {
     for (const auto dword : submission.labelWrites) ++worker.unfinishedWrites[dword];
     if (awaitedTracking.load(std::memory_order_relaxed)) {
         if (!submission.awaitedDwords.empty()) unfinishedWaits[submission.serial] = submission.awaitedDwords;
+        FrameRecorder::NoteAwaits(submission.serial, submission.awaitedDwords);
         if (!submission.labelValues.empty()) unfinishedLabels[submission.serial] = {queue, std::move(submission.labelValues)};
     }
     worker.pending.push_back(std::move(submission));
@@ -778,25 +781,28 @@ void Driver::forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::ui
     }
 }
 
-void Driver::passAwaited(const Submission& submission, std::span<const std::uint32_t> packet) {
+void Driver::passAwaited(const Submission& submission, std::span<const std::uint32_t> packet, std::optional<std::uint64_t> pendingLabel) {
     if (!awaitedTracking.load(std::memory_order_relaxed)) return;
     const auto awaited = decodeAwaited(packet);
     if (!awaited) return;
     std::lock_guard lock(mutex);
-    passAwaitedLocked(submission.serial, awaited->address);
+    passAwaitedLocked(submission.serial, awaited->address, pendingLabel);
 }
 
-void Driver::passAwaitedLocked(std::uint64_t serial, std::uint64_t address) {
+void Driver::passAwaitedLocked(std::uint64_t serial, std::uint64_t address, std::optional<std::uint64_t> pendingLabel) {
     const auto found = unfinishedWaits.find(serial);
     if (found == unfinishedWaits.end()) return;
-    for (auto& wait : found->second) {
+    for (std::size_t index = 0; index < found->second.size(); ++index) {
+        auto& wait = found->second[index];
         if (wait.passed || wait.address != address) continue;
         wait.passed = true;
+        FrameRecorder::NoteAwaitPassed(serial, index, pendingLabel);
         return;
     }
 }
 
 void Driver::finishAwaited(std::uint64_t serial) {
+    FrameRecorder::NoteAwaitsFinished(serial);
     unfinishedLabels.erase(serial);
     const auto found = unfinishedWaits.find(serial);
     if (found == unfinishedWaits.end()) return;
@@ -806,12 +812,21 @@ void Driver::finishAwaited(std::uint64_t serial) {
     unfinishedWaits.erase(found);
 }
 
+bool AwaitedAccepts(const AwaitedDword& wait, std::uint64_t value) {
+    switch (wait.kind) {
+    case AwaitKind::Semaphore: return value != 0;
+    case AwaitKind::Rewind: return (value & Pm4::RewindValid) != 0;
+    case AwaitKind::Wait: break;
+    }
+    return Pm4::WaitCompares(wait.function, wait.reference, wait.mask, wait.bytes == 4 ? value & 0xffffffffu : value);
+}
+
 bool Driver::gpuSatisfies(std::uint64_t serial, const AwaitedDword& wait) const {
     if (wait.kind == AwaitKind::Semaphore) return false;
     const auto accepts = [&](const LabelValue* low, const LabelValue* high) {
         if (low == nullptr || !low->known || (wait.bytes == 8 && (high == nullptr || !high->known))) return false;
         const std::uint64_t value = low->value | (wait.bytes == 8 ? static_cast<std::uint64_t>(high->value) << 32u : 0u);
-        return wait.kind == AwaitKind::Rewind ? (value & Pm4::RewindValid) != 0 : Pm4::WaitCompares(wait.function, wait.reference, wait.mask, value);
+        return AwaitedAccepts(wait, value);
     };
     if (wait.kind == AwaitKind::Wait) {
         const auto last = [](const std::vector<LabelValue>& labels, std::uint64_t dword) -> const LabelValue* {
