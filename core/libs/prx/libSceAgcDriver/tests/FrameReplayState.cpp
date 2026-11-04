@@ -7,6 +7,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <string_view>
 #include <barrier>
+#include <functional>
 #include <new>
 
 namespace {
@@ -18,6 +19,10 @@ constexpr std::uint32_t ReadWrite = 0x04;
 void check(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
 }
+
+struct Inconclusive : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 std::uint64_t address(const void* pointer) {
     return reinterpret_cast<std::uintptr_t>(pointer);
@@ -1611,6 +1616,272 @@ void testPacingSerials(const std::filesystem::path& directory) {
     check(replay.unfinished == 0 && replay.replaySerials == mapped, "the replay at depth did not map the suspend point and the submission to the replay serials they took");
 }
 
+void openDevice() {
+    try {
+        AgcDriverWaitForPipelineJournal_nid_postfix();
+    } catch (const std::exception& error) {
+        if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
+        throw Inconclusive(std::string("no usable Vulkan device: ") + error.what());
+    }
+}
+
+class Gate {
+public:
+    Gate(std::uint32_t* dword, std::function<bool()> arm, std::function<bool()> release)
+        : thread([this, dword, arm = std::move(arm), release = std::move(release)] {
+              const auto armBy = Clock::now() + std::chrono::seconds(5);
+              while (!arm()) {
+                  if (Clock::now() >= armBy) {
+                      std::atomic_ref<std::uint32_t>(*dword).store(1, std::memory_order_release);
+                      return;
+                  }
+                  std::this_thread::sleep_for(std::chrono::microseconds(50));
+              }
+              armed.store(true);
+              const auto openAt = Clock::now() + std::chrono::milliseconds(300);
+              while (!release() && Clock::now() < openAt) std::this_thread::sleep_for(std::chrono::microseconds(50));
+              std::atomic_ref<std::uint32_t>(*dword).store(1, std::memory_order_release);
+          }) {}
+    Gate(const Gate&) = delete;
+    Gate& operator=(const Gate&) = delete;
+    ~Gate() {
+        if (thread.joinable()) thread.join();
+    }
+
+    bool Armed() {
+        if (thread.joinable()) thread.join();
+        return armed.load();
+    }
+
+private:
+    std::atomic<bool> armed{false};
+    std::thread thread;
+};
+
+std::array<std::uint32_t, 7> waitPacket(const std::uint32_t* label) {
+    return {0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address(label)), static_cast<std::uint32_t>(address(label) >> 32u), 1u, 0xffffffffu, 4u};
+}
+
+void testPacingBound(const std::filesystem::path& directory) {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* gate = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* waiting = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    auto* nop = reinterpret_cast<std::uint32_t*>(bytes + 8192);
+    auto* cappedGate = reinterpret_cast<std::uint32_t*>(bytes + 12288);
+    auto* cappedWaiting = reinterpret_cast<std::uint32_t*>(bytes + 16384);
+    auto* probedGate = reinterpret_cast<std::uint32_t*>(bytes + 20480);
+    auto* probedWaiting = reinterpret_cast<std::uint32_t*>(bytes + 24576);
+    *gate = 0;
+    *cappedGate = 0;
+    *probedGate = 0;
+    const auto wait = waitPacket(gate);
+    const auto cappedWait = waitPacket(cappedGate);
+    const auto probedWait = waitPacket(probedGate);
+    std::copy(wait.begin(), wait.end(), waiting);
+    std::copy(cappedWait.begin(), cappedWait.end(), cappedWaiting);
+    std::copy(probedWait.begin(), probedWait.end(), probedWaiting);
+    std::copy(NopPacket.begin(), NopPacket.end(), nop);
+    FrameCaptureWriter writer(directory);
+    writer.WriteCall(depthFrameStart());
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.paceTimeout = std::chrono::seconds(2);
+    options.depth = depthProfile({{1, 1}, {3, 3}});
+    Replay replay{options, reader};
+    replay.recording = true;
+    constexpr auto Base = DepthBase;
+    const auto suspend = [](std::uint64_t ordinal, std::uint64_t taken) { return pacedCall(FrameCallKind::Suspend, ordinal, taken); };
+    const auto submit = [&](std::uint64_t ordinal, std::uint64_t taken) { return pacedCall(FrameCallKind::Submit, ordinal, taken, nop, NopPacket.size()); };
+    const std::array calls{suspend(1, Base + 1), pacedCall(FrameCallKind::Submit, 2, Base + 2, waiting, wait.size()), suspend(3, Base + 3), submit(4, Base + 4), suspend(5, Base + 5), submit(6, Base + 6)};
+    const auto behindGate = [](Replay& target, std::span<const FrameCall> window, std::uint32_t* label, std::uint64_t armAt) {
+        if (progress().first == 0) Replay::primeAcceptedSerial();
+        const auto base = progress().first;
+        check(std::atomic_ref<std::uint32_t>(*label).load() == 0, "the label the first submission waits on was already written");
+        Gate opener(label, [base, armAt] { return progress().first - base >= armAt; }, [] { return false; });
+        auto failure = windowFailure(target, window);
+        const bool armed = opener.Armed();
+        AgcDriverWaitIdle_nid_postfix();
+        return std::pair{failure, armed};
+    };
+    const auto [failure, armed] = behindGate(replay, calls, gate, 4);
+    check(failure.empty(), ("the replay of frames at the profile's bounds failed: " + failure).c_str());
+    check(armed, "the replay did not run ahead of a parked submission");
+    check(replay.paceTimeouts.load() == 0, ("the replay gave up pacing behind the parked submission instead of issuing within the profile's bounds (pace_timeouts " + std::to_string(replay.paceTimeouts.load()) + ")").c_str());
+    check(replay.census.size() == 2 && replay.census[0].issue.size() == 2 && replay.census[1].issue.size() == 2, "the replay did not sample the suspend point and the submission of frames 2 and 3, and only those");
+    for (std::size_t position = 0; position < replay.census.size(); ++position) {
+        const auto& issue = replay.census[position].issue;
+        const auto deepest = *std::max_element(issue.begin(), issue.end());
+        const auto bound = options.depth->bounds[position];
+        check(deepest <= bound, ("issue depth " + std::to_string(deepest) + " above the bound " + std::to_string(bound) + " at " + (position == 0 ? std::string("the suspend") : options.depth->names[position])).c_str());
+    }
+    check(replay.census[0].issue[0] == 1 && replay.census[1].issue[0] == 2, ("frame 2 started its suspend point at depth " + std::to_string(replay.census[0].issue[0]) + " and its submission at depth " + std::to_string(replay.census[1].issue[0]) + ", not 1 and 2 behind the parked submission").c_str());
+    check(replay.paceWaitedSeconds() >= 0.1, ("the wait of frame 3's suspend point for the parked submission was not counted: pacing waited " + std::to_string(replay.paceWaitedSeconds()) + " s").c_str());
+    check(replay.unfinished == 0, "the replay of frames at the profile's bounds did not finish");
+    auto cappedOptions = options;
+    cappedOptions.depthCap = 0;
+    Replay capped{cappedOptions, reader};
+    capped.recording = true;
+    auto entered = suspend(3, Base + 3);
+    entered.completed = Base + 1;
+    const std::array cappedCalls{suspend(1, Base + 1), pacedCall(FrameCallKind::Submit, 2, Base + 2, cappedWaiting, cappedWait.size()), entered, submit(4, Base + 4)};
+    const auto [cappedFailure, cappedArmed] = behindGate(capped, cappedCalls, cappedGate, 3);
+    check(cappedFailure.empty(), ("the replay at --depth-cap 0 waited for the parked submission at a suspend point the capture entered with that submission in flight: " + cappedFailure).c_str());
+    check(cappedArmed, "the replay at --depth-cap 0 did not start the suspend point the capture entered with one submission in flight while that submission was parked");
+    check(capped.census.size() == 2 && capped.census[0].issue == std::vector<std::uint64_t>{1} && capped.census[1].issue == std::vector<std::uint64_t>{0}, "at --depth-cap 0, frame 2 did not start its suspend point at the capture's depth 1 and its submission at depth 0");
+    check(capped.unfinished == 0, "the replay at --depth-cap 0 did not finish");
+    auto probedOptions = options;
+    probedOptions.depth = depthProfile({{3, 3}, {3, 3}});
+    probedOptions.depthProbe = 1;
+    Replay probed{probedOptions, reader};
+    probed.recording = true;
+    const std::array probedCalls{suspend(1, Base + 1), pacedCall(FrameCallKind::Submit, 2, Base + 2, probedWaiting, probedWait.size()), suspend(3, Base + 3), submit(4, Base + 4), suspend(5, Base + 5), submit(6, Base + 6)};
+    const auto [probedFailure, probedArmed] = behindGate(probed, probedCalls, probedGate, 3);
+    check(probedFailure.empty(), ("the replay at --depth-probe 1 failed: " + probedFailure).c_str());
+    check(probedArmed, "the replay at --depth-probe 1 did not run ahead of a parked submission");
+    check(probed.census.size() == 2 && probed.census[0].issue.size() == 2 && probed.census[1].issue.size() == 2, "the replay at --depth-probe 1 did not sample the suspend point and the submission of frames 2 and 3, and only those");
+    for (std::size_t position = 0; position < probed.census.size(); ++position) {
+        const auto& issue = probed.census[position].issue;
+        const auto deepest = *std::max_element(issue.begin(), issue.end());
+        check(deepest <= 1, ("issue depth " + std::to_string(deepest) + " above the probe 1 at " + (position == 0 ? std::string("the suspend") : probedOptions.depth->names[position])).c_str());
+    }
+    check(probed.unfinished == 0, "the replay at --depth-probe 1 did not finish");
+}
+
+void testPacingStall(const std::filesystem::path& directory) {
+    openDevice();
+    constexpr auto Base = DepthBase;
+    constexpr std::size_t BusyPackets = 20000;
+    constexpr std::size_t BusyLabels = 512u * 1024u;
+    constexpr std::size_t LabelWords = 5;
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* gate = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* waiting = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    auto* nop = reinterpret_cast<std::uint32_t*>(bytes + 8192);
+    *gate = 0;
+    const auto wait = waitPacket(gate);
+    std::copy(wait.begin(), wait.end(), waiting);
+    std::copy(NopPacket.begin(), NopPacket.end(), nop);
+    auto* busy = allocate(std::size_t{1} << 20u);
+    auto* busyWords = reinterpret_cast<std::uint32_t*>(busy);
+    auto* labels = reinterpret_cast<std::uint32_t*>(busy + BusyLabels);
+    std::fill_n(labels, BusyPackets, 0u);
+    for (std::size_t index = 0; index < BusyPackets; ++index) {
+        const std::array<std::uint32_t, LabelWords> label{0xc0033700u, 0x00100500u, static_cast<std::uint32_t>(address(labels + index)), static_cast<std::uint32_t>(address(labels + index) >> 32u), 1u};
+        std::copy(label.begin(), label.end(), busyWords + index * LabelWords);
+    }
+    auto* const lastLabel = labels + BusyPackets - 1;
+    const std::uint32_t restoredLabel = 2;
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(lastLabel), std::as_bytes(std::span(&restoredLabel, 1)));
+    writer.WriteCall(depthFrameStart());
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    const auto suspend = [](std::uint64_t ordinal, std::uint64_t taken) { return pacedCall(FrameCallKind::Suspend, ordinal, taken); };
+    const auto submit = [&](std::uint64_t ordinal, std::uint64_t taken) { return pacedCall(FrameCallKind::Submit, ordinal, taken, nop, NopPacket.size()); };
+    Options capOptions;
+    capOptions.release = false;
+    capOptions.paceTimeout = std::chrono::milliseconds(300);
+    capOptions.drainTimeout = std::chrono::milliseconds(300);
+    capOptions.busyTimeout = std::chrono::milliseconds(5000);
+    capOptions.depth = depthProfile({{2, 2}, {3, 3}});
+    capOptions.depthCap = 0;
+    Replay capped{capOptions, reader};
+    capped.recording = true;
+    const std::array parkedFrames{suspend(1, Base + 1), pacedCall(FrameCallKind::Submit, 2, Base + 2, waiting, wait.size()), suspend(3, Base + 3), submit(4, Base + 4)};
+    std::string stall;
+    try {
+        capped.runWindow(parkedFrames);
+    } catch (const std::runtime_error& error) {
+        stall = error.what();
+    }
+    std::atomic_ref<std::uint32_t>(*gate).store(1, std::memory_order_release);
+    AgcDriverWaitIdle_nid_postfix();
+    char blocked[64];
+    std::snprintf(blocked, sizeof(blocked), "; blocked on 0x%llx (", static_cast<unsigned long long>(address(gate)));
+    const auto expected = "frame replay: call 3 (suspend, position suspend) may start with at most 0 submissions in flight, but no queue runs and the serials stopped at " + std::to_string(capped.replayBase + 1) + "/" + std::to_string(capped.replayBase + 2) + blocked;
+    check(!stall.empty(), ("the replay at --depth-cap 0 went on past a submission parked on title memory instead of failing (pace_timeouts " + std::to_string(capped.paceTimeouts.load()) + ")").c_str());
+    check(stall.starts_with(expected), ("the stall at --depth-cap 0 did not fail with '" + expected + "': " + stall).c_str());
+    check(capped.paceTimeouts.load() == 0, "the replay at depth counted a pacing give-up");
+    Options settleOptions;
+    settleOptions.release = false;
+    settleOptions.drainTimeout = std::chrono::milliseconds(300);
+    settleOptions.busyTimeout = std::chrono::milliseconds(1);
+    settleOptions.depth = depthProfile({{2, 2}, {2, 2}});
+    Replay settling{settleOptions, reader};
+    settling.recording = true;
+    collectGroups(settling);
+    check(std::atomic_ref<std::uint32_t>(*lastLabel).load() == 0, "the last label of the busy submission was already written");
+    const std::array busyFrames{suspend(1, Base + 1), pacedCall(FrameCallKind::Submit, 2, Base + 2, busyWords, BusyPackets * LabelWords), depthRecord(3, 1), suspend(4, Base + 3), submit(5, Base + 4)};
+    const auto unsettled = windowFailure(settling, busyFrames);
+    const auto last = std::atomic_ref<std::uint32_t>(*lastLabel).load(std::memory_order_acquire);
+    if (unsettled.empty()) {
+        if (last == restoredLabel) throw Inconclusive("the busy submission had finished before the replay reached the memory delta after it");
+        throw std::runtime_error("the replay at depth restored a memory delta while the busy submission before it still ran, without settling");
+    }
+    check(unsettled == "frame replay: memory delta at call 3 is restored with nothing running or every busy queue parked on title memory, but the replay did not settle within 1 ms", ("the replay at depth did not fail at the memory delta it could not settle: " + unsettled).c_str());
+    check(last == 1, "the busy submission did not store its last label, or the replay restored the memory delta over it");
+}
+
+void testPacingFailure(const std::filesystem::path& directory) {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* gate = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* waiting = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    auto* nop = reinterpret_cast<std::uint32_t*>(bytes + 8192);
+    *gate = 0;
+    const auto wait = waitPacket(gate);
+    std::copy(wait.begin(), wait.end(), waiting);
+    std::copy(NopPacket.begin(), NopPacket.end(), nop);
+    FrameCaptureWriter writer(directory);
+    writer.WriteCall(depthFrameStart());
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.paceTimeout = std::chrono::seconds(2);
+    options.depth = depthProfile({{2, 2}, {3, 3}});
+    options.depthCap = 0;
+    Replay replay{options, reader};
+    replay.recording = true;
+    constexpr auto Base = DepthBase;
+    const std::array calls{pacedCall(FrameCallKind::Suspend, 1, Base + 1), pacedCall(FrameCallKind::Submit, 2, Base + 2, waiting, wait.size()), pacedCall(FrameCallKind::Suspend, 3, Base + 3), pacedCall(FrameCallKind::Submit, 4, Base + 4, nop, NopPacket.size())};
+    if (progress().first == 0) Replay::primeAcceptedSerial();
+    const auto base = progress().first;
+    const auto parked = [&] {
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        return std::any_of(awaited.begin(), awaited.begin() + static_cast<std::ptrdiff_t>(count), [&](const AgcDriver::AwaitedWait& slot) { return slot.address == address(gate); });
+    };
+    std::atomic<bool> reported{false};
+    std::thread failing([&] {
+        const auto deadline = Clock::now() + std::chrono::seconds(5);
+        while (progress().first - base < 2 || !parked()) {
+            if (Clock::now() >= deadline) return;
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        AgcDriverReportFailure_nid_postfix(std::make_exception_ptr(std::runtime_error("depth driver failure")));
+        reported.store(true);
+    });
+    std::string failure;
+    try {
+        replay.runWindow(calls);
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    failing.join();
+    if (!reported.load()) {
+        std::atomic_ref<std::uint32_t>(*gate).store(1, std::memory_order_release);
+        throw std::runtime_error("the submission before the second suspend point did not park on its unwritten label: " + failure);
+    }
+    check(failure == "depth driver failure", ("a driver failure while a call waited at depth did not end the replay with the driver's error: " + failure).c_str());
+    bool rethrown = false;
+    try { AgcDriverShutdown_nid_postfix(); }
+    catch (const std::runtime_error& error) { rethrown = std::string_view(error.what()) == "depth driver failure"; }
+    check(rethrown, "the injected driver failure was not propagated at shutdown");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1648,10 +1919,22 @@ int main(int argc, char** argv) {
         else if (mode == "pacing_profile") testPacingProfile(directory);
         else if (mode == "pacing_template") testPacingTemplate(directory);
         else if (mode == "pacing_serials") testPacingSerials(directory);
+        else if (mode == "pacing_bound") testPacingBound(directory);
+        else if (mode == "pacing_stall") testPacingStall(directory);
+        else if (mode == "pacing_failure") testPacingFailure(directory);
         else throw std::runtime_error("unknown test");
-        if (mode != "reservation_failure" && mode != "gate_failure") AgcDriverShutdown_nid_postfix();
+        if (mode != "reservation_failure" && mode != "gate_failure" && mode != "pacing_failure") AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");
         return 0;
+    } catch (const Inconclusive& error) {
+        std::printf("skipped, %s\n", error.what());
+        try {
+            AgcDriverShutdown_nid_postfix();
+        } catch (const std::exception& shutdown) {
+            std::fprintf(stderr, "FAILED shutdown: %s\n", shutdown.what());
+            return 1;
+        }
+        return 77;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         try { AgcDriverShutdown_nid_postfix(); } catch (...) {}
