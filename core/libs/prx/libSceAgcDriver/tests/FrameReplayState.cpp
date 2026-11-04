@@ -591,6 +591,232 @@ void testRewindBreaker(const std::filesystem::path& directory, bool previous) {
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
 }
 
+std::vector<std::byte> distinctBytes(std::size_t count, std::uint32_t seed) {
+    std::vector<std::byte> bytes(count);
+    for (std::size_t index = 0; index < count; ++index) bytes[index] = static_cast<std::byte>((seed + index % 251u + index / 4096u * 7u) & 0xffu);
+    return bytes;
+}
+
+std::vector<std::byte> dwordBytes(std::initializer_list<std::uint32_t> values, std::size_t lead = 0) {
+    std::vector<std::byte> bytes(lead, std::byte{0xa5});
+    for (const auto value : values) {
+        const auto at = bytes.size();
+        bytes.resize(at + sizeof(value));
+        std::memcpy(bytes.data() + at, &value, sizeof(value));
+    }
+    return bytes;
+}
+
+std::uint32_t dwordAt(const std::byte* bytes) {
+    std::uint32_t value = 0;
+    std::memcpy(&value, bytes, sizeof(value));
+    return value;
+}
+
+void testDecodeWindow(const std::filesystem::path& directory) {
+    constexpr std::size_t Chunk = FrameCaptureWriter::ChunkBytes;
+    constexpr std::size_t Size = 10 * Chunk;
+    auto* bytes = allocate(Size);
+    std::fill_n(bytes, Size, std::byte{0x5a});
+    std::vector<std::byte> expected(bytes, bytes + Size);
+    std::uint64_t restored = 0;
+    FrameCaptureWriter writer(directory);
+    const auto delta = [&](std::size_t offset, std::size_t count, std::uint32_t seed) {
+        const auto payload = distinctBytes(count, seed);
+        writer.WriteDelta(1, 0, address(bytes + offset), payload);
+        std::copy(payload.begin(), payload.end(), expected.begin() + static_cast<std::ptrdiff_t>(offset));
+        restored += count;
+    };
+    delta(1, 3, 1);
+    delta(5, 9 * Chunk + 6, 2);
+    delta(105, 4096, 3);
+    delta(4101, 200, 4);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    check(reader.Chunks().size() == 13, "the synthetic capture does not hold the thirteen chunks of its memory group");
+    Options options;
+    options.release = false;
+    Replay replay{options, reader};
+    collectGroups(replay);
+    replay.execute(memoryCall(1, 1));
+    check(replay.deltaBytes.load() == restored, "the replay did not count every byte of a memory group of more than 32 MiB");
+    check(std::equal(expected.begin(), expected.end(), bytes), "a memory group of more than 32 MiB was not restored chunk by chunk in file order");
+}
+
+void testDecodeRewinds(const std::filesystem::path& directory) {
+    constexpr std::size_t Chunk = FrameCaptureWriter::ChunkBytes;
+    constexpr std::uint32_t Rewind = 0xc0005900u;
+    auto* filler = allocate(8 * Chunk);
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    std::vector<std::byte> expected(bytes, bytes + FrameCaptureWriter::BlockBytes);
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(filler), std::vector<std::byte>(7 * Chunk, std::byte{0x11}));
+    writer.WriteDelta(1, 0, address(filler + 7 * Chunk), std::vector<std::byte>(Chunk - 64, std::byte{0x11}));
+    const auto delta = [&](std::size_t offset, const std::vector<std::byte>& payload) {
+        writer.WriteDelta(1, 0, address(bytes + offset), payload);
+        std::copy(payload.begin(), payload.end(), expected.begin() + static_cast<std::ptrdiff_t>(offset));
+    };
+    delta(0x100, dwordBytes({0, Rewind, 0x80000011u, 0, Rewind, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}));
+    delta(0x10c, dwordBytes({Rewind, 0x80000066u, 0x80000077u, 0, 0, 0, 0, 0, Rewind, Rewind, 0x80000088u}));
+    delta(0x200, dwordBytes({Rewind, 0x80000099u}));
+    delta(0x301, dwordBytes({Rewind, 0x800000aau}, 3));
+    delta(0x400, dwordBytes({0, Rewind}));
+    delta(0x408, dwordBytes({0x800000bbu, 0}));
+    delta(0x108, dwordBytes({0x101, 0, 0x202, 0x303, 0, 0, 0, 0, 0, 0, 0x404, 0x505}));
+    delta(0x204, dwordBytes({0x606}));
+    delta(0x308, dwordBytes({0x707}));
+    delta(0x408, dwordBytes({0x808}));
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    check(reader.Chunks().size() == 18, "the synthetic capture does not hold the eighteen chunks of its memory group");
+    Options options;
+    options.release = false;
+    Replay replay{options, reader};
+    collectGroups(replay);
+    replay.execute(memoryCall(1, 1));
+    check(dwordAt(bytes + 0x108) == 0x80000011u, "a REWIND control word was released before a chunk 32 MiB later in its group wrote over it");
+    check(dwordAt(bytes + 0x204) == 0x80000099u, "a REWIND control word after a header in a chunk's first dword was not released after the rest of its group");
+    check(dwordAt(bytes + 0x308) == 0x800000aau, "a REWIND control word after a header in the first whole dword of an unaligned chunk was not released after the rest of its group");
+    check(dwordAt(bytes + 0x110) == 0x80000066u, "a REWIND control word after a header in its own chunk was not released after the rest of its group");
+    check(dwordAt(bytes + 0x114) == 0x80000077u, "a REWIND control word after a control word whose kept guest dword, restored 32 MiB earlier in the group, is a REWIND header was not released after the rest of its group");
+    check(dwordAt(bytes + 0x130) == Rewind && dwordAt(bytes + 0x134) == 0x505u, "a dword after a REWIND control word was held as a control word although the guest dword kept for that control word is no REWIND header");
+    check(dwordAt(bytes + 0x408) == 0x808u, "a dword was held as a REWIND control word for a header at the end of the chunk before it");
+    for (const auto& [offset, value] : std::initializer_list<std::pair<std::size_t, std::uint32_t>>{{0x108, 0x80000011u}, {0x110, 0x80000066u}, {0x114, 0x80000077u}, {0x130, Rewind}, {0x204, 0x80000099u}, {0x308, 0x800000aau}}) {
+        std::memcpy(expected.data() + offset, &value, sizeof(value));
+    }
+    check(std::equal(expected.begin(), expected.end(), bytes), "the memory group with REWIND control words was not restored as recorded");
+    check(std::all_of(filler, filler + 8 * Chunk - 64, [](std::byte value) { return value == std::byte{0x11}; }), "the first 32 MiB of the memory group were not restored");
+}
+
+void testDecodeParked(const std::filesystem::path& directory) {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    std::array<std::uint32_t*, 2> commands{};
+    std::array<std::uint32_t*, 2> labels{};
+    for (std::size_t round = 0; round < commands.size(); ++round) {
+        commands[round] = reinterpret_cast<std::uint32_t*>(bytes + round * 8192);
+        labels[round] = reinterpret_cast<std::uint32_t*>(bytes + round * 8192 + 4096);
+        *labels[round] = 0;
+        const std::array<std::uint32_t, 7> rewound{0xc0005900u, 0u, 0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(address(labels[round])), static_cast<std::uint32_t>(address(labels[round]) >> 32u), 1u};
+        std::copy(rewound.begin(), rewound.end(), commands[round]);
+    }
+    const std::uint32_t valid = AgcDriver::Pm4::RewindValid;
+    const std::uint32_t cleared = 0;
+    std::vector<std::byte> unaligned(reinterpret_cast<const std::byte*>(commands[0] + 1) - 3, reinterpret_cast<const std::byte*>(commands[0] + 1));
+    unaligned.resize(unaligned.size() + sizeof(valid));
+    std::memcpy(unaligned.data() + 3, &valid, sizeof(valid));
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(commands[0] + 1) - 3, unaligned);
+    writer.WriteDelta(1, 0, address(commands[0] + 1), std::as_bytes(std::span(&cleared, 1)));
+    writer.WriteDelta(2, 0, address(commands[1] + 1), std::as_bytes(std::span(&valid, 1)));
+    writer.WriteDelta(2, 0, address(commands[1] + 1), std::as_bytes(std::span(&cleared, 1)));
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    Replay replay{options, reader};
+    collectGroups(replay);
+    auto output = std::make_shared<ReplayOutput>(replay.frames);
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    for (std::size_t round = 0; round < commands.size(); ++round) {
+        auto* const control = commands[round] + 1;
+        AgcDriverSubmitGraphics_nid_postfix(commands[round], 7);
+        const auto parked = [&] {
+            std::array<AgcDriver::AwaitedWait, 64> awaited{};
+            const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+            return std::any_of(awaited.begin(), awaited.begin() + static_cast<std::ptrdiff_t>(count), [&](const AgcDriver::AwaitedWait& slot) { return slot.address == address(control) && Replay::rewindWait(slot); });
+        };
+        const auto deadline = Clock::now() + std::chrono::seconds(10);
+        while (!parked()) {
+            check(Clock::now() < deadline, "the submission did not park at its unreleased REWIND");
+            std::this_thread::yield();
+        }
+        replay.execute(memoryCall(round + 1, 1));
+        check(std::atomic_ref<std::uint32_t>(*control).load() == valid, round == 0 ? "the control word of a parked REWIND, restored from the first whole dword of an unaligned chunk, was not released after the rest of its group" : "the control word of a parked REWIND, restored from the first dword of a chunk, was not released after the rest of its group");
+        while (std::atomic_ref<std::uint32_t>(*labels[round]).load() != 1) {
+            check(Clock::now() < deadline + std::chrono::seconds(10), "the parked REWIND did not run its tail once its memory group was restored");
+            std::this_thread::yield();
+        }
+    }
+    check(replay.deltaBytes.load() == 19, "the replay did not restore every chunk of the parked REWIND groups");
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+}
+
+void testDecodeFailure(const std::filesystem::path& directory) {
+    constexpr std::uint32_t Rewind = 0xc0005900u;
+    constexpr std::uint32_t Old = 0x0badf00du;
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    for (std::size_t offset = 0; offset < 0x100; offset += sizeof(Old)) std::memcpy(bytes + offset, &Old, sizeof(Old));
+    {
+        FrameCaptureWriter writer(directory);
+        writer.WriteDelta(1, 0, address(bytes), dwordBytes({Rewind, 0x80000011u, 0x12345678u, 0x9abcdef0u}));
+        writer.WriteDelta(1, 0, address(bytes + 0x40), dwordBytes({1, 2, 3, 4}));
+        writer.WriteDelta(1, 0, address(bytes + 0x80), dwordBytes({5, 6, 7, 8}));
+        writer.Finish("{}");
+    }
+    {
+        const FrameCaptureReader written(directory);
+        check(written.Chunks().size() == 3, "the synthetic capture does not hold the three chunks of its memory group");
+        std::fstream memory(directory / FrameCaptureWriter::MemoryName, std::ios::binary | std::ios::in | std::ios::out);
+        memory.seekp(static_cast<std::streamoff>(written.Chunks()[1].offset));
+        const std::array<char, 4> zeros{};
+        memory.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+        check(memory.good(), "cannot corrupt the second chunk of the synthetic capture");
+    }
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    Replay replay{options, reader};
+    collectGroups(replay);
+    std::string failure;
+    try {
+        replay.execute(memoryCall(1, 1));
+    } catch (const std::runtime_error& error) {
+        failure = error.what();
+    }
+    check(failure.starts_with("frame capture: zstd: "), "the replay did not fail the memory group with the corrupt chunk's own decompression error");
+    check(dwordAt(bytes) == Rewind && dwordAt(bytes + 8) == 0x12345678u && dwordAt(bytes + 12) == 0x9abcdef0u, "the chunk before the corrupt chunk of the failed group was not restored");
+    check(dwordAt(bytes + 4) == Old, "the REWIND control word in the chunk before the corrupt chunk did not keep its guest dword when the group failed");
+    for (std::size_t offset = 0x40; offset < 0x100; offset += sizeof(Old)) check(dwordAt(bytes + offset) == Old, "the corrupt chunk or a chunk after it was restored");
+    check(replay.deltaBytes.load() == 16, "the failed group did not count only the chunk before its corrupt chunk");
+}
+
+void testDecodePool() {
+    DecodePool pool;
+    std::vector<std::exception_ptr> failures;
+    if (pool.Participants() >= 2) {
+        std::atomic<std::size_t> arrived{0};
+        std::atomic<std::size_t> met{0};
+        pool.Run(2, [&](std::size_t) {
+            ++arrived;
+            const auto deadline = Clock::now() + std::chrono::seconds(10);
+            while (arrived.load() < 2 && Clock::now() < deadline) std::this_thread::yield();
+            if (arrived.load() == 2) ++met;
+        }, failures);
+        check(met.load() == 2, "the two decode tasks of one window did not run at the same time");
+    }
+    std::array<std::atomic<std::size_t>, 8> started{};
+    std::atomic<std::size_t> finished{0};
+    pool.Run(started.size(), [&](std::size_t index) {
+        ++started[index];
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (index == 3) throw std::runtime_error("decode task 3 failed");
+        ++finished;
+    }, failures);
+    check(finished.load() == started.size() - 1, "the decode pool returned before every task of its window had finished");
+    check(std::all_of(started.begin(), started.end(), [](const std::atomic<std::size_t>& runs) { return runs.load() == 1; }), "a decode task did not run exactly once in a window with a failing task");
+    std::string failure;
+    try {
+        if (failures.size() == started.size() && failures[3] != nullptr) std::rethrow_exception(failures[3]);
+    } catch (const std::runtime_error& error) {
+        failure = error.what();
+    }
+    check(failure == "decode task 3 failed", "a failing decode task did not fail its window with its own error");
+    check(std::count(failures.begin(), failures.end(), nullptr) == 7, "a decode task that did not fail reported a failure");
+    std::atomic<std::size_t> ran{0};
+    pool.Run(5, [&](std::size_t) { ++ran; }, failures);
+    check(ran.load() == 5 && failures.size() == 5 && std::all_of(failures.begin(), failures.end(), [](const std::exception_ptr& entry) { return entry == nullptr; }), "the decode pool did not run every task of the window after a failed window");
+}
+
 void testSerialDiverged(const std::filesystem::path& directory) {
     constexpr std::uint64_t Base = 40;
     const char* dump = std::getenv("APS5_DUMP_SUBMITS");
@@ -3706,6 +3932,11 @@ int main(int argc, char** argv) {
         else if (mode == "serial_diverged") testSerialDiverged(directory);
         else if (mode == "serial_flip_in_order") testSerialFlipInOrder(directory);
         else if (mode == "flip_serial_neutral") testFlipSerialNeutral(directory);
+        else if (mode == "decode_window") testDecodeWindow(directory);
+        else if (mode == "decode_rewinds") testDecodeRewinds(directory);
+        else if (mode == "decode_parked") testDecodeParked(directory);
+        else if (mode == "decode_failure") testDecodeFailure(directory);
+        else if (mode == "decode_pool") testDecodePool();
         else if (mode == "environment") testColdPipelines();
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else if (mode == "shader_host_rewritten" || mode == "shader_host_restored" || mode == "shader_unaligned_restored") testDeltaPaths(directory, mode);

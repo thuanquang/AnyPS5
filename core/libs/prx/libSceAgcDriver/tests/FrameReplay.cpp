@@ -1749,7 +1749,7 @@ void testHoldDiagnostics(const std::filesystem::path& tool) {
     check(readFile(dump) == std::vector<std::byte>{std::byte{Stored}, std::byte{0}, std::byte{0}, std::byte{0}}, "the replay did not restore the CPU store into the unwatched block");
     const auto json = readFile(result);
     const std::string line(reinterpret_cast<const char*>(json.data()), json.size());
-    for (const char* field : {"\"memory_held_wait_s\":", "\"memory_in_flight_wait_s\":", "\"restore_s\":", "\"in_flight_mean\":"}) check(line.find(field) != std::string::npos, std::string("the replay JSON has no ") + field + " " + line);
+    for (const char* field : {"\"memory_held_wait_s\":", "\"memory_in_flight_wait_s\":", "\"restore_s\":", "\"restore_decode_s\":", "\"restore_decode_work_s\":", "\"restore_decode_threads\":", "\"in_flight_mean\":"}) check(line.find(field) != std::string::npos, std::string("the replay JSON has no ") + field + " " + line);
     check(line.find("\"in_flight_max\":2,") != std::string::npos, "the replay did not report the two submissions in flight behind the parked gate: " + line);
 }
 
