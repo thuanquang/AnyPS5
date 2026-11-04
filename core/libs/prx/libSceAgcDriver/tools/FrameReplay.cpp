@@ -206,6 +206,11 @@ void requireRecordedSerials(const FrameCaptureReader& reader) {
     }
 }
 
+std::optional<std::uint64_t> titleNs(const FrameCaptureReader& reader, const FrameCall& call) {
+    if (reader.Version() < AgcDriver::ExitCallsVersion || !AgcDriver::FrameTitleCall(call.kind) || call.previousExitNs == 0) return std::nullopt;
+    return call.timeNs - call.previousExitNs;
+}
+
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
     reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
 }
@@ -1333,6 +1338,13 @@ int run(const Options& options) {
     }
     const auto& calls = reader.Calls();
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
+    double titleSeconds = 0.0;
+    std::uint64_t titleUnknown = 0;
+    for (auto call = frameStart == calls.end() ? calls.end() : frameStart + 1; call != calls.end(); ++call) {
+        if (!AgcDriver::FrameTitleCall(call->kind)) continue;
+        if (const auto title = titleNs(reader, *call)) titleSeconds += static_cast<double>(*title) / 1e9;
+        else ++titleUnknown;
+    }
     for (auto call = calls.begin(); call != frameStart; ++call) replay.execute(*call);
     const auto journalStart = Clock::now();
     AgcDriverWaitForPipelineJournal_nid_postfix();
@@ -1405,7 +1417,7 @@ int run(const Options& options) {
         frames += measured.frames;
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"restore_s\":%.3f,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"restore_s\":%.3f,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"title_s\":%.3f,\"title_unknown\":%llu,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
@@ -1413,7 +1425,7 @@ int run(const Options& options) {
                 static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
-                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds);
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, titleSeconds, static_cast<unsigned long long>(titleUnknown), std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds);
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }

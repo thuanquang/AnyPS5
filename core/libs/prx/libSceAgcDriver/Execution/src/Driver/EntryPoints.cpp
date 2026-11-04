@@ -24,6 +24,7 @@ void Submit(const Packet* packet, std::uint32_t queue) try {
     const auto flips = driver.FlipSubmissions();
     recorder->Submit(*packet, queue, [&] { driver.Submit(packet, queue); });
     if (driver.FlipSubmissions() != flips) recorder->FrameBoundary();
+    recorder->Returned();
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
@@ -38,8 +39,10 @@ void Shutdown() {
 
 void RegisterShader(const Shader* shader) {
     const GuestMemory::StoreSerialScope titleCall(GuestMemory::TitleCallStoreSerial);
-    if (auto* const recorder = FrameRecorder::Active()) recorder->RegisterShader(shader);
+    auto* const recorder = FrameRecorder::Active();
+    if (recorder != nullptr) recorder->RegisterShader(shader);
     DriverDetail::Driver::Get().RegisterShader(shader);
+    if (recorder != nullptr) recorder->Returned();
 }
 
 void SuspendPoint() {
@@ -50,16 +53,21 @@ void SuspendPoint() {
         return;
     }
     recorder->Suspend([] { DriverDetail::Driver::Get().SuspendPoint(); });
+    recorder->Returned();
 }
 
 void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
-    if (auto* const recorder = FrameRecorder::Active()) recorder->RegisterVideoOutput(handle);
+    auto* const recorder = FrameRecorder::Active();
+    if (recorder != nullptr) recorder->RegisterVideoOutput(handle);
     DriverDetail::Driver::Get().RegisterVideoOutput(handle, output);
+    if (recorder != nullptr) recorder->Returned();
 }
 
 void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
-    if (auto* const recorder = FrameRecorder::Active()) recorder->UnregisterVideoOutput(handle);
+    auto* const recorder = FrameRecorder::Active();
+    if (recorder != nullptr) recorder->UnregisterVideoOutput(handle);
     DriverDetail::Driver::Get().UnregisterVideoOutput(handle, output);
+    if (recorder != nullptr) recorder->Returned();
 }
 
 void AttachWindow(const PresentationWindow& window) {
@@ -139,8 +147,13 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
 
 extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::FlipInfo& info) {
     const AgcDriver::GuestMemory::StoreSerialScope titleCall(AgcDriver::GuestMemory::TitleCallStoreSerial);
+    auto* const recorder = AgcDriver::FrameRecorder::Active();
+    const auto entered = recorder != nullptr ? recorder->ElapsedNs() : 0;
     const auto token = AgcDriver::DriverDetail::Driver::Get().ReserveEopFlip(info);
-    if (auto* const recorder = AgcDriver::FrameRecorder::Active(); recorder != nullptr && token != 0) recorder->ReserveEopFlip(info, token);
+    if (recorder != nullptr && token != 0) {
+        recorder->ReserveEopFlip(info, token, entered);
+        recorder->Returned();
+    }
     return token;
 }
 
@@ -194,6 +207,7 @@ extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info)
     }
     recorder->Flip(info, [&] { AgcDriver::DriverDetail::Driver::Get().SubmitFlip(info); });
     recorder->FrameBoundary();
+    recorder->Returned();
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
@@ -240,23 +254,29 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
 
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     const AgcDriver::GuestMemory::StoreSerialScope titleCall(AgcDriver::GuestMemory::TitleCallStoreSerial);
-    if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveShaderAbi(shader, context, primitive);
+    auto* const recorder = AgcDriver::FrameRecorder::Active();
+    if (recorder != nullptr) recorder->ResolveShaderAbi(shader, context, primitive);
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
+    if (recorder != nullptr) recorder->Returned();
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
     const AgcDriver::GuestMemory::StoreSerialScope titleCall(AgcDriver::GuestMemory::TitleCallStoreSerial);
-    if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsAbi(vertex, pixel, primitiveType);
+    auto* const recorder = AgcDriver::FrameRecorder::Active();
+    if (recorder != nullptr) recorder->ResolveGraphicsAbi(vertex, pixel, primitiveType);
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
+    if (recorder != nullptr) recorder->Returned();
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     const AgcDriver::GuestMemory::StoreSerialScope titleCall(AgcDriver::GuestMemory::TitleCallStoreSerial);
-    if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsStagesAbi(stages, context, primitive);
+    auto* const recorder = AgcDriver::FrameRecorder::Active();
+    if (recorder != nullptr) recorder->ResolveGraphicsStagesAbi(stages, context, primitive);
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
+    if (recorder != nullptr) recorder->Returned();
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }

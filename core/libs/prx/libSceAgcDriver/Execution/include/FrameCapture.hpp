@@ -35,11 +35,14 @@ enum class FrameCallKind : std::uint32_t {
 
 inline constexpr std::uint32_t InFlightDeltaFlag = 1;
 inline constexpr std::uint32_t InFlightCallsVersion = 2;
+inline constexpr std::uint32_t ExitCallsVersion = InFlightCallsVersion + 1;
+inline constexpr std::uint32_t CallsVersion = ExitCallsVersion;
 
 struct FrameCall {
     FrameCallKind kind = FrameCallKind::End;
     std::uint64_t ordinal = 0;
     std::uint64_t timeNs = 0;
+    std::uint64_t previousExitNs = 0;
     std::uint64_t thread = 0;
     std::uint64_t accepted = 0;
     std::uint64_t completed = 0;
@@ -81,13 +84,13 @@ public:
     static constexpr std::string_view CallsName = "calls.bin";
     static constexpr std::string_view MemoryName = "memory.bin";
     static constexpr std::string_view HeaderName = "capture.json";
-    static constexpr std::string_view CallsMagic = "aps5-frame-calls 2\n";
-    static constexpr std::string_view CallsMagicV1 = "aps5-frame-calls 1\n";
+    static constexpr std::string_view CallsMagicPrefix = "aps5-frame-calls ";
+    static constexpr std::string_view CallsMagic = "aps5-frame-calls 3\n";
     static constexpr std::string_view MemoryMagic = "aps5-frame-memory 1\n";
     static constexpr std::size_t BlockBytes = 64u * 1024u;
     static constexpr std::size_t ChunkBytes = 4u * 1024u * 1024u;
 
-    explicit FrameCaptureWriter(const std::filesystem::path& directory, int level = 1);
+    explicit FrameCaptureWriter(const std::filesystem::path& directory, int level = 1, std::uint32_t version = CallsVersion);
     FrameCaptureWriter(const FrameCaptureWriter&) = delete;
     FrameCaptureWriter& operator=(const FrameCaptureWriter&) = delete;
 
@@ -108,6 +111,7 @@ private:
 
     std::filesystem::path directory;
     int level;
+    std::uint32_t version;
     mutable std::mutex mutex;
     std::ofstream calls;
     std::ofstream memory;
@@ -138,6 +142,7 @@ private:
 };
 
 std::string_view FrameCallName(FrameCallKind kind);
+bool FrameTitleCall(FrameCallKind kind);
 bool AllZero(std::span<const std::byte> bytes);
 using GuestRead = void (*)(std::uint64_t address, std::span<std::byte> destination);
 std::uint64_t ReadAroundRanges(std::uint64_t address, std::span<std::byte> bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> skipped, GuestRead read);

@@ -70,6 +70,8 @@ constexpr std::size_t BlockBytes = 1u << 20;
 constexpr std::size_t CommandBytes = 64u * 1024u;
 constexpr std::size_t DataBytes = 4096;
 constexpr std::uint32_t Done = 1;
+constexpr auto SlowDriverCall = std::chrono::milliseconds(40);
+constexpr auto TitleWork = std::chrono::milliseconds(25);
 
 struct Inconclusive : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -102,6 +104,39 @@ public:
         if (!error) std::terminate();
     }
     std::atomic<int> ready = 0;
+};
+
+class SlowOutput final : public AgcDriver::IVideoOutput {
+public:
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override {
+        std::this_thread::sleep_for(SlowDriverCall);
+        return std::make_shared<Request>(ready);
+    }
+    void Fail(std::exception_ptr error) noexcept override {
+        if (!error) std::terminate();
+    }
+    std::atomic<int> ready = 0;
+};
+
+class SlowRequest final : public AgcDriver::IFlipRequest {
+public:
+    ~SlowRequest() override { std::this_thread::sleep_for(SlowDriverCall); }
+    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override {}
+    void Fail(std::exception_ptr error) noexcept override {
+        if (!error) std::terminate();
+    }
+};
+
+class SlowEopOutput final : public AgcDriver::IVideoOutput {
+public:
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override { return std::make_shared<SlowRequest>(); }
+    std::shared_ptr<AgcDriver::IFlipRequest> TryReserve(const AgcDriver::FlipInfo&) override {
+        std::this_thread::sleep_for(SlowDriverCall);
+        return std::make_shared<SlowRequest>();
+    }
+    void Fail(std::exception_ptr error) noexcept override {
+        if (!error) std::terminate();
+    }
 };
 
 struct Layout {
@@ -1970,14 +2005,112 @@ void testCarriedLabelKeepsSerial(const std::filesystem::path&) {
     requireSerial(later, accepted + 2, "the label of the next submission");
 }
 
+std::filesystem::path finishedCapture(const FrameCaptureReader& reader) {
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const auto& header = reader.Header();
+    check(!reader.Truncated() && header.find("stopped") == std::string::npos && header.find("\"frames\":2") != std::string::npos, "the capture of two frames did not end normally: " + header);
+    return directory;
+}
+
+std::string callName(const AgcDriver::FrameCall& call) {
+    return "call " + std::to_string(call.ordinal) + " (" + std::string(AgcDriver::FrameCallName(call.kind)) + ")";
+}
+
+const AgcDriver::FrameCall& recordedAfter(const FrameCaptureReader& reader, const AgcDriver::FrameCall& from, FrameCallKind kind) {
+    const auto& calls = reader.Calls();
+    const auto found = std::find_if(calls.begin(), calls.end(), [&](const auto& call) { return call.kind == kind && call.ordinal > from.ordinal; });
+    check(found != calls.end(), "the capture holds no " + std::string(AgcDriver::FrameCallName(kind)) + " after " + callName(from) + ": " + reader.Header());
+    return *found;
+}
+
+std::string replayReport(const std::filesystem::path& tool, const std::filesystem::path& capture) {
+    const auto report = capture / "report.json";
+    auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict > \"" + report.string() + "\"";
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+#endif
+    const auto code = std::system(command.c_str());
+    check(code == 0, "agc_frame_replay exited with " + std::to_string(code));
+    const auto bytes = readFile(report);
+    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+double jsonNumber(const std::string& text, const std::string& name) {
+    const auto key = "\"" + name + "\":";
+    const auto found = text.find(key);
+    check(found != std::string::npos, "the JSON has no number " + name + ": " + text);
+    return std::stod(text.substr(found + key.size()));
+}
+
+void testExitTimes(const std::filesystem::path& tool) {
+    constexpr std::uint64_t SlowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(SlowDriverCall).count();
+    constexpr std::uint64_t TitleNs = std::chrono::duration_cast<std::chrono::nanoseconds>(TitleWork).count();
+    constexpr std::uint64_t SleepSlackNs = 5000000;
+    const auto layout = allocate();
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto* const first = layout.secondCommands;
+    auto* const second = layout.secondCommands + 64;
+    auto output = std::make_shared<SlowOutput>();
+    auto eop = std::make_shared<SlowEopOutput>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle + 1, eop);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    submitLabel(first, layout.label + 1);
+    std::this_thread::sleep_for(TitleWork);
+    flip();
+    std::this_thread::sleep_for(TitleWork);
+    check(AgcDriverReserveEopFlip_nid_postfix(AgcDriver::FlipInfo{Handle + 1, 0, 1, 0}) != 0, "the slow output did not reserve the EOP flip");
+    std::this_thread::sleep_for(TitleWork);
+    AgcDriverUnregisterVideoOutput_nid_postfix(Handle + 1, eop);
+    std::this_thread::sleep_for(TitleWork);
+    submitLabel(second, layout.label + 2);
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    const auto capture = finishedCapture(reader);
+    const auto& header = reader.Header();
+    const auto& calls = reader.Calls();
+    const auto start = std::find_if(calls.begin(), calls.end(), [](const auto& call) { return call.kind == FrameCallKind::FrameStart; });
+    check(start != calls.end(), "the capture has no frame start: " + header);
+    const AgcDriver::FrameCall* previous = &*start;
+    for (auto call = start + 1; call != calls.end(); ++call) {
+        if (!AgcDriver::FrameTitleCall(call->kind)) continue;
+        check(call->previousExitNs != 0, callName(*call) + " after the frame start has no previous exit time: " + header);
+        check(previous->timeNs <= call->previousExitNs && call->previousExitNs <= call->timeNs, callName(*call) + " names the previous exit time " + std::to_string(call->previousExitNs) + " ns, outside the entry of " + callName(*previous) + " at " + std::to_string(previous->timeNs) + " ns and its own entry at " + std::to_string(call->timeNs) + " ns");
+        previous = &*call;
+    }
+    for (const auto& call : calls) {
+        if (!AgcDriver::FrameTitleCall(call.kind)) check(call.previousExitNs == 0, callName(call) + " is not a title call but carries the previous exit time " + std::to_string(call.previousExitNs) + " ns");
+    }
+    const auto& firstSubmit = submitted(reader, first);
+    const auto& flipped = recordedAfter(reader, firstSubmit, FrameCallKind::Flip);
+    const auto& reserved = recordedAfter(reader, firstSubmit, FrameCallKind::ReserveEopFlip);
+    const auto& unregistered = recordedAfter(reader, firstSubmit, FrameCallKind::UnregisterVideoOutput);
+    const auto& secondSubmit = submitted(reader, second);
+    check(flipped.timeNs - flipped.previousExitNs + SleepSlackNs >= TitleNs, callName(flipped) + " was entered " + std::to_string(flipped.timeNs - flipped.previousExitNs) + " ns after the submission before it returned, less than 20 of the title's 25 ms between them");
+    check(reserved.previousExitNs - flipped.timeNs + SleepSlackNs >= SlowNs, callName(flipped) + " returned " + std::to_string(reserved.previousExitNs - flipped.timeNs) + " ns after it was entered, so its exit was stamped before its output's 40 ms reservation");
+    check(unregistered.previousExitNs - reserved.timeNs + SleepSlackNs >= SlowNs, callName(reserved) + " returned " + std::to_string(unregistered.previousExitNs - reserved.timeNs) + " ns after it was entered, so its entry was stamped after the 40 ms the driver took to reserve the token");
+    check(secondSubmit.previousExitNs - unregistered.timeNs + SleepSlackNs >= SlowNs, callName(unregistered) + " returned " + std::to_string(secondSubmit.previousExitNs - unregistered.timeNs) + " ns after it was entered, so its exit was stamped before the driver dropped the 40 ms reservation");
+    const auto report = replayReport(tool, capture);
+    check(jsonNumber(report, "title_s") >= 0.1, "the replay reports less title time than the title's four 25 ms pauses: " + report);
+    check(jsonNumber(report, "title_unknown") == 0, "the replay counts title calls without a previous exit time: " + report);
+}
+
 }
 
 int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
-        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"flip_serial_start", testFlipSerialAtStart}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"host_page_restored", testHostPageRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}, {"wait64_after_read", testWait64AfterRead}, {"semaphore_after_read", testSemaphoreAfterRead}, {"rewind_after_read", testRewindAfterRead}, {"late_wait", testWaitAfterLastFrame}, {"wait_labelled_after", testWaitLabelledAfter}, {"wait_labelled_before", testWaitLabelledBefore}, {"wait_labelled_skipped", testWaitLabelledSkipped}, {"wait_labelled_elsewhere", testWaitLabelledElsewhere}, {"carried_label", testCarriedLabelKeepsSerial}};
+        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"flip_serial_start", testFlipSerialAtStart}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"host_page_restored", testHostPageRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}, {"wait64_after_read", testWait64AfterRead}, {"semaphore_after_read", testSemaphoreAfterRead}, {"rewind_after_read", testRewindAfterRead}, {"late_wait", testWaitAfterLastFrame}, {"wait_labelled_after", testWaitLabelledAfter}, {"wait_labelled_before", testWaitLabelledBefore}, {"wait_labelled_skipped", testWaitLabelledSkipped}, {"wait_labelled_elsewhere", testWaitLabelledElsewhere}, {"carried_label", testCarriedLabelKeepsSerial}, {"exit_times", testExitTimes}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|flip_serial_start|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|host_page_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read|late_wait|wait_labelled_after|wait_labelled_before|wait_labelled_skipped|wait_labelled_elsewhere|carried_label]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|flip_serial_start|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|host_page_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read|late_wait|wait_labelled_after|wait_labelled_before|wait_labelled_skipped|wait_labelled_elsewhere|carried_label|exit_times]\n");
         return 2;
     }
     int status = 0;
