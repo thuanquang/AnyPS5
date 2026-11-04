@@ -533,6 +533,7 @@ struct Replay {
     std::atomic<std::uint64_t> depthSamples{0};
     std::atomic<std::uint64_t> depthTotal{0};
     std::atomic<std::uint64_t> depthMax{0};
+    std::atomic<std::int64_t> memoryGpuWaitedNs{0};
     std::atomic<bool> stalled{false};
     std::atomic<std::uint64_t> stalledAt{0};
     std::atomic<std::uint64_t> earlyReleases{0};
@@ -720,6 +721,7 @@ struct Replay {
                 if (const auto accepted = progress().first; captureBase && accepted != mappedSerial(call.accepted)) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " was read in flight at capture serial " + std::to_string(call.accepted) + ", which maps to replay serial " + std::to_string(mappedSerial(call.accepted)) + ", but this replay had accepted " + std::to_string(accepted));
                 waitStarted(call);
                 memoryWaited(inFlightWaitedNs, began);
+                waitSettledOnGpu(call);
                 restoreGroup(call.values.at(0));
                 return;
             }
@@ -727,6 +729,7 @@ struct Replay {
             const SettledHold hold{pacing};
             memoryWaited(heldWaitedNs, began);
             if (!settled && options.strict) throw std::runtime_error("frame replay: the replay did not settle before memory delta " + std::to_string(call.ordinal));
+            if (pacing && settled) waitSettledOnGpu(call);
             restoreGroup(call.values.at(0));
             return;
         }
@@ -776,6 +779,13 @@ struct Replay {
         return wait.function == 0 && wait.bytes == 0;
     }
 
+    void waitSettledOnGpu(const FrameCall& call) {
+        const auto began = Clock::now();
+        const bool ran = AgcDriverWaitRecordedOnGpuFor_nid_postfix(options.busyTimeout.count());
+        memoryGpuWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+        if (!ran) throw std::runtime_error("frame replay: the GPU work recorded so far did not finish before memory delta " + std::to_string(call.ordinal));
+    }
+
     void restoreGroup(std::uint64_t group) {
         const auto found = groups.find(group);
         if (found == groups.end()) return;
@@ -787,24 +797,42 @@ struct Replay {
             if (rewindWait(awaited[slot])) parked.push_back(awaited[slot].address);
         }
         std::vector<std::pair<std::uint32_t*, std::uint32_t>> controls;
-        for (const auto* chunk : found->second) {
-            if (skipped.Overlaps(*chunk)) continue;
-            auto bytes = reader.Read(*chunk);
-            auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk->address));
-            for (auto at = static_cast<std::size_t>((4 - chunk->address % 4) % 4); at + 4 <= bytes.size(); at += 4) {
-                std::uint32_t value = 0;
-                std::memcpy(&value, bytes.data() + at, sizeof(value));
-                if ((value & AgcDriver::Pm4::RewindValid) == 0) continue;
-                std::uint32_t header = 0;
-                if (at >= 4) std::memcpy(&header, bytes.data() + at - 4, sizeof(header));
-                const bool rewind = (header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x59u;
-                if (!rewind && std::find(parked.begin(), parked.end(), chunk->address + at) == parked.end()) continue;
-                controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
-                std::memcpy(bytes.data() + at, target + at, sizeof(value));
+        const auto& chunks = found->second;
+        std::vector<std::pair<std::size_t, std::size_t>> runs;
+        for (std::size_t first = 0; first < chunks.size();) {
+            if (skipped.Overlaps(*chunks[first])) {
+                ++first;
+                continue;
             }
-            AgcDriverPrepareCommandWrite_nid_no_patch(chunk->address, static_cast<std::size_t>(chunk->bytes));
-            std::memcpy(target, bytes.data(), bytes.size());
-            deltaBytes += chunk->bytes;
+            auto last = first + 1;
+            auto end = chunks[first]->address + chunks[first]->bytes;
+            while (last < chunks.size() && chunks[last]->address == end && !skipped.Overlaps(*chunks[last])) {
+                end += chunks[last]->bytes;
+                ++last;
+            }
+            AgcDriverPrepareGuestStore_nid_postfix(chunks[first]->address, static_cast<std::size_t>(end - chunks[first]->address));
+            runs.emplace_back(first, last);
+            first = last;
+        }
+        for (const auto& [first, last] : runs) {
+            for (auto index = first; index < last; ++index) {
+                const auto* const chunk = chunks[index];
+                auto bytes = reader.Read(*chunk);
+                auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk->address));
+                for (auto at = static_cast<std::size_t>((4 - chunk->address % 4) % 4); at + 4 <= bytes.size(); at += 4) {
+                    std::uint32_t value = 0;
+                    std::memcpy(&value, bytes.data() + at, sizeof(value));
+                    if ((value & AgcDriver::Pm4::RewindValid) == 0) continue;
+                    std::uint32_t header = 0;
+                    if (at >= 4) std::memcpy(&header, bytes.data() + at - 4, sizeof(header));
+                    const bool rewind = (header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x59u;
+                    if (!rewind && std::find(parked.begin(), parked.end(), chunk->address + at) == parked.end()) continue;
+                    controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
+                    std::memcpy(bytes.data() + at, target + at, sizeof(value));
+                }
+                std::memcpy(target, bytes.data(), bytes.size());
+                deltaBytes += chunk->bytes;
+            }
         }
         for (const auto& [control, value] : controls) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
         restoredNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
@@ -821,6 +849,7 @@ struct Replay {
             std::memcpy(&value, bytes.data() + (wait.address - chunk->address), sizeof(value));
             if ((value & AgcDriver::Pm4::RewindValid) == 0 || !AgcDriverHoldSettled_nid_postfix(0)) return false;
             const SettledHold hold{true};
+            waitSettledOnGpu(call);
             restoreGroup(call.values.at(0));
             return true;
         }
@@ -1638,11 +1667,11 @@ int run(const Options& options) {
         frames += measured.frames;
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"restore_s\":%.3f,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f,\"flips_hashed\":%llu,\"flip_hash_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"memory_held_wait_s\":%.3f,\"memory_in_flight_wait_s\":%.3f,\"memory_gpu_wait_s\":%.3f,\"restore_s\":%.3f,\"in_flight_max\":%llu,\"in_flight_mean\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f,\"flips_hashed\":%llu,\"flip_hash_s\":%.3f}\n",
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
-                replay.paceWaitedSeconds(), Replay::secondsOf(replay.heldWaitedNs), Replay::secondsOf(replay.inFlightWaitedNs), Replay::secondsOf(replay.restoredNs), static_cast<unsigned long long>(replay.depthMax.load()), replay.depthMean(),
+                replay.paceWaitedSeconds(), Replay::secondsOf(replay.heldWaitedNs), Replay::secondsOf(replay.inFlightWaitedNs), Replay::secondsOf(replay.memoryGpuWaitedNs), Replay::secondsOf(replay.restoredNs), static_cast<unsigned long long>(replay.depthMax.load()), replay.depthMean(),
                 static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
