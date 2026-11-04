@@ -435,6 +435,10 @@ DepthPlan planDepth(std::span<const FrameCall> calls, const DepthProfile& profil
     return plan;
 }
 
+struct PositionCensus {
+    std::vector<std::uint64_t> issue;
+};
+
 void requireDepthOptions(const Options& options) {
     if (options.release) throw std::runtime_error("frame replay: --depth-profile needs --no-release: a replay at depth never writes recorded or synthesized values to release a wait");
 }
@@ -689,6 +693,7 @@ struct Replay {
     std::optional<DepthPlan> plan;
     std::span<const FrameCall> window;
     std::size_t current = 0;
+    std::vector<PositionCensus> census;
 
     struct SettledHold {
         bool held;
@@ -752,7 +757,9 @@ struct Replay {
     }
 
     void pace(const FrameCall& call) {
-        if (!options.pace || !recording || !paced(call.kind) || call.accepted < call.completed) return;
+        if (!options.pace || !recording || !paced(call.kind)) return;
+        if (plan) return paceAtDepth(call);
+        if (call.accepted < call.completed) return;
         if (stalled.load()) {
             if (progress().second == stalledAt.load()) return;
             stalled.store(false);
@@ -778,6 +785,27 @@ struct Replay {
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
+    }
+
+    std::uint64_t boundOf(std::size_t index) const {
+        const auto& call = window[index];
+        const auto recorded = call.accepted >= call.completed ? call.accepted - call.completed : 0;
+        const auto chosen = options.depthProbe ? *options.depthProbe : std::min(options.depth->bounds[plan->position[index]], options.depthCap.value_or(~std::uint64_t{0}));
+        return std::max(recorded, chosen);
+    }
+
+    void paceAtDepth(const FrameCall& call) {
+        const auto index = current;
+        const auto position = plan->position[index];
+        const auto bound = boundOf(index);
+        const auto accepted = progress().first;
+        const auto target = accepted > bound ? accepted - bound : 0;
+        const auto began = Clock::now();
+        awaitCompleted(target, began + options.busyTimeout, [&](const std::string& reason) {
+            return std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + std::string(AgcDriver::FrameCallName(call.kind)) + ", position " + options.depth->names[position] + ") may start with at most " + std::to_string(bound) + " submissions in flight, but " + reason);
+        });
+        paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+        if (plan->frame[index] >= 2) census[position].issue.push_back(accepted - progress().second);
     }
 
     void execute(const FrameCall& call) {
@@ -863,7 +891,7 @@ struct Replay {
             const bool settled = !pacing || AgcDriverHoldSettled_nid_postfix(stalled.load() && progress().second == stalledAt.load() ? 0 : options.busyTimeout.count());
             const SettledHold hold{pacing};
             memoryWaited(heldWaitedNs, began);
-            if (!settled && options.strict) throw std::runtime_error("frame replay: the replay did not settle before memory delta " + std::to_string(call.ordinal));
+            if (!settled && (options.strict || plan)) throw std::runtime_error(plan ? "frame replay: memory delta at call " + std::to_string(call.ordinal) + " is restored with nothing running or every busy queue parked on title memory, but the replay did not settle within " + std::to_string(options.busyTimeout.count()) + " ms" : "frame replay: the replay did not settle before memory delta " + std::to_string(call.ordinal));
             if (pacing && settled) waitSettledOnGpu(call);
             restoreGroup(call.values.at(0));
             return;
@@ -919,6 +947,23 @@ struct Replay {
                 throw blocked("no queue runs and the serials stopped at " + std::to_string(seen.second) + "/" + std::to_string(seen.first) + "; blocked on" + describeBlocked());
             }
             if (now >= limit) throw blocked("it did not complete within " + std::to_string(options.busyTimeout.count()) + " ms");
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+
+    template <typename TBlocked>
+    void awaitCompleted(std::uint64_t serial, Clock::time_point limit, TBlocked&& blocked) {
+        auto lastSeen = progress();
+        auto quietSince = Clock::now();
+        while (!AgcDriverSerialDone_nid_postfix(serial) || progress().second < serial) {
+            const auto now = Clock::now();
+            if (const auto seen = progress(); seen != lastSeen) {
+                lastSeen = seen;
+                quietSince = now;
+            } else if (now - quietSince >= options.paceTimeout && AgcDriverSettled_nid_postfix() && progress() == seen) {
+                throw blocked("no queue runs and the serials stopped at " + std::to_string(seen.second) + "/" + std::to_string(seen.first) + "; blocked on" + describeBlocked());
+            }
+            if (now >= limit) throw blocked("they did not complete within " + std::to_string(options.busyTimeout.count()) + " ms");
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
@@ -1144,7 +1189,9 @@ struct Replay {
             depthSamples.store(0);
             depthTotal.store(0);
             depthMax.store(0);
+            census.clear();
         }
+        if (plan) census.resize(options.depth->names.size());
         std::thread breaker([&] {
             if (!options.release) return;
             try {
@@ -1344,9 +1391,12 @@ int usage() {
                          "                      hashes every pass the same way and fails at the first flip whose hashes differ from <file>,\n"
                          "                      or when a pass presents another number of flips than <file> lists\n"
                          "  --depth-profile <file>\n"
-                         "                      refuses captured frames that are not one thread's suspend points, each followed by the queue 0\n"
-                         "                      submissions <file> (aps5-depth-profile 1) bounds, or whose calls do not take the serials the\n"
-                         "                      capture recorded; needs --no-release\n"
+                         "                      starts each suspend point and queue 0 submission of the captured frames once no more\n"
+                         "                      submissions are in flight than the bound <file> (aps5-depth-profile 1) gives its position, or\n"
+                         "                      than the capture had there, and fails once no queue runs for the pacing timeout; refuses\n"
+                         "                      captured frames that are not one thread's suspend points, each followed by the queue 0\n"
+                         "                      submissions <file> bounds, or whose calls do not take the serials the capture recorded;\n"
+                         "                      needs --no-release\n"
                          "  --depth-cap <n>     lowers every bound of the depth profile to at most n\n"
                          "  --depth-probe <n>   sets every bound of the depth profile to n, for sensitivity runs\n");
     return 2;
@@ -1774,8 +1824,16 @@ std::string depthJson(const Options& options, const Replay& replay) {
     const auto number = [](const std::optional<std::uint64_t>& value) { return value ? std::to_string(*value) : std::string("null"); };
     const auto name = profile.path.filename().u8string();
     std::string text = "{\"profile\":" + jsonText(std::string(name.begin(), name.end())) + ",\"cap\":" + number(options.depthCap) + ",\"probe\":" + number(options.depthProbe) + ",\"frames\":" + std::to_string(replay.plan ? replay.plan->frames : 0) + ",\"positions\":[";
+    const auto spread = [](std::vector<std::uint64_t> values) {
+        if (values.empty()) return std::string("null");
+        std::sort(values.begin(), values.end());
+        const auto at = [&](double fraction) { return std::to_string(values[std::min(values.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(values.size())))]); };
+        return "[" + std::to_string(values.front()) + "," + at(0.1) + "," + at(0.5) + "," + std::to_string(values.back()) + "]";
+    };
     for (std::size_t position = 0; position < profile.names.size(); ++position) {
-        text += std::string(position == 0 ? "" : ",") + "{\"position\":" + jsonText(profile.names[position]) + ",\"bound\":" + std::to_string(profile.bounds[position]) + ",\"observed\":" + std::to_string(profile.observed[position]) + "}";
+        const auto issue = position < replay.census.size() ? replay.census[position].issue : std::vector<std::uint64_t>{};
+        text += std::string(position == 0 ? "" : ",") + "{\"position\":" + jsonText(profile.names[position]) + ",\"bound\":" + std::to_string(profile.bounds[position]) + ",\"observed\":" + std::to_string(profile.observed[position]) +
+                ",\"issued\":" + std::to_string(issue.size()) + ",\"issue_depth\":" + spread(issue) + "}";
     }
     return text + "]}";
 }
