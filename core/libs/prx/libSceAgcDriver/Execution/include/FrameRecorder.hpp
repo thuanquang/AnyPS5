@@ -45,10 +45,12 @@ public:
     void UnregisterVideoOutput(std::uint32_t handle);
     void Submit(const Packet& packet, std::uint32_t queue, const std::function<void()>& accept);
     void Flip(const FlipInfo& info, const std::function<void()>& accept);
-    void ReserveEopFlip(const FlipInfo& info, std::uint32_t token);
+    void ReserveEopFlip(const FlipInfo& info, std::uint32_t token, std::uint64_t enteredNs);
     void Suspend(const std::function<void()>& accept);
     void PresentBuffer(const DisplayBuffer& buffer);
     void FrameBoundary();
+    void Returned();
+    std::uint64_t ElapsedNs() const;
     static void NoteGpuStore(std::uint64_t address, std::span<const std::byte> bytes) {
         if (notingGpuStores.load(std::memory_order_relaxed)) Active()->noteGpuStore(address, bytes);
     }
@@ -109,6 +111,7 @@ private:
     };
 
     FrameCall make(FrameCallKind kind);
+    void takePreviousExit(FrameCall& call);
     void record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders = {}, const std::function<void()>& accept = {});
     bool recordLocked(FrameCall& call, bool prologueCall, std::span<const Shader* const> shaders);
     void emitDelta(const StartedProgressSnapshot* decision = nullptr);
@@ -191,6 +194,7 @@ private:
     std::vector<std::string> warnings;
     std::chrono::steady_clock::time_point origin;
     std::chrono::steady_clock::time_point startedAt;
+    std::uint64_t startedNs = 0;
 };
 
 }

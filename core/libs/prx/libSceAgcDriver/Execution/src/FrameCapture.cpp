@@ -14,6 +14,9 @@ namespace AgcDriver {
 namespace {
 
 static_assert(std::endian::native == std::endian::little, "frame captures are stored in little-endian order");
+static_assert(CallsVersion >= 1 && CallsVersion <= 9 && FrameCaptureWriter::CallsMagic.size() == FrameCaptureWriter::CallsMagicPrefix.size() + 2 && FrameCaptureWriter::CallsMagic.starts_with(FrameCaptureWriter::CallsMagicPrefix) &&
+                  FrameCaptureWriter::CallsMagic[FrameCaptureWriter::CallsMagicPrefix.size()] == '0' + CallsVersion && FrameCaptureWriter::CallsMagic.back() == '\n',
+              "the digit of CallsMagic is CallsVersion");
 
 constexpr std::size_t ChunkHeaderBytes = 64;
 
@@ -76,10 +79,11 @@ std::vector<ShaderRegister> takeRegisters(Decoder& decoder) {
     return registers;
 }
 
-std::vector<std::byte> encodeCall(const FrameCall& call) {
+std::vector<std::byte> encodeCall(const FrameCall& call, std::uint32_t version) {
     Encoder encoder;
     encoder.Put(call.ordinal);
     encoder.Put(call.timeNs);
+    if (version >= ExitCallsVersion) encoder.Put(call.previousExitNs);
     encoder.Put(call.thread);
     encoder.Put(call.accepted);
     encoder.Put(call.completed);
@@ -95,12 +99,13 @@ std::vector<std::byte> encodeCall(const FrameCall& call) {
     return std::move(encoder.bytes);
 }
 
-FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload) {
+FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload, std::uint32_t version) {
     Decoder decoder(payload);
     FrameCall call;
     call.kind = kind;
     call.ordinal = decoder.Take<std::uint64_t>("ordinal");
     call.timeNs = decoder.Take<std::uint64_t>("time");
+    if (version >= ExitCallsVersion) call.previousExitNs = decoder.Take<std::uint64_t>("previous exit time");
     call.thread = decoder.Take<std::uint64_t>("thread");
     call.accepted = decoder.Take<std::uint64_t>("accepted serial");
     call.completed = decoder.Take<std::uint64_t>("completed serial");
@@ -117,6 +122,16 @@ FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload) {
     call.primitive = takeRegisters(decoder);
     requireCapture(decoder.Done(), "call record has trailing bytes");
     return call;
+}
+
+[[noreturn]] void refuseCapture(const std::string& reason) {
+    throw std::runtime_error("frame capture: " + reason);
+}
+
+void checkCall(const FrameCall& call) {
+    const auto name = [&] { return "call " + std::to_string(call.ordinal) + " (" + std::string(FrameCallName(call.kind)) + ")"; };
+    if (call.previousExitNs != 0 && !FrameTitleCall(call.kind)) refuseCapture(name() + " is not a title call but carries a previous exit time");
+    if (call.previousExitNs > call.timeNs) refuseCapture(name() + " was entered at " + std::to_string(call.timeNs) + " ns, before its thread's previous call returned at " + std::to_string(call.previousExitNs) + " ns");
 }
 
 bool knownCall(std::uint32_t kind) {
@@ -195,7 +210,31 @@ std::string_view FrameCallName(FrameCallKind kind) {
     throw std::runtime_error("frame capture: unknown call kind " + std::to_string(static_cast<std::uint32_t>(kind)));
 }
 
-FrameCaptureWriter::FrameCaptureWriter(const std::filesystem::path& directory, int level) : directory(directory), level(level) {
+bool FrameTitleCall(FrameCallKind kind) {
+    switch (kind) {
+    case FrameCallKind::RegisterShader:
+    case FrameCallKind::ResolveShaderAbi:
+    case FrameCallKind::ResolveGraphicsAbi:
+    case FrameCallKind::ResolveGraphicsStagesAbi:
+    case FrameCallKind::RegisterVideoOutput:
+    case FrameCallKind::UnregisterVideoOutput:
+    case FrameCallKind::Submit:
+    case FrameCallKind::Flip:
+    case FrameCallKind::ReserveEopFlip:
+    case FrameCallKind::Suspend:
+        return true;
+    case FrameCallKind::SetTessellationFactorRing:
+    case FrameCallKind::Memory:
+    case FrameCallKind::FrameStart:
+    case FrameCallKind::End:
+    case FrameCallKind::DisplayBuffer:
+        return false;
+    }
+    return false;
+}
+
+FrameCaptureWriter::FrameCaptureWriter(const std::filesystem::path& directory, int level, std::uint32_t version) : directory(directory), level(level), version(version) {
+    requireCapture(version >= 1 && version <= CallsVersion, "cannot write calls format " + std::to_string(version));
     std::error_code error;
     std::filesystem::create_directories(directory, error);
     requireCapture(!error && std::filesystem::is_directory(directory), "cannot create the directory " + directory.string());
@@ -203,14 +242,20 @@ FrameCaptureWriter::FrameCaptureWriter(const std::filesystem::path& directory, i
     calls.open(directory / CallsName, std::ios::binary | std::ios::trunc);
     memory.open(directory / MemoryName, std::ios::binary | std::ios::trunc);
     requireCapture(calls.is_open() && memory.is_open(), "cannot create the capture files in " + directory.string());
-    calls.write(CallsMagic.data(), static_cast<std::streamsize>(CallsMagic.size()));
+    const std::array<char, 2> digit{static_cast<char>('0' + version), '\n'};
+    calls.write(CallsMagicPrefix.data(), static_cast<std::streamsize>(CallsMagicPrefix.size()));
+    calls.write(digit.data(), static_cast<std::streamsize>(digit.size()));
     memory.write(MemoryMagic.data(), static_cast<std::streamsize>(MemoryMagic.size()));
     requireCapture(calls.good() && memory.good(), "cannot write the capture files in " + directory.string());
 }
 
 void FrameCaptureWriter::WriteCall(const FrameCall& call) {
     FrameCallName(call.kind);
-    const auto payload = encodeCall(call);
+    const auto recorded = [&](bool held, const char* what) {
+        if (!held) refuseCapture("calls format " + std::to_string(version) + " does not record " + what);
+    };
+    recorded(version >= ExitCallsVersion || call.previousExitNs == 0, "the previous exit time");
+    const auto payload = encodeCall(call, version);
     requireCapture(payload.size() <= UINT32_MAX, "call record too large");
     std::lock_guard lock(mutex);
     requireCapture(!finished, "call written after the capture finished");
@@ -360,9 +405,12 @@ std::vector<std::byte> FrameCaptureWriter::compress(std::span<const std::byte> b
 FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) : directory(directory) {
     const auto callsPath = directory / FrameCaptureWriter::CallsName;
     const auto callBytes = readFile(callsPath);
-    const auto first = std::span<const std::byte>(callBytes).first(std::min(callBytes.size(), FrameCaptureWriter::CallsMagicV1.size()));
-    if (first.size() == FrameCaptureWriter::CallsMagicV1.size() && std::memcmp(first.data(), FrameCaptureWriter::CallsMagicV1.data(), first.size()) == 0) version = 1;
-    else requireMagic(callBytes, FrameCaptureWriter::CallsMagic, callsPath);
+    const auto prefix = FrameCaptureWriter::CallsMagicPrefix.size();
+    requireMagic(callBytes, FrameCaptureWriter::CallsMagicPrefix, callsPath);
+    const auto digit = callBytes.size() >= prefix + 2 ? static_cast<char>(callBytes[prefix]) : '\0';
+    requireCapture(digit >= '1' && digit <= '9' && static_cast<char>(callBytes[prefix + 1]) == '\n', callsPath.string() + " is not a frame capture file");
+    version = static_cast<std::uint32_t>(digit - '0');
+    requireCapture(version <= CallsVersion, callsPath.string() + ": calls format " + std::to_string(version) + " is newer than this build reads (" + std::to_string(CallsVersion) + ")");
     std::size_t at = FrameCaptureWriter::CallsMagic.size();
     while (at < callBytes.size()) {
         if (callBytes.size() - at < 8) {
@@ -378,7 +426,8 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
             truncated = true;
             break;
         }
-        calls.push_back(decodeCall(static_cast<FrameCallKind>(kind), std::span(callBytes).subspan(at + 8, bytes)));
+        calls.push_back(decodeCall(static_cast<FrameCallKind>(kind), std::span(callBytes).subspan(at + 8, bytes), version));
+        checkCall(calls.back());
         at += 8 + static_cast<std::size_t>(bytes);
     }
 

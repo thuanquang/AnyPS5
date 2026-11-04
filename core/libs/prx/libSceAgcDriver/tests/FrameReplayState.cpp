@@ -55,14 +55,6 @@ FrameCall memoryCall(std::uint64_t group, std::uint64_t thread) {
     return call;
 }
 
-void rewriteCallsVersion(const std::filesystem::path& capture, std::uint32_t version) {
-    static_assert(FrameCaptureWriter::CallsMagic.size() == 19);
-    std::fstream file(capture / FrameCaptureWriter::CallsName, std::ios::binary | std::ios::in | std::ios::out);
-    file.seekp(static_cast<std::streamoff>(FrameCaptureWriter::CallsMagic.size() - 2));
-    file.put(static_cast<char>('0' + version));
-    check(file.good(), "cannot rewrite the calls format of the synthetic capture");
-}
-
 void testMemoryOrder(const std::filesystem::path& directory) {
     constexpr std::size_t Size = 64u * 1024u * 1024u;
     auto* bytes = allocate(Size);
@@ -538,10 +530,9 @@ void testRewindBreaker(const std::filesystem::path& directory, bool previous) {
     std::copy(rewound.begin(), rewound.end(), commands);
     auto* const control = commands + 1;
     const std::uint32_t valid = AgcDriver::Pm4::RewindValid;
-    FrameCaptureWriter writer(directory);
+    FrameCaptureWriter writer(directory, 1, previous ? AgcDriver::InFlightCallsVersion - 1 : AgcDriver::CallsVersion);
     writer.WriteDelta(1, 0, address(control), std::as_bytes(std::span(&valid, 1)));
     writer.Finish("{}");
-    if (previous) rewriteCallsVersion(directory, AgcDriver::InFlightCallsVersion - 1);
     const FrameCaptureReader reader(directory);
     check((reader.Version() < AgcDriver::InFlightCallsVersion) == previous, "the synthetic capture is not of the calls format this mode replays");
     Options options;
@@ -932,7 +923,7 @@ void testUnverifiedDeltas(const std::filesystem::path& directory) {
     const auto refusal = [&](const std::string& name, bool inFlight, const std::optional<std::string>& header, std::optional<std::uint32_t> version = std::nullopt) {
         const auto capture = directory / name;
         {
-            FrameCaptureWriter writer(capture);
+            FrameCaptureWriter writer(capture, 1, version.value_or(AgcDriver::CallsVersion));
             writer.WriteRange(address(bytes), FrameCaptureWriter::BlockBytes, FrameRangeKind::Unwatched, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable);
             writer.WriteDelta(1, 1, address(bytes), std::as_bytes(std::span(&stored, 1)));
             auto call = memoryCall(1, 1);
@@ -946,7 +937,6 @@ void testUnverifiedDeltas(const std::filesystem::path& directory) {
             writer.WriteCall(call);
             if (header) writer.Finish(*header);
         }
-        if (version) rewriteCallsVersion(capture, *version);
         const FrameCaptureReader reader(capture);
         try {
             restoreMemory(reader);

@@ -11,6 +11,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -39,6 +40,8 @@ extern char** environ;
 
 namespace AgcDriver {
 namespace {
+
+struct ReturnSlot {};
 
 std::uint64_t readNumber(const char* text, std::uint64_t fallback) {
     if (text == nullptr || *text == '\0') return fallback;
@@ -316,10 +319,24 @@ void FrameRecorder::awaitLateStores() {
     }
 }
 
+std::uint64_t FrameRecorder::ElapsedNs() const {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - origin).count());
+}
+
+void FrameRecorder::Returned() {
+    HostThreadSlot<std::uint64_t, ReturnSlot>::Set(ElapsedNs());
+}
+
+void FrameRecorder::takePreviousExit(FrameCall& call) {
+    const auto returned = HostThreadSlot<std::uint64_t, ReturnSlot>::Get();
+    HostThreadSlot<std::uint64_t, ReturnSlot>::Set(0);
+    call.previousExitNs = returned >= startedNs ? returned : 0;
+}
+
 FrameCall FrameRecorder::make(FrameCallKind kind) {
     FrameCall call;
     call.kind = kind;
-    call.timeNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - origin).count());
+    call.timeNs = ElapsedNs();
     call.thread = threadId();
     return call;
 }
@@ -383,8 +400,9 @@ void FrameRecorder::Flip(const FlipInfo& info, const std::function<void()>& acce
     record(std::move(call), false, {}, accept);
 }
 
-void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
+void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token, std::uint64_t enteredNs) {
     auto call = make(FrameCallKind::ReserveEopFlip);
+    call.timeNs = enteredNs;
     call.values = {info.handle, flipValue(info.index), info.mode, flipValue(info.argument), token};
     std::lock_guard lock(mutex);
     if (state == State::Waiting) {
@@ -405,6 +423,7 @@ void FrameRecorder::ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
     }
     if (state != State::Recording) return;
     call.ordinal = ++ordinal;
+    takePreviousExit(call);
     call.accepted = entry.accepted;
     call.completed = entry.completed;
     writer->WriteCall(call);
@@ -490,6 +509,7 @@ bool FrameRecorder::recordLocked(FrameCall& call, bool prologueCall, std::span<c
     else emitDelta(&entry);
     if (state != State::Recording) return false;
     call.ordinal = ++ordinal;
+    takePreviousExit(call);
     call.accepted = entry.accepted;
     call.completed = entry.completed;
     if (call.kind == FrameCallKind::Submit) ++submitDepths[static_cast<std::size_t>(std::min<std::uint64_t>(entry.accepted - entry.completed, submitDepths.size() - 1))];
@@ -928,6 +948,7 @@ void FrameRecorder::start() {
     }
     if (!GuestMemory::WriteWatched()) throw std::runtime_error("frame capture: the guest write watch is unavailable, so CPU stores during the frames cannot be recorded");
     startedAt = std::chrono::steady_clock::now();
+    startedNs = ElapsedNs();
     startBoundary = boundaries;
     allocationsGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     ranges = committedRanges();

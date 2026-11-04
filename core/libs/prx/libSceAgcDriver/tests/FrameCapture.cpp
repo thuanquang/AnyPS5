@@ -44,6 +44,17 @@ void checkThrows(TFunction&& function, const std::string& message) {
     check(false, message);
 }
 
+template <typename TFunction>
+void checkThrowsWith(TFunction&& function, const std::string& expected, const std::string& message) {
+    try {
+        function();
+    } catch (const std::runtime_error& error) {
+        check(std::string(error.what()).find(expected) != std::string::npos, message + ": it threw '" + error.what() + "', not '" + expected + "'");
+        return;
+    }
+    check(false, message);
+}
+
 bool sameRegisters(const std::vector<ShaderRegister>& left, const std::vector<ShaderRegister>& right) {
     if (left.size() != right.size()) return false;
     for (std::size_t index = 0; index < left.size(); ++index) {
@@ -53,7 +64,7 @@ bool sameRegisters(const std::vector<ShaderRegister>& left, const std::vector<Sh
 }
 
 bool sameCall(const FrameCall& left, const FrameCall& right) {
-    return left.kind == right.kind && left.ordinal == right.ordinal && left.timeNs == right.timeNs && left.thread == right.thread && left.accepted == right.accepted && left.completed == right.completed && left.queue == right.queue &&
+    return left.kind == right.kind && left.ordinal == right.ordinal && left.timeNs == right.timeNs && left.previousExitNs == right.previousExitNs && left.thread == right.thread && left.accepted == right.accepted && left.completed == right.completed && left.queue == right.queue &&
            left.flags == right.flags && left.cpuFlip == right.cpuFlip && left.address == right.address && left.size == right.size && left.values == right.values && sameRegisters(left.context, right.context) &&
            sameRegisters(left.primitive, right.primitive);
 }
@@ -76,6 +87,7 @@ std::vector<FrameCall> sampleCalls() {
     submit.kind = FrameCallKind::Submit;
     submit.ordinal = 3;
     submit.timeNs = 123456789;
+    submit.previousExitNs = 123000000;
     submit.thread = 4242;
     submit.accepted = 20;
     submit.completed = 17;
@@ -213,6 +225,73 @@ void testWriter(const std::filesystem::path& directory) {
     checkThrows([&] { other.WriteCall(unknown); }, "an unknown call kind is written");
 }
 
+std::vector<FrameCall> callsOfFormat(std::uint32_t version) {
+    auto calls = sampleCalls();
+    for (auto& call : calls) {
+        if (version < AgcDriver::ExitCallsVersion) call.previousExitNs = 0;
+    }
+    return calls;
+}
+
+void writeCalls(const std::filesystem::path& directory, const std::vector<FrameCall>& calls, std::uint32_t version) {
+    FrameCaptureWriter writer(directory, 1, version);
+    for (const auto& call : calls) writer.WriteCall(call);
+    writer.Finish("{}");
+}
+
+void testCallsVersions(const std::filesystem::path& directory) {
+    for (std::uint32_t version = 1; version <= AgcDriver::CallsVersion; ++version) {
+        const auto path = directory / ("format " + std::to_string(version));
+        const auto calls = callsOfFormat(version);
+        writeCalls(path, calls, version);
+        const FrameCaptureReader reader(path);
+        const auto name = "calls format " + std::to_string(version);
+        check(reader.Version() == version, name + " reads back as calls format " + std::to_string(reader.Version()));
+        check(reader.Calls().size() == calls.size(), "the call count of " + name + " does not round-trip");
+        for (std::size_t index = 0; index < calls.size(); ++index) check(sameCall(reader.Calls()[index], calls[index]), "call " + std::to_string(index) + " of " + name + " does not round-trip");
+    }
+    const auto newer = directory / "newer";
+    writeCalls(newer, sampleCalls(), AgcDriver::CallsVersion);
+    {
+        std::fstream file(newer / FrameCaptureWriter::CallsName, std::ios::binary | std::ios::in | std::ios::out);
+        file.seekp(static_cast<std::streamoff>(FrameCaptureWriter::CallsMagicPrefix.size()));
+        file.put(static_cast<char>('0' + AgcDriver::CallsVersion + 1));
+        check(file.good(), "cannot patch the calls format of a capture");
+    }
+    const auto next = std::to_string(AgcDriver::CallsVersion + 1);
+    checkThrowsWith([&] { FrameCaptureReader reader(newer); }, "calls format " + next + " is newer than this build reads (" + std::to_string(AgcDriver::CallsVersion) + ")", "a calls format newer than this build was read");
+    checkThrowsWith([&] { FrameCaptureWriter writer(directory / "zero", 1, 0); }, "cannot write calls format 0", "calls format 0 was written");
+    checkThrowsWith([&] { FrameCaptureWriter writer(directory / "next", 1, AgcDriver::CallsVersion + 1); }, "cannot write calls format " + next, "a calls format newer than this build was written");
+    FrameCaptureWriter previous(directory / "previous", 1, AgcDriver::InFlightCallsVersion);
+    checkThrowsWith([&] { previous.WriteCall(sampleCalls()[2]); }, "calls format " + std::to_string(AgcDriver::InFlightCallsVersion) + " does not record the previous exit time", "a previous exit time was written in a calls format without one");
+}
+
+void refusedRecord(const std::filesystem::path& directory, const std::string& name, const FrameCall& call, const std::string& expected, std::uint32_t version = AgcDriver::CallsVersion) {
+    const auto path = directory / name;
+    {
+        FrameCaptureWriter writer(path, 1, version);
+        writer.WriteCall(call);
+        writer.Finish("{}");
+    }
+    checkThrowsWith([&] { FrameCaptureReader reader(path); }, expected, "a record that breaks " + name + " was accepted");
+}
+
+void testCallsInvariants(const std::filesystem::path& directory) {
+    FrameCall early;
+    early.kind = FrameCallKind::Submit;
+    early.ordinal = 1;
+    early.timeNs = 100;
+    early.previousExitNs = 200;
+    refusedRecord(directory, "X1", early, "call 1 (submit) was entered at 100 ns, before its thread's previous call returned at 200 ns");
+    FrameCall delta;
+    delta.kind = FrameCallKind::Memory;
+    delta.ordinal = 2;
+    delta.timeNs = 300;
+    delta.previousExitNs = 100;
+    delta.values = {1};
+    refusedRecord(directory, "X2", delta, "call 2 (memory) is not a title call but carries a previous exit time");
+}
+
 std::vector<std::byte> guest(64);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
 constexpr std::uint64_t GuestBase = 0x10000;
@@ -263,12 +342,19 @@ void testAllZero() {
 int main() {
     const auto root = std::filesystem::temp_directory_path() / ("aps5-frame-capture-test-" + std::to_string(getpid()));
     std::filesystem::remove_all(root);
-    testAllZero();
-    testReadAroundRanges();
-    testRoundTrip(root / "capture");
-    testTruncated(root / "capture", root / "truncated");
-    testCorrupt(root / "capture", root / "corrupt");
-    testWriter(root / "writer");
+    try {
+        testAllZero();
+        testReadAroundRanges();
+        testRoundTrip(root / "capture");
+        testTruncated(root / "capture", root / "truncated");
+        testCorrupt(root / "capture", root / "corrupt");
+        testWriter(root / "writer");
+        testCallsVersions(root / "versions");
+        testCallsInvariants(root / "invariants");
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAILED: %s\n", error.what());
+        return 1;
+    }
     std::filesystem::remove_all(root);
     std::puts("frame capture tests passed");
     return 0;
