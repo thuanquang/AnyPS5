@@ -980,7 +980,9 @@ constexpr unsigned ImportHashThreads = 4;
 enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow, Fresh };
 
 struct StoreSerialSlot {};
+struct StorageWriteBackSlot {};
 std::atomic<DriverStoreObserver> driverStoreObserver{nullptr};
+std::atomic<DriverStoreObserver> gpuWriteNoteObserver{nullptr};
 
 void reportDriverStore(std::uint64_t begin, std::uint64_t end) {
     if (const auto observer = driverStoreObserver.load(std::memory_order_acquire)) observer(begin, end, HostThreadSlot<std::uint64_t, StoreSerialSlot>::Get());
@@ -1809,6 +1811,26 @@ void SetDriverStoreObserver(DriverStoreObserver observer) {
 
 bool DriverStoreObserved() {
     return driverStoreObserver.load(std::memory_order_acquire) != nullptr;
+}
+
+void SetGpuWriteNoteObserver(DriverStoreObserver observer) {
+    gpuWriteNoteObserver.store(observer, std::memory_order_release);
+}
+
+void ReportGpuWriteNote(std::uint64_t begin, std::uint64_t end) {
+    if (const auto observer = gpuWriteNoteObserver.load(std::memory_order_acquire)) observer(begin, end, HostThreadSlot<std::uint64_t, StoreSerialSlot>::Get());
+}
+
+StorageWriteBackScope::StorageWriteBackScope() : previous(HostThreadSlot<std::uint64_t, StorageWriteBackSlot>::Get()) {
+    HostThreadSlot<std::uint64_t, StorageWriteBackSlot>::Set(1);
+}
+
+StorageWriteBackScope::~StorageWriteBackScope() {
+    HostThreadSlot<std::uint64_t, StorageWriteBackSlot>::Set(previous);
+}
+
+bool InStorageWriteBack() {
+    return HostThreadSlot<std::uint64_t, StorageWriteBackSlot>::Get() != 0;
 }
 
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written) {

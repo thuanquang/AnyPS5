@@ -79,8 +79,24 @@ private:
         std::uint64_t changed = 0;
         std::uint64_t stored = 0;
     };
+    struct FloorPiece {
+        std::uint64_t end = 0;
+        std::uint64_t serial = 0;
+        std::uint32_t unknown = 0;
+        std::uint64_t event = 0;
+    };
+    struct StoreFloor {
+        std::uint64_t serial = 0;
+        std::uint32_t unknown = 0;
+        std::uint64_t newestEvent = 0;
+    };
+    static constexpr std::size_t FloorPieceLimit = std::size_t{1} << 20;
     static void observeDriverStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
     void noteDriverStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
+    static void observeGpuWriteNote(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
+    void noteGpuWriteNote(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
+    void addFloorPiece(std::uint64_t begin, std::uint64_t end, std::uint64_t serial, std::uint32_t unknown);
+    void takeStoreFloor(std::uint64_t address, std::span<const std::pair<std::size_t, std::size_t>> runs, std::uint64_t before, std::uint64_t completed, StoreFloor& storeFloor);
     std::uint32_t holdMask(std::span<const std::pair<std::uint64_t, std::uint64_t>> blocks, std::uint64_t& checked);
     void countUnwatched(std::vector<std::pair<std::uint64_t, std::uint64_t>>& unwatched, std::vector<std::pair<std::uint64_t, std::uint64_t>>& blocks);
     void recordUnwatched(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stores);
@@ -181,6 +197,9 @@ private:
     std::unordered_map<std::uint64_t, StoreOwner> storeOwners;
     StoreHazard storeHazard;
     std::uint64_t unattributedStores = 0;
+    std::map<std::uint64_t, FloorPiece> floorPieces;
+    bool floorTableFull = false;
+    inline static std::atomic<std::uint64_t> floorEvents{0};
     std::uint64_t unverifiedDeltas = 0;
     std::uint64_t inFlightDeltas = 0;
     std::uint64_t heldDeltas = 0;

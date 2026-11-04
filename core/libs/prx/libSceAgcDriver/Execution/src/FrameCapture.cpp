@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
 #include <cstring>
 #include <future>
 #include <iterator>
@@ -92,6 +93,10 @@ std::vector<std::byte> encodeCall(const FrameCall& call, std::uint32_t version) 
     encoder.Put(static_cast<std::uint32_t>(call.cpuFlip ? 1u : 0u));
     encoder.Put(call.address);
     encoder.Put(call.size);
+    if (version >= StoreFloorCallsVersion) {
+        encoder.Put(call.storeFloor);
+        encoder.Put(call.floorFlags);
+    }
     encoder.Put(static_cast<std::uint32_t>(call.values.size()));
     for (const auto value : call.values) encoder.Put(value);
     putRegisters(encoder, call.context);
@@ -116,6 +121,10 @@ FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload, std
     call.cpuFlip = cpuFlip == 1;
     call.address = decoder.Take<std::uint64_t>("address");
     call.size = decoder.Take<std::uint64_t>("size");
+    if (version >= StoreFloorCallsVersion) {
+        call.storeFloor = decoder.Take<std::uint64_t>("store floor");
+        call.floorFlags = decoder.Take<std::uint32_t>("floor flags");
+    }
     call.values.resize(decoder.Count(8, "values"));
     for (auto& value : call.values) value = decoder.Take<std::uint64_t>("value");
     call.context = takeRegisters(decoder);
@@ -128,10 +137,30 @@ FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload, std
     throw std::runtime_error("frame capture: " + reason);
 }
 
-void checkCall(const FrameCall& call) {
+std::string hex(std::uint64_t value) {
+    std::array<char, 16> text{};
+    const auto written = std::to_chars(text.data(), text.data() + text.size(), value, 16);
+    return "0x" + std::string(text.data(), written.ptr);
+}
+
+std::uint32_t floorFlagsOf(std::uint32_t version) {
+    return version >= StoreFloorCallsVersion ? FrameFloorFlag::StoreUnknown : 0u;
+}
+
+void checkCall(const FrameCall& call, std::uint32_t version) {
     const auto name = [&] { return "call " + std::to_string(call.ordinal) + " (" + std::string(FrameCallName(call.kind)) + ")"; };
     if (call.previousExitNs != 0 && !FrameTitleCall(call.kind)) refuseCapture(name() + " is not a title call but carries a previous exit time");
     if (call.previousExitNs > call.timeNs) refuseCapture(name() + " was entered at " + std::to_string(call.timeNs) + " ns, before its thread's previous call returned at " + std::to_string(call.previousExitNs) + " ns");
+    const bool floored = call.storeFloor != 0 || call.floorFlags != 0;
+    if (call.kind != FrameCallKind::Memory) {
+        if (floored) refuseCapture(name() + " is not a memory delta but carries a floor");
+        return;
+    }
+    const auto delta = [&] { return "memory delta " + std::to_string(call.ordinal); };
+    if (const auto unknown = call.floorFlags & ~floorFlagsOf(version); unknown != 0) refuseCapture(delta() + " carries unknown floor flags " + hex(unknown));
+    if ((call.flags & InFlightDeltaFlag) != 0 && (call.storeFloor != 0 || (call.floorFlags & FrameFloorFlag::StoreUnknown) != 0)) refuseCapture(delta() + " was read in flight but carries a floor");
+    if (call.storeFloor != 0 && (call.floorFlags & FrameFloorFlag::StoreUnknown) != 0) refuseCapture(delta() + " marks its store floor unknown but names submission " + std::to_string(call.storeFloor));
+    if (call.storeFloor > call.completed) refuseCapture(delta() + " names store floor " + std::to_string(call.storeFloor) + " above its completed serial " + std::to_string(call.completed));
 }
 
 bool knownCall(std::uint32_t kind) {
@@ -255,6 +284,7 @@ void FrameCaptureWriter::WriteCall(const FrameCall& call) {
         if (!held) refuseCapture("calls format " + std::to_string(version) + " does not record " + what);
     };
     recorded(version >= ExitCallsVersion || call.previousExitNs == 0, "the previous exit time");
+    recorded(version >= StoreFloorCallsVersion || (call.storeFloor == 0 && call.floorFlags == 0), "store floors");
     const auto payload = encodeCall(call, version);
     requireCapture(payload.size() <= UINT32_MAX, "call record too large");
     std::lock_guard lock(mutex);
@@ -427,7 +457,7 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
             break;
         }
         calls.push_back(decodeCall(static_cast<FrameCallKind>(kind), std::span(callBytes).subspan(at + 8, bytes), version));
-        checkCall(calls.back());
+        checkCall(calls.back(), version);
         at += 8 + static_cast<std::size_t>(bytes);
     }
 

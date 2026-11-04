@@ -6507,6 +6507,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
         return writer;
     }());
+    const GuestMemory::StorageWriteBackScope writingBack;
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;

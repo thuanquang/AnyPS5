@@ -36,7 +36,19 @@ enum class FrameCallKind : std::uint32_t {
 inline constexpr std::uint32_t InFlightDeltaFlag = 1;
 inline constexpr std::uint32_t InFlightCallsVersion = 2;
 inline constexpr std::uint32_t ExitCallsVersion = InFlightCallsVersion + 1;
-inline constexpr std::uint32_t CallsVersion = ExitCallsVersion;
+inline constexpr std::uint32_t StoreFloorCallsVersion = InFlightCallsVersion + 2;
+inline constexpr std::uint32_t CallsVersion = StoreFloorCallsVersion;
+
+struct FrameFloorFlag {
+    static constexpr std::uint32_t UnattributedStore = 1u << 0;
+    static constexpr std::uint32_t TitleCallStore = 1u << 1;
+    static constexpr std::uint32_t ReadFlushStore = 1u << 2;
+    static constexpr std::uint32_t StorageWriteBackStore = 1u << 3;
+    static constexpr std::uint32_t StoreDuringRead = 1u << 4;
+    static constexpr std::uint32_t IncompleteSerialStore = 1u << 5;
+    static constexpr std::uint32_t StoreTableFull = 1u << 6;
+    static constexpr std::uint32_t StoreUnknown = 0x7fu;
+};
 
 struct FrameCall {
     FrameCallKind kind = FrameCallKind::End;
@@ -51,6 +63,8 @@ struct FrameCall {
     bool cpuFlip = false;
     std::uint64_t address = 0;
     std::uint64_t size = 0;
+    std::uint64_t storeFloor = 0;
+    std::uint32_t floorFlags = 0;
     std::vector<std::uint64_t> values;
     std::vector<ShaderRegister> context;
     std::vector<ShaderRegister> primitive;
@@ -85,7 +99,7 @@ public:
     static constexpr std::string_view MemoryName = "memory.bin";
     static constexpr std::string_view HeaderName = "capture.json";
     static constexpr std::string_view CallsMagicPrefix = "aps5-frame-calls ";
-    static constexpr std::string_view CallsMagic = "aps5-frame-calls 3\n";
+    static constexpr std::string_view CallsMagic = "aps5-frame-calls 4\n";
     static constexpr std::string_view MemoryMagic = "aps5-frame-memory 1\n";
     static constexpr std::size_t BlockBytes = 64u * 1024u;
     static constexpr std::size_t ChunkBytes = 4u * 1024u * 1024u;

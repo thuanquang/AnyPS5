@@ -2445,14 +2445,319 @@ void testExitTimes(const std::filesystem::path& tool) {
     check(jsonNumber(report, "title_unknown") == 0, "the replay counts title calls without a previous exit time: " + report);
 }
 
+const AgcDriver::FrameCall& deltaBefore(const FrameCaptureReader& reader, const AgcDriver::FrameCall& call) {
+    const auto& calls = reader.Calls();
+    const auto delta = std::find_if(calls.begin(), calls.end(), [&](const auto& found) { return found.kind == FrameCallKind::Memory && found.ordinal + 1 == call.ordinal; });
+    check(delta != calls.end(), "the capture recorded no memory delta before " + callName(call) + ": " + reader.Header());
+    return *delta;
+}
+
+std::string flagsText(std::uint32_t flags) {
+    char text[16];
+    std::snprintf(text, sizeof text, "0x%x", flags);
+    return text;
+}
+
+std::string floorsOf(const AgcDriver::FrameCall& delta) {
+    return "memory delta " + std::to_string(delta.ordinal) + " has store floor " + std::to_string(delta.storeFloor) + ", flags " + flagsText(delta.floorFlags);
+}
+
+std::uint64_t acceptedSerial() {
+    std::uint64_t accepted = 0;
+    std::uint64_t completed = 0;
+    AgcDriverSerialProgress_nid_postfix(&accepted, &completed);
+    return accepted;
+}
+
+void storeTitleWord(void* address, std::uint32_t value) {
+    std::atomic_ref<std::uint32_t>(*static_cast<std::uint32_t*>(address)).store(value, std::memory_order_release);
+}
+
+void storeGuestLabel(void* address) {
+    AgcDriverStoreGuestLabel_nid_postfix(static_cast<std::uint64_t*>(address), Done);
+}
+
+void testStoreFloor(const std::filesystem::path& tool) {
+    constexpr std::size_t CopyBytes = 128u * 1024u;
+    constexpr std::uint32_t FirstWord = 0x11111111u;
+    constexpr std::uint32_t SecondWord = 0x22222222u;
+    const auto layout = allocate();
+    const auto big = allocate(2 * BlockBytes);
+    auto* const destination = big.base + BlockBytes;
+    for (std::size_t index = 0; index < CopyBytes; ++index) big.base[index] = static_cast<std::byte>((index * 7 + 3) & 0xff);
+    std::memset(destination, 0, CopyBytes);
+    auto copying = commands(layout.secondCommands);
+    sceAgcDcbDmaData(&copying, 0, DmaMemory, 0, at(destination), DmaMemory, 0, at(big.base), CopyBytes, 0, 1, 0);
+    writeDone(copying, layout.label + 1);
+    const Packet copyPacket{layout.secondCommands, static_cast<std::uint32_t>(copying.cursor_up - layout.secondCommands), 0, {}};
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto* const first = layout.firstCommands + 64;
+    auto* const second = layout.firstCommands + 128;
+    auto* const third = layout.firstCommands + 192;
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    check(sceAgcDriverSubmitDcb(&copyPacket) == 0, "the copying submission failed");
+    waitUntil([&] { return std::atomic_ref<std::uint32_t>(layout.label[1]).load(std::memory_order_acquire) == Done; }, "the label behind the copy did not land");
+    AgcDriverWaitIdle_nid_postfix();
+    storeTitleWord(destination + 0x40, FirstWord);
+    submitLabel(first, layout.label + 2);
+    storeTitleWord(destination + 0x80, SecondWord);
+    submitLabel(second, layout.label + 3);
+    AgcDriverWaitIdle_nid_postfix();
+    const auto reported = acceptedSerial();
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope storing(reported);
+        storeGuestLabel(layout.firstTarget);
+    }
+    storeTitleWord(layout.firstTarget + 64, 0x33333333u);
+    submitLabel(third, layout.label + 4);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    std::vector<std::byte> expected(big.base, big.base + DataBytes);
+    std::memcpy(expected.data() + 0x40, &FirstWord, sizeof(FirstWord));
+    std::memcpy(expected.data() + 0x80, &SecondWord, sizeof(SecondWord));
+    check(equal(destination, expected), "the driver did not copy the pattern under the title's words");
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    const auto capture = finishedCapture(reader);
+    const auto& header = reader.Header();
+    const auto copied = submitted(reader, layout.secondCommands).values.back();
+    const auto& afterCopy = deltaBefore(reader, submitted(reader, first));
+    const auto& afterRestore = deltaBefore(reader, submitted(reader, second));
+    const auto& afterReport = deltaBefore(reader, submitted(reader, third));
+    check(afterCopy.storeFloor == copied && afterCopy.floorFlags == 0, floorsOf(afterCopy) + ", not the copy's submission " + std::to_string(copied) + ", which stored into the page the title wrote after it: " + header);
+    check(afterRestore.storeFloor == 0 && afterRestore.floorFlags == 0, floorsOf(afterRestore) + ", although the delta before it restored the copy's bytes of the same page: " + header);
+    check(afterReport.storeFloor == reported && afterReport.floorFlags == 0, floorsOf(afterReport) + ", not submission " + std::to_string(reported) + ", whose reported store the delta restores: " + header);
+    check(replayed(tool, capture, destination, DataBytes) == expected, "the replay did not restore the title's words over the copy");
+}
+
+void testStoreFloorUnknown(const std::filesystem::path&) {
+    const auto layout = allocate();
+    const auto pages = allocate();
+    auto* const unattributed = pages.base;
+    auto* const titleCall = pages.base + DataBytes;
+    auto* const writtenBack = pages.base + 2 * DataBytes;
+    const std::array<std::uint32_t*, 4> words{layout.firstCommands + 64, layout.firstCommands + 128, layout.firstCommands + 192, layout.firstCommands + 256};
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    const auto completedSerial = acceptedSerial();
+    storeGuestLabel(unattributed);
+    storeTitleWord(unattributed + 64, 1);
+    submitLabel(words[0], layout.label + 1);
+    AgcDriverWaitIdle_nid_postfix();
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope storing(AgcDriver::GuestMemory::TitleCallStoreSerial);
+        storeGuestLabel(titleCall);
+    }
+    storeTitleWord(titleCall + 64, 2);
+    submitLabel(words[1], layout.label + 2);
+    AgcDriverWaitIdle_nid_postfix();
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope storing(completedSerial);
+        const AgcDriver::GuestMemory::StorageWriteBackScope writingBack;
+        storeGuestLabel(writtenBack);
+    }
+    storeTitleWord(writtenBack + 64, 3);
+    submitLabel(words[2], layout.label + 3);
+    AgcDriverWaitIdle_nid_postfix();
+    storeTitleWord(unattributed + 128, 4);
+    submitLabel(words[3], layout.label + 4);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto& header = reader.Header();
+    const auto unknown = [&](const std::uint32_t* submit, std::uint32_t flags, const std::string& what) {
+        const auto& delta = deltaBefore(reader, submitted(reader, submit));
+        check(delta.storeFloor == 0 && delta.floorFlags == flags, floorsOf(delta) + ", not flags " + flagsText(flags) + " for " + what + ": " + header);
+    };
+    unknown(words[0], AgcDriver::FrameFloorFlag::UnattributedStore, "a store reported with no serial");
+    unknown(words[1], AgcDriver::FrameFloorFlag::TitleCallStore, "a store reported inside a title call");
+    unknown(words[2], AgcDriver::FrameFloorFlag::StorageWriteBackStore, "a store reported inside a storage-image write-back");
+    unknown(words[3], 0, "a page whose unknown store the delta before it restored");
+    check(jsonNumber(header, "unattributed_stores") >= 1, "the capture header does not count the store reported with no serial: " + header);
+}
+
+void testStoreFloorNoted(const std::filesystem::path& tool) {
+    const auto layout = allocate();
+    auto* const noted = layout.label + 4;
+    auto* const labels = reinterpret_cast<std::uint32_t*>(layout.firstTarget);
+    auto* const first = layout.firstCommands + 64;
+    auto* const second = layout.firstCommands + 128;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    submitLabel(layout.secondCommands, noted);
+    waitUntil([&] { return std::atomic_ref<std::uint32_t>(*noted).load(std::memory_order_acquire) == Done; }, "the label did not land");
+    AgcDriverWaitIdle_nid_postfix();
+    storeTitleWord(noted + 16, 0x77u);
+    submitLabel(first, labels);
+    storeTitleWord(noted, 0);
+    submitLabel(second, labels + 1);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    const std::vector<std::byte> live(reinterpret_cast<const std::byte*>(layout.label), reinterpret_cast<const std::byte*>(layout.label) + DataBytes);
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    const auto capture = finishedCapture(reader);
+    const auto& header = reader.Header();
+    const auto labelled = submitted(reader, layout.secondCommands).values.back();
+    const auto& dropped = deltaBefore(reader, submitted(reader, first));
+    const auto& restored = deltaBefore(reader, submitted(reader, second));
+    check(dropped.storeFloor == 0 && dropped.floorFlags == 0, floorsOf(dropped) + ", although the only store into its page was the label it leaves out as a driver word: " + header);
+    check(jsonNumber(header, "gpu_store_bytes") >= 4, "the capture left out no driver word: " + header);
+    check(restored.storeFloor == labelled && restored.floorFlags == 0, floorsOf(restored) + ", not submission " + std::to_string(labelled) + ", whose label the delta restores after the title cleared it: " + header);
+    check(replayed(tool, capture, layout.label, DataBytes) == live, "the replay did not restore the label page as the title left it");
+}
+
+void testStoreFloorNote(const std::filesystem::path&) {
+    const auto layout = allocate();
+    auto* const noted = layout.firstTarget;
+    auto* const next = layout.firstCommands + 64;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    const auto completedSerial = acceptedSerial();
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope storing(completedSerial);
+        AgcDriver::GuestMemory::ReportGpuWriteNote(at(noted), at(noted) + 64);
+    }
+    storeTitleWord(noted + 8, 0x55u);
+    submitLabel(next, layout.label + 1);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto& delta = deltaBefore(reader, submitted(reader, next));
+    check(delta.storeFloor == completedSerial && delta.floorFlags == 0, floorsOf(delta) + ", not submission " + std::to_string(completedSerial) + ", whose noted GPU write the delta restores: " + reader.Header());
+}
+
+void testStoreFloorParked(const std::filesystem::path&) {
+    const auto layout = allocate();
+    auto* const page = layout.secondTarget;
+    auto gated = commands(layout.secondCommands);
+    auto* const awaited = emitAwait(gated, WaitKind::Wait32, page);
+    writeDone(gated, layout.label + 1);
+    const Packet waiting{layout.secondCommands, static_cast<std::uint32_t>(gated.cursor_up - layout.secondCommands), 0, {}};
+    auto* const next = layout.firstCommands + 64;
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    check(sceAgcDriverSubmitDcb(&waiting) == 0, "the submission that waits on the title's flag failed");
+    waitUntil([&] { return awaits(awaited); }, "the submission never waited on the title's flag");
+    const auto parked = acceptedSerial();
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope storing(parked);
+        storeGuestLabel(page + 0x100);
+    }
+    storeTitleWord(page + 16, 0x66u);
+    submitLabel(next, layout.label + 2);
+    passAwait(WaitKind::Wait32, awaited);
+    AgcDriverWaitIdle_nid_postfix();
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto& delta = deltaBefore(reader, submitted(reader, next));
+    if (delta.completed >= parked) throw Inconclusive("the submission parked on the title's flag completed before the delta was read");
+    check(delta.storeFloor == 0 && delta.floorFlags == AgcDriver::FrameFloorFlag::IncompleteSerialStore, floorsOf(delta) + ", not an unknown floor for the store of submission " + std::to_string(parked) + ", which had not completed when the delta was read (completed " + std::to_string(delta.completed) + "): " + reader.Header());
+}
+
+void testStoreFloorInFlight(const std::filesystem::path&) {
+    const auto layout = allocate();
+    const auto written = allocate();
+    const auto busy = allocate();
+    for (const auto* touched : {&layout, &written, &busy}) std::memset(touched->base, 0, BlockBytes);
+    const auto running = busyPacket(busy);
+    auto second = commands(layout.secondCommands);
+    sceAgcDcbDmaData(&second, 0, DmaMemory, 0, at(layout.firstTarget), DmaMemory, 0, at(written.source), DataBytes, 0, 1, 0);
+    const Packet reading{layout.secondCommands, static_cast<std::uint32_t>(second.cursor_up - layout.secondCommands), 0, {}};
+    const auto warming = labelPacket(layout.firstCommands, layout.label);
+    auto* const later = layout.firstCommands + 64;
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+    check(sceAgcDriverSubmitDcb(&running) == 0 && sceAgcDriverSubmitDcb(&reading) == 0, "the submissions warming the imports failed");
+    AgcDriverWaitIdle_nid_postfix();
+
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    settleDeltas(warming);
+    check(sceAgcDriverSubmitDcb(&running) == 0, "the busy submission failed");
+    awaitStarted();
+    const auto busySerial = acceptedSerial();
+    {
+        const AgcDriver::GuestMemory::StoreSerialScope storing(busySerial);
+        AgcDriver::GuestMemory::ReportGpuWriteNote(at(written.source), at(written.source) + 64);
+    }
+    const auto stored = pattern(41);
+    std::memcpy(written.source, stored.data(), stored.size());
+    check(sceAgcDriverSubmitDcb(&reading) == 0, "the reading submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    storeTitleWord(written.source + 128, 0x5a5a5a5au);
+    submitLabel(later, layout.label + 1);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const FrameCaptureReader reader(directory);
+    finishedCapture(reader);
+    const auto& header = reader.Header();
+    const auto& inFlight = deltaReadInFlight(reader, layout.secondCommands);
+    check(inFlight.storeFloor == 0 && inFlight.floorFlags == 0, floorsOf(inFlight) + ", although it was read with the busy submission in flight: " + header);
+    const auto& settled = deltaBefore(reader, submitted(reader, later));
+    check((settled.flags & AgcDriver::InFlightDeltaFlag) == 0, "the delta after the busy submission completed was read in flight: " + header);
+    check(settled.storeFloor == busySerial && settled.floorFlags == 0, floorsOf(settled) + ", not submission " + std::to_string(busySerial) + ", whose noted write the delta read in flight left for the next delta of its page: " + header);
+}
+
 }
 
 int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
-        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"flip_serial_start", testFlipSerialAtStart}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"host_page_restored", testHostPageRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}, {"wait64_after_read", testWait64AfterRead}, {"semaphore_after_read", testSemaphoreAfterRead}, {"rewind_after_read", testRewindAfterRead}, {"late_wait", testWaitAfterLastFrame}, {"wait_labelled_after", testWaitLabelledAfter}, {"wait_labelled_before", testWaitLabelledBefore}, {"wait_labelled_skipped", testWaitLabelledSkipped}, {"wait_labelled_elsewhere", testWaitLabelledElsewhere}, {"carried_label", testCarriedLabelKeepsSerial}, {"exit_times", testExitTimes}};
+        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}, {"in_flight_delta", testDeltaReadInFlight}, {"flip_serial_start", testFlipSerialAtStart}, {"in_flight_store", testStoreIntoDeltaReadInFlight}, {"hold_diagnostics", testHoldDiagnostics}, {"late_store", testStoreAfterLastFrame}, {"wait_before_read", testWaitBeforeRead}, {"wait_after_read", testWaitAfterRead}, {"unwatched_in_flight", testUnwatchedLeftInFlight}, {"unwatched_restored", testUnwatchedRestoredInFlight}, {"host_page_restored", testHostPageRestoredInFlight}, {"in_flight_gate", testDeltaGatedOnStartedCopy}, {"wait64_after_read", testWait64AfterRead}, {"semaphore_after_read", testSemaphoreAfterRead}, {"rewind_after_read", testRewindAfterRead}, {"late_wait", testWaitAfterLastFrame}, {"wait_labelled_after", testWaitLabelledAfter}, {"wait_labelled_before", testWaitLabelledBefore}, {"wait_labelled_skipped", testWaitLabelledSkipped}, {"wait_labelled_elsewhere", testWaitLabelledElsewhere}, {"carried_label", testCarriedLabelKeepsSerial}, {"exit_times", testExitTimes}, {"store_floor", testStoreFloor}, {"store_floor_unknown", testStoreFloorUnknown}, {"store_floor_noted", testStoreFloorNoted}, {"store_floor_note", testStoreFloorNote}, {"store_floor_parked", testStoreFloorParked}, {"store_floor_in_flight", testStoreFloorInFlight}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "flip_hashes" || mode == "flip_hashes_lists" || mode == "flip_hashes_cpu" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|flip_hashes|flip_hashes_lists|flip_hashes_cpu|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|flip_serial_start|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|host_page_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read|late_wait|wait_labelled_after|wait_labelled_before|wait_labelled_skipped|wait_labelled_elsewhere|carried_label|exit_times]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|flip_hashes|flip_hashes_lists|flip_hashes_cpu|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue|in_flight_delta|flip_serial_start|in_flight_store|hold_diagnostics|late_store|wait_after_read|wait_before_read|unwatched_in_flight|unwatched_restored|host_page_restored|in_flight_gate|wait64_after_read|semaphore_after_read|rewind_after_read|late_wait|wait_labelled_after|wait_labelled_before|wait_labelled_skipped|wait_labelled_elsewhere|carried_label|exit_times|store_floor|store_floor_unknown|store_floor_noted|store_floor_note|store_floor_parked|store_floor_in_flight]\n");
         return 2;
     }
     int status = 0;
