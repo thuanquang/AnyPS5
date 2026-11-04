@@ -42,6 +42,31 @@ namespace AgcDriver {
 namespace {
 
 struct ReturnSlot {};
+struct RecorderFlushSlot {};
+
+class RecorderFlushScope {
+public:
+    RecorderFlushScope() : previous(HostThreadSlot<std::uint64_t, RecorderFlushSlot>::Get()) { HostThreadSlot<std::uint64_t, RecorderFlushSlot>::Set(1); }
+    ~RecorderFlushScope() { HostThreadSlot<std::uint64_t, RecorderFlushSlot>::Set(previous); }
+    RecorderFlushScope(const RecorderFlushScope&) = delete;
+    RecorderFlushScope& operator=(const RecorderFlushScope&) = delete;
+
+private:
+    std::uint64_t previous;
+};
+
+std::uint32_t floorUnknown(std::uint64_t serial) {
+    std::uint32_t unknown = serial == 0 ? FrameFloorFlag::UnattributedStore : serial == GuestMemory::TitleCallStoreSerial ? FrameFloorFlag::TitleCallStore : 0u;
+    if (unknown != 0 && HostThreadSlot<std::uint64_t, RecorderFlushSlot>::Get() != 0) unknown |= FrameFloorFlag::ReadFlushStore;
+    if (GuestMemory::InStorageWriteBack()) unknown |= FrameFloorFlag::StorageWriteBackStore;
+    return unknown;
+}
+
+void flushBeforeRead(std::uint64_t address, std::span<std::byte> bytes) {
+    if (bytes.empty()) return;
+    GuestMemory::GuardRead(address, bytes.size());
+    GuestMemory::FlushGpuWrites(address, bytes.size());
+}
 
 std::uint64_t readNumber(const char* text, std::uint64_t fallback) {
     if (text == nullptr || *text == '\0') return fallback;
@@ -171,6 +196,7 @@ void FrameRecorder::observeDriverStore(std::uint64_t begin, std::uint64_t end, s
 
 void FrameRecorder::noteDriverStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial) {
     if (end <= begin) return;
+    const auto unknown = floorUnknown(serial);
     std::lock_guard lock(storeMutex);
     if (serial == 0) ++unattributedStores;
     ++driverStores;
@@ -179,6 +205,91 @@ void FrameRecorder::noteDriverStore(std::uint64_t begin, std::uint64_t end, std:
         if (storeHazard.group != 0 || serial == GuestMemory::TitleCallStoreSerial) continue;
         const auto found = storeOwners.find(page);
         if (found != storeOwners.end() && (serial == 0 || serial <= found->second.accepted)) storeHazard = {found->second.group, page, serial};
+    }
+    addFloorPiece(begin, end, serial, unknown);
+}
+
+void FrameRecorder::observeGpuWriteNote(std::uint64_t begin, std::uint64_t end, std::uint64_t serial) {
+    if (auto* const recorder = observing.load(std::memory_order_acquire)) recorder->noteGpuWriteNote(begin, end, serial);
+}
+
+void FrameRecorder::noteGpuWriteNote(std::uint64_t begin, std::uint64_t end, std::uint64_t serial) {
+    if (end <= begin) return;
+    const auto unknown = floorUnknown(serial);
+    std::lock_guard lock(storeMutex);
+    addFloorPiece(begin, end, serial, unknown);
+}
+
+void FrameRecorder::addFloorPiece(std::uint64_t begin, std::uint64_t end, std::uint64_t serial, std::uint32_t unknown) {
+    if (floorTableFull) return;
+    const auto event = ++floorEvents;
+    const auto pieceSerial = (unknown & (FrameFloorFlag::UnattributedStore | FrameFloorFlag::TitleCallStore)) != 0 ? 0 : serial;
+    const auto split = [&](std::uint64_t at) {
+        auto found = floorPieces.upper_bound(at);
+        if (found == floorPieces.begin()) return;
+        --found;
+        if (found->first == at || found->second.end <= at) return;
+        auto tail = found->second;
+        found->second.end = at;
+        floorPieces.emplace_hint(std::next(found), at, tail);
+    };
+    split(begin);
+    split(end);
+    auto piece = floorPieces.lower_bound(begin);
+    for (auto at = begin; at < end;) {
+        if (piece != floorPieces.end() && piece->first == at) {
+            piece->second.serial = std::max(piece->second.serial, pieceSerial);
+            piece->second.unknown |= unknown;
+            piece->second.event = std::max(piece->second.event, event);
+            at = piece->second.end;
+            ++piece;
+            continue;
+        }
+        const auto stop = piece != floorPieces.end() && piece->first < end ? piece->first : end;
+        piece = std::next(floorPieces.emplace_hint(piece, at, FloorPiece{stop, pieceSerial, unknown, event}));
+        at = stop;
+    }
+    auto merged = floorPieces.lower_bound(begin);
+    if (merged != floorPieces.begin()) --merged;
+    while (merged != floorPieces.end() && merged->first <= end) {
+        const auto next = std::next(merged);
+        if (next == floorPieces.end() || next->first > end || merged->second.end != next->first || merged->second.serial != next->second.serial || merged->second.unknown != next->second.unknown) {
+            merged = next;
+            continue;
+        }
+        merged->second.end = next->second.end;
+        merged->second.event = std::max(merged->second.event, next->second.event);
+        floorPieces.erase(next);
+    }
+    if (floorPieces.size() > FloorPieceLimit) {
+        floorTableFull = true;
+        floorPieces.clear();
+    }
+}
+
+void FrameRecorder::takeStoreFloor(std::uint64_t address, std::span<const std::pair<std::size_t, std::size_t>> runs, std::uint64_t before, std::uint64_t completed, StoreFloor& storeFloor) {
+    std::lock_guard lock(storeMutex);
+    if (floorTableFull) storeFloor.unknown |= FrameFloorFlag::StoreTableFull;
+    for (const auto& [offset, length] : runs) {
+        const auto begin = address + offset;
+        const auto end = begin + length;
+        auto piece = floorPieces.upper_bound(begin);
+        if (piece != floorPieces.begin() && std::prev(piece)->second.end > begin) --piece;
+        while (piece != floorPieces.end() && piece->first < end) {
+            if (piece->second.event > before) {
+                storeFloor.unknown |= FrameFloorFlag::StoreDuringRead;
+                ++piece;
+                continue;
+            }
+            const auto start = piece->first;
+            const auto taken = piece->second;
+            storeFloor.serial = std::max(storeFloor.serial, taken.serial);
+            storeFloor.unknown |= taken.unknown | (taken.serial > completed ? FrameFloorFlag::IncompleteSerialStore : 0u);
+            storeFloor.newestEvent = std::max(storeFloor.newestEvent, taken.event);
+            piece = floorPieces.erase(piece);
+            if (start < begin) floorPieces.emplace(start, FloorPiece{begin, taken.serial, taken.unknown, taken.event});
+            if (end < taken.end) piece = floorPieces.emplace(end, FloorPiece{taken.end, taken.serial, taken.unknown, taken.event}).first;
+        }
     }
 }
 
@@ -715,11 +826,20 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         stores = driverStores;
     }
     readStores = stores;
+    StoreFloor storeFloor;
+    const auto prepareRead = [&](std::uint64_t at, std::span<std::byte> part) {
+        if (!inFlightRead) {
+            const RecorderFlushScope flushing;
+            ReadAroundRanges(at, part, Graphics::HostOnlySampleRanges(at, part.size()), flushBeforeRead);
+        }
+        return floorEvents.load(std::memory_order_acquire);
+    };
     bool any = false;
     std::vector<std::byte> bytes;
     std::vector<std::pair<std::size_t, std::size_t>> runs;
-    const auto writeTitleWords = [&](std::uint64_t address, bool zero = false) {
+    const auto writeTitleWords = [&](std::uint64_t address, std::uint64_t before, bool zero = false) {
         keepTitleWords(address, bytes, runs, zero);
+        if (!inFlightRead) takeStoreFloor(address, runs, before, completed, storeFloor);
         for (const auto& [offset, length] : runs) {
             writer->WriteDelta(group, completed, address + offset, std::span<const std::byte>(bytes).subspan(offset, length));
             deltaBytes += length;
@@ -744,8 +864,9 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
         }
         for (std::uint64_t at = 0; at < range.bytes;) {
             bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
+            const auto before = prepareRead(range.address + at, bytes);
             readGuest(range.address + at, bytes);
-            writeTitleWords(range.address + at, std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; }));
+            writeTitleWords(range.address + at, before, std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; }));
             if (!GuestMemory::Watched(range.address + at, bytes.size())) recordUnwatched(range.address + at, bytes, stores);
             at += bytes.size();
         }
@@ -753,18 +874,24 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     for (const auto page : hostPages) {
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes)) continue;
         bytes.resize(HostPageBytes);
+        const auto before = floorEvents.load(std::memory_order_acquire);
         std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes);
         const auto hash = contentHash(bytes);
         if (const auto found = hostPageHashes.find(page); found != hostPageHashes.end() && found->second == hash) continue;
         forget(page, page + HostPageBytes);
         hostPageHashes[page] = hash;
         writer->WriteDelta(group, completed, page, bytes);
+        if (!inFlightRead) {
+            const std::array<std::pair<std::size_t, std::size_t>, 1> whole{{{0, HostPageBytes}}};
+            takeStoreFloor(page, whole, before, completed, storeFloor);
+        }
         recordUnwatched(page, bytes, stores);
         deltaBytes += bytes.size();
         any = true;
     }
     for (const auto& [begin, end] : blocks) {
         bytes.resize(static_cast<std::size_t>(end - begin));
+        const auto before = prepareRead(begin, bytes);
         readGuest(begin, bytes);
         if (accepted == completed && !GuestMemory::Watched(begin, bytes.size())) {
             const auto key = std::pair{begin, static_cast<std::uint64_t>(bytes.size())};
@@ -777,7 +904,7 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
             forget(begin, end);
         }
         if (!GuestMemory::Watched(begin, bytes.size())) recordUnwatched(begin, bytes, stores);
-        writeTitleWords(begin);
+        writeTitleWords(begin, before);
     }
     if (!inFlightRead) {
         std::lock_guard lock(storeMutex);
@@ -796,7 +923,12 @@ void FrameRecorder::writeDelta(std::span<const Span> spans, std::span<const std:
     call.completed = completed;
     call.values = {group};
     call.values.insert(call.values.end(), started.begin(), started.end());
-    if (inFlightRead) call.flags = InFlightDeltaFlag;
+    if (inFlightRead) {
+        call.flags = InFlightDeltaFlag;
+    } else {
+        call.floorFlags = storeFloor.unknown;
+        call.storeFloor = (storeFloor.unknown & FrameFloorFlag::StoreUnknown) != 0 ? 0 : storeFloor.serial;
+    }
     writer->WriteCall(call);
 }
 
@@ -930,6 +1062,7 @@ void FrameRecorder::stop(const char* reason) {
         std::fprintf(stderr, "[frame-capture] %s\n", failure.what());
     }
     GuestMemory::SetDriverStoreObserver(nullptr);
+    GuestMemory::SetGpuWriteNoteObserver(nullptr);
     writer.reset();
     endGpuStores();
     state = State::Done;
@@ -963,10 +1096,13 @@ void FrameRecorder::start() {
     {
         std::lock_guard lock(storeMutex);
         driverPages.clear();
+        floorPieces.clear();
+        floorTableFull = false;
         startStores = driverStores;
         fullDeltaStores = driverStores;
     }
     GuestMemory::SetDriverStoreObserver(&FrameRecorder::observeDriverStore);
+    GuestMemory::SetGpuWriteNoteObserver(&FrameRecorder::observeGpuWriteNote);
     generation = GuestMemory::WriteGeneration();
     for (const auto& range : ranges) {
         snapshot(range);
@@ -1031,6 +1167,7 @@ void FrameRecorder::finish() {
     if (stopOnHazard()) return;
     writer->Finish(header());
     GuestMemory::SetDriverStoreObserver(nullptr);
+    GuestMemory::SetGpuWriteNoteObserver(nullptr);
     std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
                  static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(deltaGroups), static_cast<double>(deltaBytes) / (1024.0 * 1024.0),
                  static_cast<double>(writer->RawBytes()) / (1024.0 * 1024.0), static_cast<double>(writer->StoredBytes()) / (1024.0 * 1024.0), directory.string().c_str());
@@ -1057,8 +1194,10 @@ std::string FrameRecorder::header() const {
     text += "],\"read_depths\":[";
     for (std::size_t depth = 0; depth < readDepths.size(); ++depth) text += (depth == 0 ? "" : ",") + std::to_string(readDepths[depth]);
     text += "]";
+    bool tableFull = false;
     {
         std::lock_guard lock(storeMutex);
+        tableFull = floorTableFull;
         text += ",\"in_flight_deltas\":" + std::to_string(inFlightDeltas) + ",\"held_deltas\":" + std::to_string(heldDeltas) + ",\"hold_reasons\":{" + [&] {
             std::string reasons;
             for (std::size_t index = 1; index < HoldReasonNames.size(); ++index) reasons += std::string(index == 1 ? "" : ",") + "\"" + HoldReasonNames[index] + "\":" + std::to_string(holdReasons[index]);
@@ -1091,6 +1230,10 @@ std::string FrameRecorder::header() const {
     first = true;
     for (const auto& warning : warnings) {
         text += (first ? "" : ",") + jsonString(warning);
+        first = false;
+    }
+    if (tableFull) {
+        text += (first ? "" : ",") + jsonString("the frame capture's store floor table is full, so every later delta's store floor is unknown");
         first = false;
     }
     if (hostOnlySampleBytes != 0) text += (first ? "" : ",") + jsonString(std::to_string(hostOnlySampleBytes) + " bytes under multisampled targets whose samples are only on the host are zero in the capture, so replay starts those targets without their earlier contents");

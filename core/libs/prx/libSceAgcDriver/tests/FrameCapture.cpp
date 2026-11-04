@@ -65,8 +65,8 @@ bool sameRegisters(const std::vector<ShaderRegister>& left, const std::vector<Sh
 
 bool sameCall(const FrameCall& left, const FrameCall& right) {
     return left.kind == right.kind && left.ordinal == right.ordinal && left.timeNs == right.timeNs && left.previousExitNs == right.previousExitNs && left.thread == right.thread && left.accepted == right.accepted && left.completed == right.completed && left.queue == right.queue &&
-           left.flags == right.flags && left.cpuFlip == right.cpuFlip && left.address == right.address && left.size == right.size && left.values == right.values && sameRegisters(left.context, right.context) &&
-           sameRegisters(left.primitive, right.primitive);
+           left.flags == right.flags && left.cpuFlip == right.cpuFlip && left.address == right.address && left.size == right.size && left.storeFloor == right.storeFloor && left.floorFlags == right.floorFlags && left.values == right.values &&
+           sameRegisters(left.context, right.context) && sameRegisters(left.primitive, right.primitive);
 }
 
 std::vector<FrameCall> sampleCalls() {
@@ -106,9 +106,25 @@ std::vector<FrameCall> sampleCalls() {
     unregister.ordinal = 5;
     unregister.values = {1};
     calls.push_back(unregister);
+    FrameCall floored;
+    floored.kind = FrameCallKind::Memory;
+    floored.ordinal = 6;
+    floored.accepted = 21;
+    floored.completed = 19;
+    floored.storeFloor = 18;
+    floored.values = {1};
+    calls.push_back(floored);
+    FrameCall unknown;
+    unknown.kind = FrameCallKind::Memory;
+    unknown.ordinal = 7;
+    unknown.accepted = 21;
+    unknown.completed = 20;
+    unknown.floorFlags = AgcDriver::FrameFloorFlag::UnattributedStore | AgcDriver::FrameFloorFlag::StoreDuringRead;
+    unknown.values = {2};
+    calls.push_back(unknown);
     FrameCall end;
     end.kind = FrameCallKind::End;
-    end.ordinal = 6;
+    end.ordinal = 8;
     calls.push_back(end);
     return calls;
 }
@@ -229,6 +245,10 @@ std::vector<FrameCall> callsOfFormat(std::uint32_t version) {
     auto calls = sampleCalls();
     for (auto& call : calls) {
         if (version < AgcDriver::ExitCallsVersion) call.previousExitNs = 0;
+        if (version < AgcDriver::StoreFloorCallsVersion) {
+            call.storeFloor = 0;
+            call.floorFlags = 0;
+        }
     }
     return calls;
 }
@@ -264,6 +284,9 @@ void testCallsVersions(const std::filesystem::path& directory) {
     checkThrowsWith([&] { FrameCaptureWriter writer(directory / "next", 1, AgcDriver::CallsVersion + 1); }, "cannot write calls format " + next, "a calls format newer than this build was written");
     FrameCaptureWriter previous(directory / "previous", 1, AgcDriver::InFlightCallsVersion);
     checkThrowsWith([&] { previous.WriteCall(sampleCalls()[2]); }, "calls format " + std::to_string(AgcDriver::InFlightCallsVersion) + " does not record the previous exit time", "a previous exit time was written in a calls format without one");
+    FrameCaptureWriter exits(directory / "exits", 1, AgcDriver::ExitCallsVersion);
+    checkThrowsWith([&] { exits.WriteCall(sampleCalls()[5]); }, "calls format " + std::to_string(AgcDriver::ExitCallsVersion) + " does not record store floors", "a store floor was written in a calls format without one");
+    checkThrowsWith([&] { exits.WriteCall(sampleCalls()[6]); }, "calls format " + std::to_string(AgcDriver::ExitCallsVersion) + " does not record store floors", "floor flags were written in a calls format without them");
 }
 
 void refusedRecord(const std::filesystem::path& directory, const std::string& name, const FrameCall& call, const std::string& expected, std::uint32_t version = AgcDriver::CallsVersion) {
@@ -290,6 +313,38 @@ void testCallsInvariants(const std::filesystem::path& directory) {
     delta.previousExitNs = 100;
     delta.values = {1};
     refusedRecord(directory, "X2", delta, "call 2 (memory) is not a title call but carries a previous exit time");
+    FrameCall floored;
+    floored.kind = FrameCallKind::Submit;
+    floored.ordinal = 3;
+    floored.completed = 10;
+    floored.storeFloor = 4;
+    refusedRecord(directory, "F1", floored, "call 3 (submit) is not a memory delta but carries a floor");
+    const auto memory = [](std::uint64_t ordinal) {
+        FrameCall call;
+        call.kind = FrameCallKind::Memory;
+        call.ordinal = ordinal;
+        call.accepted = 12;
+        call.completed = 10;
+        call.values = {ordinal};
+        return call;
+    };
+    auto flagged = memory(4);
+    flagged.floorFlags = 1u << 7;
+    refusedRecord(directory, "F2", flagged, "memory delta 4 carries unknown floor flags 0x80");
+    auto named = memory(5);
+    named.storeFloor = 5;
+    named.floorFlags = AgcDriver::FrameFloorFlag::UnattributedStore;
+    refusedRecord(directory, "F3", named, "memory delta 5 marks its store floor unknown but names submission 5");
+    auto ahead = memory(6);
+    ahead.storeFloor = 11;
+    refusedRecord(directory, "F4", ahead, "memory delta 6 names store floor 11 above its completed serial 10");
+    auto inFlight = memory(7);
+    inFlight.flags = AgcDriver::InFlightDeltaFlag;
+    inFlight.storeFloor = 3;
+    refusedRecord(directory, "F5", inFlight, "memory delta 7 was read in flight but carries a floor");
+    inFlight.storeFloor = 0;
+    inFlight.floorFlags = AgcDriver::FrameFloorFlag::IncompleteSerialStore;
+    refusedRecord(directory, "F5 flags", inFlight, "memory delta 7 was read in flight but carries a floor");
 }
 
 std::vector<std::byte> guest(64);
