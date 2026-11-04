@@ -65,6 +65,7 @@ void Driver::UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<I
 void Driver::AttachWindow(const PresentationWindow& window) {
     CheckFailure();
     std::unique_lock replacing(deviceReplacement);
+    require(gpuEpochTrackers.load(std::memory_order_relaxed) == 0, "a window cannot replace the device while a frame replay tracks the GPU batches of completed submissions");
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
     std::lock_guard lock(GuestMemory::GpuMutex());
     if (device) {

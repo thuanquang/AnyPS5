@@ -189,6 +189,14 @@ extern "C" bool AgcDriverWaitRecordedOnGpuFor_nid_postfix(std::int64_t milliseco
     return AgcDriver::DriverDetail::Driver::Get().WaitRecordedOnGpuFor(std::chrono::milliseconds(milliseconds));
 }
 
+extern "C" void AgcDriverTrackGpuEpochs_nid_postfix(bool tracking) {
+    AgcDriver::DriverDetail::Driver::Get().TrackGpuEpochs(tracking);
+}
+
+extern "C" bool AgcDriverWaitSerialsOnGpuFor_nid_postfix(std::uint64_t through, const std::uint64_t* serials, std::size_t count, std::int64_t milliseconds, AgcDriver::GpuSerialsWait* outcome) {
+    return AgcDriver::DriverDetail::Driver::Get().WaitSerialsOnGpuFor(through, std::span<const std::uint64_t>(serials, count), std::chrono::milliseconds(milliseconds), outcome);
+}
+
 extern "C" void AgcDriverPrepareGuestStore_nid_postfix(std::uint64_t address, std::size_t bytes) {
     const AgcDriver::GuestMemory::ReadSiteScope site(AgcDriver::GuestMemory::ReadSite::Store);
     AgcDriver::GuestMemory::FlushGpuWrites(address, bytes);

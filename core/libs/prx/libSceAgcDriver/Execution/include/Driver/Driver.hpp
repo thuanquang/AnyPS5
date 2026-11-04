@@ -94,6 +94,8 @@ public:
     void ReleaseSettled();
     bool Settled();
     bool WaitRecordedOnGpuFor(std::chrono::milliseconds timeout);
+    void TrackGpuEpochs(bool tracking);
+    bool WaitSerialsOnGpuFor(std::uint64_t through, std::span<const std::uint64_t> serials, std::chrono::milliseconds timeout, GpuSerialsWait* outcome);
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void AttachWindow(const PresentationWindow& window);
@@ -411,6 +413,7 @@ private:
     void deliverGuestEopInterrupt(std::uint32_t queue);
     void deliverFlipEopInterrupt(std::uint32_t queue);
     void markCompleted(std::uint64_t serial);
+    std::uint64_t gpuEpochOf(std::uint64_t serial) const;
     static const std::atomic<std::uint64_t>*& workerQueued();
     void reapCompletionLabels();
     void run(std::uint32_t id) noexcept;
@@ -507,6 +510,10 @@ private:
     std::uint64_t completed = 0;
     std::set<std::uint64_t> completedOutOfOrder;
     std::set<std::uint64_t> startedAhead;
+    static constexpr std::size_t GpuEpochHistory = 4096;
+    std::atomic<std::uint32_t> gpuEpochTrackers{0};
+    std::deque<std::pair<std::uint64_t, std::uint64_t>> completedGpuEpochs;
+    std::map<std::uint64_t, std::uint64_t> outOfOrderGpuEpochs;
     std::map<std::uint64_t, std::vector<AwaitedDword>> unfinishedWaits;
     std::map<std::uint64_t, std::pair<std::uint32_t, std::vector<LabelValue>>> unfinishedLabels;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> finishedWaits;

@@ -540,6 +540,7 @@ std::atomic<std::uint64_t> writeBacksOverLabels{0};
 // Completion labels that entered the pending count at a write-back (see NoteWrittenBack).
 std::atomic<std::uint64_t> completionLabelsCountedLate{0};
 std::atomic<std::uint64_t> workSinceSubmit{0};
+std::atomic<std::uint64_t> openedBatch{0};
 
 // APS5_COUNT_ALL_COMPLETION_LABELS=1: a completion label also stored on the GPU counts as pending
 // from its registration, as before (see Recorder::AfterCompletions).
@@ -1212,6 +1213,7 @@ Recorder::~Recorder() {
         completionStores.store(0, std::memory_order_release);
         writeBackCompletions.store(0, std::memory_order_release);
         workSinceSubmit.store(0, std::memory_order_release);
+        openedBatch.store(0, std::memory_order_release);
     }
     {
         // A thread that released the mutex around a wait on this recorder re-checks the id when it
@@ -1300,12 +1302,17 @@ void Recorder::CountRecordedWork() {
     workSinceSubmit.fetch_add(1, std::memory_order_relaxed);
 }
 
+std::uint64_t Recorder::OpenedBatch() {
+    return openedBatch.load(std::memory_order_relaxed);
+}
+
 Recorder* Recorder::Active() {
     return activeRecorder;
 }
 
 void Recorder::Activate() {
     activeRecorder = this;
+    openedBatch.store(open != nullptr ? submissions + 1 : submissions, std::memory_order_relaxed);
     {
         std::lock_guard tableLock(labelTableMutex);
         labelTableOwner = this;
@@ -1765,6 +1772,7 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
+        if (activeRecorder == this) openedBatch.store(submissions + 1, std::memory_order_relaxed);
         if (PerformanceTrace::Recording()) {
             static std::atomic<std::uint64_t> traceIds{0};
             open->traceId = traceIds.fetch_add(1, std::memory_order_relaxed) + 1;

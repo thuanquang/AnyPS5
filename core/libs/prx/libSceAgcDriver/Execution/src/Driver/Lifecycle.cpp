@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cerrno>
 #include <exception>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -347,6 +348,64 @@ bool Driver::WaitRecordedOnGpuFor(std::chrono::milliseconds timeout) {
     }
     if (epoch == 0) return true;
     if (!localDevice->CanWaitUnlocked()) throw std::runtime_error("waiting for GPU batch " + std::to_string(epoch) + " of the recorded work needs timeline semaphores");
+    const auto remaining = (std::max)(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
+    return localDevice->WaitRecordedFor(epoch, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count()));
+}
+
+void Driver::TrackGpuEpochs(bool tracking) {
+    std::shared_lock use(deviceReplacement);
+    std::lock_guard lock(mutex);
+    if (!tracking) {
+        if (gpuEpochTrackers.load(std::memory_order_relaxed) == 0 || gpuEpochTrackers.fetch_sub(1, std::memory_order_relaxed) != 1) return;
+        completedGpuEpochs.clear();
+        outOfOrderGpuEpochs.clear();
+        return;
+    }
+    if (gpuEpochTrackers.fetch_add(1, std::memory_order_relaxed) != 0) return;
+    const auto epoch = Graphics::Recorder::OpenedBatch();
+    completedGpuEpochs.emplace_back(completed, epoch);
+    for (const auto serial : completedOutOfOrder) outOfOrderGpuEpochs.emplace(serial, epoch);
+}
+
+std::uint64_t Driver::gpuEpochOf(std::uint64_t serial) const {
+    if (serial == 0) return 0;
+    if (serial > completed) {
+        const auto found = outOfOrderGpuEpochs.find(serial);
+        if (found == outOfOrderGpuEpochs.end()) throw std::runtime_error("submission " + std::to_string(serial) + " has not completed, so its GPU batches are not known");
+        return found->second;
+    }
+    return std::lower_bound(completedGpuEpochs.begin(), completedGpuEpochs.end(), serial, [](const auto& entry, std::uint64_t value) { return entry.first < value; })->second;
+}
+
+bool Driver::WaitSerialsOnGpuFor(std::uint64_t through, std::span<const std::uint64_t> serials, std::chrono::milliseconds timeout, GpuSerialsWait* outcome) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::uint64_t epoch = 0;
+    {
+        std::lock_guard lock(mutex);
+        rethrowFailure();
+        checkStopping();
+        if (gpuEpochTrackers.load(std::memory_order_relaxed) == 0) throw std::runtime_error("waiting for the GPU batches of submissions needs AgcDriverTrackGpuEpochs before they complete");
+        if (through > completed) throw std::runtime_error("submission " + std::to_string(through) + " and the ones before it have not all completed, so their GPU batches are not known");
+        epoch = gpuEpochOf(through);
+        for (const auto serial : serials) epoch = (std::max)(epoch, gpuEpochOf(serial));
+    }
+    if (outcome != nullptr) *outcome = GpuSerialsWait{epoch, false, false};
+    if (epoch == 0) return true;
+    const auto localDevice = device.Load();
+    if (localDevice == nullptr) throw std::runtime_error("GPU batch " + std::to_string(epoch) + " of a completed submission has no device");
+    if (localDevice->SubmittedEpoch() < epoch) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (localDevice->SubmittedEpoch() < epoch) {
+            localDevice->SubmitRecorded(false);
+            if (outcome != nullptr) outcome->submitted = true;
+        }
+        if (localDevice->SubmittedEpoch() < epoch) throw std::runtime_error("GPU batch " + std::to_string(epoch) + " of a completed submission was never submitted");
+    }
+    if (!localDevice->CanWaitUnlocked()) throw std::runtime_error("waiting for GPU batch " + std::to_string(epoch) + " of a completed submission needs timeline semaphores");
+    if (localDevice->WaitRecordedFor(epoch, 0)) return true;
+    if (outcome != nullptr) outcome->waited = true;
     const auto remaining = (std::max)(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now());
     return localDevice->WaitRecordedFor(epoch, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count()));
 }

@@ -35,6 +35,12 @@ struct AwaitedDwordsSnapshot {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> finished;
 };
 
+struct GpuSerialsWait {
+    std::uint64_t batch = 0;
+    bool submitted = false;
+    bool waited = false;
+};
+
 }
 
 extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address, std::size_t bytes);
@@ -54,6 +60,8 @@ extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds);
 extern "C" void AgcDriverReleaseSettled_nid_postfix();
 extern "C" bool AgcDriverSettled_nid_postfix();
 extern "C" bool AgcDriverWaitRecordedOnGpuFor_nid_postfix(std::int64_t milliseconds);
+extern "C" void AgcDriverTrackGpuEpochs_nid_postfix(bool tracking);
+extern "C" bool AgcDriverWaitSerialsOnGpuFor_nid_postfix(std::uint64_t through, const std::uint64_t* serials, std::size_t count, std::int64_t milliseconds, AgcDriver::GpuSerialsWait* outcome);
 extern "C" void AgcDriverPrepareGuestStore_nid_postfix(std::uint64_t address, std::size_t bytes);
 extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait* waits, std::size_t capacity);
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix();

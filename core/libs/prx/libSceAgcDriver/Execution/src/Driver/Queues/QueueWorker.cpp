@@ -52,12 +52,22 @@ FrameTiming* Driver::includeTimingSubmission(const Submission& submission, bool 
 void Driver::markCompleted(std::uint64_t serial) {
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f completed serial=%llu (in order up to %llu)\n", TraceMs(), static_cast<unsigned long long>(serial), static_cast<unsigned long long>(completed));
+    const auto before = completed;
     completedOutOfOrder.insert(serial);
     while (!completedOutOfOrder.empty() && *completedOutOfOrder.begin() == completed + 1) {
         completed = *completedOutOfOrder.begin();
         completedOutOfOrder.erase(completedOutOfOrder.begin());
     }
     startedAhead.erase(startedAhead.begin(), startedAhead.upper_bound(completed));
+    if (gpuEpochTrackers.load(std::memory_order_relaxed) == 0) return;
+    const auto epoch = Graphics::Recorder::OpenedBatch();
+    if (completed == before) {
+        outOfOrderGpuEpochs.emplace(serial, epoch);
+        return;
+    }
+    outOfOrderGpuEpochs.erase(outOfOrderGpuEpochs.begin(), outOfOrderGpuEpochs.upper_bound(completed));
+    completedGpuEpochs.emplace_back(completed, epoch);
+    if (completedGpuEpochs.size() > GpuEpochHistory) completedGpuEpochs.pop_front();
 }
 
 bool& Driver::completionDeferred() {
@@ -291,6 +301,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 execute(submission);
                 if (submission.progress && submission.rewindTail == nullptr && !completionDeferred()) submitOpenWork(submission.progress);
             }
+            if (gpuEpochTrackers.load(std::memory_order_relaxed) != 0) recordQueuedLabelsBeforeRead(id);
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             PerformanceContext completionContext(id == 0 ? frameTiming() : FrameTiming::Async());
