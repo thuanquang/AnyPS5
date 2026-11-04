@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include <algorithm>
 #include <mutex>
@@ -217,6 +218,25 @@ extern "C" void AgcDriverPrepareGuestStore_nid_postfix(std::uint64_t address, st
 
 extern "C" bool AgcDriverGuestStoreSettled_nid_postfix(std::uint64_t address, std::size_t bytes) {
     return AgcDriver::DriverDetail::Driver::Get().GuestStoreSettled(address, bytes);
+}
+
+extern "C" bool AgcDriverGpuReadTracking_nid_postfix() {
+    return AgcDriver::Graphics::Recorder::ReadTracking();
+}
+
+extern "C" bool AgcDriverPendingGpuRead_nid_postfix(std::uint64_t address, std::size_t bytes, AgcDriver::PendingGpuRead* read) {
+    AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Wait);
+    std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+    const auto* const recorder = AgcDriver::Graphics::Recorder::Active();
+    if (recorder == nullptr || !recorder->PendingReadOverlaps(address, bytes)) return false;
+    const auto pending = recorder->DescribePendingRead(address, bytes);
+    if (!pending) return false;
+    if (read != nullptr) *read = AgcDriver::PendingGpuRead{pending->serial, pending->queue, static_cast<std::uint32_t>(pending->kind), pending->open};
+    return true;
+}
+
+extern "C" bool AgcDriverWaitGpuBatchFor_nid_postfix(std::uint64_t batch, std::int64_t milliseconds) {
+    return AgcDriver::DriverDetail::Driver::Get().WaitGpuBatchFor(batch, std::chrono::milliseconds(milliseconds));
 }
 
 extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {
