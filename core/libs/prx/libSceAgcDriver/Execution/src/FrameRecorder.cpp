@@ -335,7 +335,7 @@ void FrameRecorder::emitDelta() {
         }
     }
     const auto added = newRanges();
-    writeDelta(spans, {}, added);
+    writeDelta(spans, {}, added, true);
     for (const auto& span : spans) pieceMarks[span.address] = span.since;
 }
 
@@ -468,7 +468,7 @@ std::uint64_t FrameRecorder::blockSince(std::uint64_t block) const {
     return covered == FrameCaptureWriter::BlockBytes ? std::max(mark, since) : mark;
 }
 
-void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added) {
+void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added, bool full) {
     if (abandonIfDiskLow()) return;
     auto& driver = DriverDetail::Driver::Get();
     const struct Hold {
@@ -484,7 +484,9 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
         }
         std::tie(accepted, completed) = driver.SerialProgress();
     }
-    const auto newest = completed < accepted ? before : std::numeric_limits<std::uint64_t>::max();
+    const auto passed = driver.TitleWaitsPassed();
+    const auto newest = passed != waitsPassed ? before : std::numeric_limits<std::uint64_t>::max();
+    if (full) waitsPassed = passed;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> blocks;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
     for (auto& span : spans) {
@@ -553,7 +555,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
             const auto found = unwatchedHashes.find(key);
             if (found != unwatchedHashes.end() && found->second == sample) continue;
             forget(begin, end);
-            unwatchedHashes[key] = sample;
+            if (newest == std::numeric_limits<std::uint64_t>::max()) unwatchedHashes[key] = sample;
         } else {
             forget(begin, end);
         }
@@ -721,6 +723,7 @@ void FrameRecorder::start() {
         if (range.kind == FrameRangeKind::Watched || range.kind == FrameRangeKind::Unwatched) range.since = GuestMemory::CollectWrittenBlocks(range.address, static_cast<std::size_t>(range.bytes), std::numeric_limits<std::uint64_t>::max(), written);
     }
     startGeneration = GuestMemory::TrackerGeneration();
+    waitsPassed = driver.TitleWaitsPassed();
     for (const auto& range : ranges) {
         snapshot(range);
         if (!writer) return;
