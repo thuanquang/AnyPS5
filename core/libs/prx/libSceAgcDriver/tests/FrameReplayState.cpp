@@ -1459,6 +1459,178 @@ void testGpuGateParked(const std::filesystem::path& directory) {
     check(std::all_of(target, target + CopyBytes, [](std::byte value) { return value == std::byte{0x11}; }), "the held delta was restored before the GPU copy that reads its range ran");
 }
 
+void testCompletedGate(const std::filesystem::path& directory) {
+    constexpr std::uint32_t ComputeQueue = 0x20;
+    constexpr std::size_t CopyBytes = 16;
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* gate = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* compute = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    auto* nop = reinterpret_cast<std::uint32_t*>(bytes + 4352);
+    auto* source = bytes + 8192;
+    auto* target = bytes + 8256;
+    *gate = 0;
+    std::fill_n(source, CopyBytes, std::byte{0x11});
+    std::fill_n(target, CopyBytes, std::byte{0});
+    const std::array<std::uint32_t, 14> gated{0xc0053c00u, 0x13u, low(gate), high(gate), 1u, 0xffffffffu, 4u, 0xc0055000u, 0x80000000u, low(source), high(source), low(target), high(target), static_cast<std::uint32_t>(CopyBytes)};
+    std::copy(gated.begin(), gated.end(), compute);
+    const std::array<std::uint32_t, 2> empty{0xc0001000u, 0u};
+    std::copy(empty.begin(), empty.end(), nop);
+    const std::vector<std::byte> rewritten(CopyBytes, std::byte{0x22});
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(source), rewritten);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.busyTimeout = std::chrono::milliseconds(20000);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    const auto before = progress().first;
+    const Packet packet{compute, static_cast<std::uint32_t>(gated.size()), 0, {}};
+    check(sceAgcDriverSubmitAcb(ComputeQueue, &packet) == 0, "the compute submission failed");
+    const auto parked = [&] {
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        return std::any_of(awaited.begin(), awaited.begin() + static_cast<std::ptrdiff_t>(count), [&](const AgcDriver::AwaitedWait& slot) { return slot.address == address(gate); });
+    };
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    while (!parked()) {
+        check(Clock::now() < deadline, "the compute submission did not wait on its unwritten gate");
+        std::this_thread::yield();
+    }
+    AgcDriverSubmitGraphics_nid_postfix(nop, static_cast<std::uint32_t>(empty.size()));
+    while (!AgcDriverSerialDone_nid_postfix(before + 2)) {
+        check(Clock::now() < deadline, "the graphics submission did not complete while the compute submission before it waited on its gate");
+        std::this_thread::yield();
+    }
+    check(progress() == std::pair{before + 2, before} && !AgcDriverSerialDone_nid_postfix(before + 1), "the graphics submission did not complete ahead of the compute submission that waits on its gate");
+    std::uint32_t sourceAtGate = 0;
+    std::thread title([&] {
+        const auto limit = Clock::now() + std::chrono::seconds(1);
+        do {
+            sourceAtGate = std::atomic_ref<std::uint32_t>(*reinterpret_cast<std::uint32_t*>(source)).load(std::memory_order_acquire);
+            std::this_thread::yield();
+        } while (sourceAtGate != 0x22222222u && Clock::now() < limit);
+        std::atomic_ref<std::uint32_t>(*gate).store(1, std::memory_order_release);
+    });
+    auto call = memoryCall(1, 1);
+    call.ordinal = 1;
+    call.flags = AgcDriver::InFlightDeltaFlag;
+    call.accepted = 2;
+    call.completed = 1;
+    call.values = {1, 2};
+    std::string failure;
+    try {
+        replay.runWindow(std::span(&call, 1));
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    title.join();
+    check(failure.empty(), failure.c_str());
+    AgcDriverWaitIdle_nid_postfix();
+    check(sourceAtGate == 0x11111111u, "the in-flight delta was restored before a submission the capture had completed ran");
+    check(std::all_of(target, target + CopyBytes, [](std::byte value) { return value == std::byte{0x11}; }), "the copy of a submission the capture had completed read the bytes of a delta read in flight after it");
+    check(std::equal(rewritten.begin(), rewritten.end(), source), "the delta read in flight was not restored");
+}
+
+void testCompletedGateFlip(const std::filesystem::path& directory) {
+    constexpr std::uint64_t Base = 40;
+    constexpr std::uint32_t ComputeQueue = 0x20;
+    constexpr std::size_t CopyBytes = 16;
+    if (APS5_ENABLE_TIMING_LOG) return;
+    const char* dump = std::getenv("APS5_DUMP_SUBMITS");
+    check(std::getenv("APS5_CPU_FLIP_IN_ORDER") == nullptr && std::getenv("APS5_SYNC_FLIP") == nullptr && (dump == nullptr || *dump == '\0'), "the environment orders CPU flips or captures submissions, so the replay's CPU flip would take a serial");
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* gate = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* compute = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    auto* nop = reinterpret_cast<std::uint32_t*>(bytes + 4352);
+    auto* source = bytes + 8192;
+    auto* target = bytes + 8256;
+    *gate = 0;
+    std::fill_n(source, CopyBytes, std::byte{0x11});
+    std::fill_n(target, CopyBytes, std::byte{0});
+    const std::array<std::uint32_t, 14> gated{0xc0053c00u, 0x13u, low(gate), high(gate), 1u, 0xffffffffu, 4u, 0xc0055000u, 0x80000000u, low(source), high(source), low(target), high(target), static_cast<std::uint32_t>(CopyBytes)};
+    std::copy(gated.begin(), gated.end(), compute);
+    const std::array<std::uint32_t, 2> empty{0xc0001000u, 0u};
+    std::copy(empty.begin(), empty.end(), nop);
+    const std::vector<std::byte> rewritten(CopyBytes, std::byte{0x22});
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(source), rewritten);
+    FrameCall start;
+    start.kind = FrameCallKind::FrameStart;
+    start.accepted = Base;
+    start.completed = Base;
+    writer.WriteCall(start);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.busyTimeout = std::chrono::milliseconds(20000);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    auto output = std::make_shared<ReplayOutput>(replay.frames);
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    FrameCall parked;
+    parked.kind = FrameCallKind::Submit;
+    parked.ordinal = 1;
+    parked.thread = 1;
+    parked.queue = ComputeQueue;
+    parked.address = address(compute);
+    parked.size = gated.size();
+    parked.accepted = Base;
+    parked.completed = Base;
+    parked.values = {Base + 1};
+    FrameCall flip;
+    flip.kind = FrameCallKind::Flip;
+    flip.ordinal = 2;
+    flip.thread = 1;
+    flip.cpuFlip = true;
+    flip.accepted = Base + 1;
+    flip.completed = Base;
+    flip.values = {7, static_cast<std::uint64_t>(-1), 1, 0, Base + 2};
+    FrameCall graphics;
+    graphics.kind = FrameCallKind::Submit;
+    graphics.ordinal = 3;
+    graphics.thread = 1;
+    graphics.address = address(nop);
+    graphics.size = empty.size();
+    graphics.accepted = Base + 2;
+    graphics.completed = Base;
+    graphics.values = {Base + 3};
+    auto delta = memoryCall(1, 1);
+    delta.ordinal = 4;
+    delta.flags = AgcDriver::InFlightDeltaFlag;
+    delta.accepted = Base + 3;
+    delta.completed = Base + 1;
+    delta.values = {1, Base + 2, Base + 3};
+    std::uint32_t sourceAtGate = 0;
+    std::thread title([&] {
+        const auto limit = Clock::now() + std::chrono::seconds(1);
+        do {
+            sourceAtGate = std::atomic_ref<std::uint32_t>(*reinterpret_cast<std::uint32_t*>(source)).load(std::memory_order_acquire);
+            std::this_thread::yield();
+        } while (sourceAtGate != 0x22222222u && Clock::now() < limit);
+        std::atomic_ref<std::uint32_t>(*gate).store(1, std::memory_order_release);
+    });
+    const std::array calls{parked, flip, graphics, delta};
+    std::string failure;
+    try {
+        replay.runWindow(calls);
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    title.join();
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+    check(failure.empty(), failure.c_str());
+    check(replay.frames.Times().size() == 1, "the replay did not present the CPU flip that took a serial only in the capture");
+    check(sourceAtGate == 0x11111111u, "the in-flight delta was restored before a submission the capture had completed ran, when a CPU flip after that submission took a serial only in the capture");
+    check(std::all_of(target, target + CopyBytes, [](std::byte value) { return value == std::byte{0x11}; }), "the copy of a submission the capture had completed before a CPU flip that took a serial only in the capture read the bytes of a delta read in flight after it");
+    check(std::equal(rewritten.begin(), rewritten.end(), source), "the delta read in flight was not restored");
+}
+
 struct PendingResults {
     std::uint64_t address = 0;
     std::size_t bytes = 0;
@@ -1553,6 +1725,8 @@ int main(int argc, char** argv) {
         else if (mode == "reservations" || mode == "reservation_failure") testRepeatedReservations(directory, mode == "reservation_failure");
         else if (mode == "blocking") testBlockingSubmission(directory);
         else if (mode == "gate_settled") testGateSettled(directory);
+        else if (mode == "completed_gate") testCompletedGate(directory);
+        else if (mode == "completed_gate_flip") testCompletedGateFlip(directory);
         else if (mode == "depth_submits") testDepthAfterSubmits(directory);
         else if (mode == "depth_passes") testDepthOfTimedPasses(directory);
         else if (mode == "gate_failure") testGateFailure(directory);

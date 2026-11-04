@@ -746,11 +746,24 @@ struct Replay {
         const auto limit = Clock::now() + options.busyTimeout;
         auto lastSeen = progress();
         auto quietSince = Clock::now();
+        if (const auto through = completedSerial(call, accepted); through != 0) awaitSerial(through, limit, lastSeen, quietSince, [&](const std::string& reason) { return std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for submission " + std::to_string(call.completed) + " (replay serial " + std::to_string(through) + "), which had completed when the capture read the delta, but " + reason); }, [](std::uint64_t serial) { return AgcDriverSerialDone_nid_postfix(serial) && progress().second >= serial; });
         for (std::size_t index = 1; index < call.values.size(); ++index) {
             const auto serial = startedSerial(call, accepted, call.values[index]);
             if (!serial) continue;
-            awaitSerial(*serial, limit, lastSeen, quietSince, [&](const std::string& reason) { return std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for submission " + std::to_string(call.values[index]) + " (replay serial " + std::to_string(*serial) + "), which had started when the capture read the delta, but " + reason); });
+            awaitSerial(*serial, limit, lastSeen, quietSince, [&](const std::string& reason) { return std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for submission " + std::to_string(call.values[index]) + " (replay serial " + std::to_string(*serial) + "), which had started when the capture read the delta, but " + reason); }, AgcDriverSerialDone_nid_postfix);
         }
+    }
+
+    std::uint64_t completedSerial(const FrameCall& call, std::uint64_t accepted) const {
+        if (!captureBase) return call.accepted - call.completed < accepted ? accepted - (call.accepted - call.completed) : 0;
+        if (call.completed <= *captureBase) return replayBase;
+        auto found = replaySerials.upper_bound(call.completed);
+        if (found == replaySerials.begin() || std::prev(found)->first != call.completed) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for submission " + std::to_string(call.completed) + ", which had completed when the capture read the delta, but no call since the frame start recorded that serial");
+        while (found != replaySerials.begin()) {
+            --found;
+            if (found->second) return *found->second;
+        }
+        return replayBase;
     }
 
     std::optional<std::uint64_t> startedSerial(const FrameCall& call, std::uint64_t accepted, std::uint64_t serial) const {
@@ -760,14 +773,14 @@ struct Replay {
         return found->second;
     }
 
-    template <typename TBlocked>
-    void awaitSerial(std::uint64_t serial, Clock::time_point limit, std::pair<std::uint64_t, std::uint64_t>& lastSeen, Clock::time_point& quietSince, TBlocked&& blocked) {
-        while (!AgcDriverSerialDone_nid_postfix(serial)) {
+    template <typename TBlocked, typename TDone>
+    void awaitSerial(std::uint64_t serial, Clock::time_point limit, std::pair<std::uint64_t, std::uint64_t>& lastSeen, Clock::time_point& quietSince, TBlocked&& blocked, TDone&& done) {
+        while (!done(serial)) {
             const auto now = Clock::now();
             if (const auto seen = progress(); seen != lastSeen) {
                 lastSeen = seen;
                 quietSince = now;
-            } else if (now - quietSince >= options.paceTimeout && AgcDriverSettled_nid_postfix() && !AgcDriverSerialDone_nid_postfix(serial) && progress() == seen) {
+            } else if (now - quietSince >= options.paceTimeout && AgcDriverSettled_nid_postfix() && !done(serial) && progress() == seen) {
                 throw blocked("no queue runs and the serials stopped at " + std::to_string(seen.second) + "/" + std::to_string(seen.first) + "; blocked on" + describeBlocked());
             }
             if (now >= limit) throw blocked("it did not complete within " + std::to_string(options.busyTimeout.count()) + " ms");
@@ -1098,7 +1111,7 @@ struct Replay {
             const auto limit = Clock::now() + options.busyTimeout;
             auto lastSeen = progress();
             auto quietSince = Clock::now();
-            awaitSerial(after, limit, lastSeen, quietSince, [&](const std::string& reason) { return std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + name + ") took replay serial " + std::to_string(after) + " where the capture's call took none and presented at once, but " + reason); });
+            awaitSerial(after, limit, lastSeen, quietSince, [&](const std::string& reason) { return std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + name + ") took replay serial " + std::to_string(after) + " where the capture's call took none and presented at once, but " + reason); }, AgcDriverSerialDone_nid_postfix);
             return;
         }
         throw std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + name + ") took " + (after == before ? std::string("no replay serial") : "replay serial " + std::to_string(after)) + " where " +
