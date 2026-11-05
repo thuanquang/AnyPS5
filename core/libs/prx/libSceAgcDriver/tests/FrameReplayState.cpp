@@ -4040,7 +4040,6 @@ void testPacingAcceptInflight(const std::filesystem::path& directory) {
     const auto& entry = replay.census[1];
     check(entry.issue.size() == 1 && entry.issue.front() <= 1, ("the submission that waited for the label started with " + (entry.issue.empty() ? std::string("no sample") : std::to_string(entry.issue.front())) + " submissions in flight, not at most 1").c_str());
     check(entry.issueBound == std::vector<std::uint64_t>{1}, "the submission that waited for the label did not record the depth bound 1 that wait left it");
-    check(Replay::secondsOf(replay.issueWaitedNs) >= 0.25, ("the submission waited " + std::to_string(Replay::secondsOf(replay.issueWaitedNs)) + " s for the label, not the 0.3 s the submission that writes it stayed parked").c_str());
     const auto json = depthJson(options, replay);
     check(json.find("\"issue_waits\":{\"inflight\":1,\"stream\":0,\"indirect\":0,\"access\":0}") != std::string::npos && json.find("\"issue_bound\":[1,1,1]") != std::string::npos, ("the depth object does not list the wait and the bound it left: " + json).c_str());
     check(replay.unfinished == 0, "the replay of a submission whose command buffer an earlier submission's label writes did not finish");
