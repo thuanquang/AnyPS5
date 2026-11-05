@@ -458,7 +458,7 @@ std::string readKindName(std::uint32_t kind) {
 }
 
 struct PositionCensus {
-    std::vector<std::uint64_t> issue, restore, ceiling;
+    std::vector<std::uint64_t> issue, restore, ceiling, issueBound;
     std::uint64_t byDepth = 0, byStore = 0, byWait = 0, cpuWaits = 0, gpuWaits = 0;
     std::array<std::uint64_t, HeldCauses> held{};
 };
@@ -474,6 +474,136 @@ MemoryFloors memoryFloors(const FrameCall& call) {
     if ((call.floorFlags & FrameFloorFlag::StoreUnknown) == 0) floors.store = call.storeFloor;
     if ((call.floorFlags & FrameFloorFlag::WaitUnknown) == 0) floors.wait = call.waitFloor;
     return floors;
+}
+
+struct SplitTarget {
+    std::uint64_t begin = 0, end = 0, serial = 0;
+    bool wait = false;
+};
+
+struct SplitAccess {
+    std::uint64_t begin = 0, end = 0;
+    enum class Kind : std::uint8_t { FullStore, Store, Wait, Read } kind = Kind::Read;
+};
+
+struct SplitScan {
+    std::vector<SplitTarget> targets;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> acceptReads, indirect;
+    std::vector<SplitAccess> accesses;
+    bool rewind = false, opaque = false;
+};
+
+std::uint64_t packetAddress(std::uint32_t low, std::uint32_t high) {
+    return low | (static_cast<std::uint64_t>(high) << 32u);
+}
+
+SplitScan scanSubmission(std::span<const std::uint32_t> stream, std::uint64_t address) {
+    namespace Pm4 = AgcDriver::Pm4;
+    SplitScan scan;
+    if (!stream.empty()) scan.acceptReads.emplace_back(address, address + stream.size_bytes());
+    std::vector<std::uint64_t> labels;
+    std::size_t budget = std::size_t{1} << 26u;
+    const auto readAtAccept = [&](std::uint64_t begin, std::uint64_t bytes) {
+        if (bytes == 0) return;
+        scan.acceptReads.emplace_back(begin, begin + bytes);
+        scan.indirect.emplace_back(begin, begin + bytes);
+    };
+    const auto access = [&](std::uint64_t begin, std::uint64_t bytes, SplitAccess::Kind kind) {
+        if (bytes != 0) scan.accesses.push_back(SplitAccess{begin, begin + bytes, kind});
+    };
+    const auto walk = [&](const auto& self, std::span<const std::uint32_t> words, bool conditional) -> bool {
+        if (words.size() > budget) {
+            scan.opaque = true;
+            return true;
+        }
+        budget -= words.size();
+        std::vector<std::pair<std::size_t, std::size_t>> guarded;
+        for (std::size_t cursor = 0; cursor < words.size();) {
+            const auto header = words[cursor];
+            if (Pm4::FillerPacket(header)) {
+                ++cursor;
+                continue;
+            }
+            const auto count = Pm4::PacketWords(header);
+            if ((header >> 30u) != 3u || count > words.size() - cursor) {
+                scan.opaque = true;
+                return true;
+            }
+            const auto packet = words.subspan(cursor, count);
+            const auto opcode = (header >> 8u) & 0xffu;
+            const bool inside = conditional || std::any_of(guarded.begin(), guarded.end(), [cursor](const auto& range) { return range.first <= cursor && cursor < range.second; });
+            cursor += count;
+            if (opcode == 0x59u) {
+                scan.rewind = true;
+                return true;
+            }
+            if (opcode == 0x3fu) {
+                if (count != 4 && count != 14) {
+                    scan.opaque = true;
+                    return true;
+                }
+                const auto target = count == 4 ? packetAddress(packet[1] & ~3u, packet[2] & 0xffffu) : packetAddress(packet[8] & ~3u, packet[9] & 0xffffu);
+                const std::size_t targetWords = (count == 4 ? packet[3] : packet[10]) & 0xfffffu;
+                if (targetWords != 0) {
+                    const auto* const commands = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(target));
+                    if (!AgcDriver::GuestMemory::Accessible(commands, targetWords * sizeof(std::uint32_t))) {
+                        scan.opaque = true;
+                        return true;
+                    }
+                    readAtAccept(target, targetWords * sizeof(std::uint32_t));
+                    if (self(self, std::span(commands, targetWords), inside || count == 14 || Pm4::Predicated(header))) return true;
+                }
+                if (count == 4 && (packet[3] & (1u << 20u)) != 0) return false;
+                continue;
+            }
+            try {
+                if (opcode == 0x22u && count == 5) {
+                    access(packetAddress(packet[1], packet[2]), 4, SplitAccess::Kind::Read);
+                    guarded.emplace_back(cursor, cursor + Pm4::ConditionalWords(packet));
+                } else if (opcode == 0x20u && count == 4 && ((packet[1] >> 16u) & 7u) != 0) {
+                    access(packetAddress(packet[2], packet[3]), ((packet[1] >> 16u) & 7u) == 3 ? 8 : 4, SplitAccess::Kind::Read);
+                } else if (opcode == 0x45u && count == 9) {
+                    access(packetAddress(packet[2], packet[3]), 4, SplitAccess::Kind::Read);
+                } else if (Pm4::IndirectRegisterOpcode(opcode) && count == 5) {
+                    readAtAccept(packetAddress(packet[1], packet[2]), static_cast<std::uint64_t>(packet[4]) * (packet[3] == 0x80000000u ? 8 : 4));
+                } else if ((opcode == 0x3cu || opcode == 0x93u) && count >= 2 && ((packet[1] >> 4u) & 3u) == 1u) {
+                    const auto wait = Pm4::DecodeWait(packet);
+                    scan.targets.push_back(SplitTarget{wait.address, wait.address + wait.bytes, 0, true});
+                    access(wait.address, wait.bytes, SplitAccess::Kind::Wait);
+                    bool labelled = false;
+                    for (std::uint64_t dword = wait.address; dword < wait.address + wait.bytes; dword += 4) labelled = labelled || std::find(labels.begin(), labels.end(), dword) != labels.end();
+                    if (!labelled) readAtAccept(wait.address, wait.bytes);
+                } else if (opcode == 0x39u && count >= 3) {
+                    const auto semaphore = packetAddress(packet[1], packet[2]);
+                    scan.targets.push_back(SplitTarget{semaphore, semaphore + 8, 0, true});
+                } else if (opcode == 0x50u && count == 7 && (Pm4::DmaSource(packet) == 0 || Pm4::DmaSource(packet) == 3)) {
+                    access(packetAddress(packet[2], packet[3]), Pm4::DmaBytes(packet), SplitAccess::Kind::Read);
+                } else if (opcode == 0x40u && count == 6) {
+                    const auto source = Pm4::CopyDataSource(packet);
+                    if (source != 0 && source != Pm4::CopyDataGpuClockSource && !Pm4::CopyDataImmediate(source)) access(packetAddress(packet[2], packet[3]), Pm4::CopyDataBytes(packet), SplitAccess::Kind::Read);
+                }
+                if (opcode == 0x49u || opcode == 0x37u) {
+                    if (const auto label = Pm4::DecodeLabelWrite(packet); label && label->address % 4 == 0 && label->Bytes().size() <= 64) {
+                        for (std::size_t offset = 0; offset < label->Bytes().size(); offset += 4) labels.push_back(label->address + offset);
+                    }
+                }
+                if (opcode == 0x39u && count < 3) {
+                    scan.opaque = true;
+                    continue;
+                }
+                for (const auto& store : Pm4::DecodeStores(packet)) {
+                    if (store.bytes == 0) continue;
+                    scan.targets.push_back(SplitTarget{store.address, store.address + store.bytes, 0, false});
+                    access(store.address, store.bytes, !store.conditional && !Pm4::Predicated(header) && !inside && opcode != 0x39u ? SplitAccess::Kind::FullStore : SplitAccess::Kind::Store);
+                }
+            } catch (const std::exception&) {
+                scan.opaque = true;
+            }
+        }
+        return false;
+    };
+    walk(walk, stream, false);
+    return scan;
 }
 
 void requireDepthOptions(const Options& options) {
@@ -859,6 +989,18 @@ struct Replay {
     std::atomic<std::uint64_t> readWaits{0};
     std::atomic<std::int64_t> readCheckNs{0};
     std::optional<ReadHit> firstRead;
+    std::vector<SplitTarget> inFlight;
+    std::uint64_t opaqueThrough = 0;
+    struct IssuePrep {
+        SplitScan scan;
+        std::vector<std::uint32_t> words;
+        bool fromCopy = false;
+        std::uint64_t need = 0;
+    } prep;
+    std::atomic<std::int64_t> issueWaitedNs{0};
+    std::atomic<std::int64_t> scanNs{0};
+    std::array<std::uint64_t, 4> issueWaits{};
+    std::uint64_t unsettledLandings = 0;
 
     struct SettledHold {
         bool held;
@@ -970,7 +1112,77 @@ struct Replay {
             return std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (" + std::string(AgcDriver::FrameCallName(call.kind)) + ", position " + options.depth->names[position] + ") may start with at most " + std::to_string(bound) + " submissions in flight, but " + reason);
         });
         paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
-        if (plan->frame[index] >= 2) census[position].issue.push_back(accepted - progress().second);
+        if (call.kind == FrameCallKind::Submit) prepareIssue(call);
+        if (plan->frame[index] >= 2) {
+            census[position].issue.push_back(accepted - progress().second);
+            const auto need = call.kind == FrameCallKind::Submit ? prep.need : 0;
+            census[position].issueBound.push_back(need != 0 ? std::min(bound, accepted - need) : bound);
+        }
+    }
+
+    std::runtime_error issueBlocked(const FrameCall& call, std::uint64_t address, std::uint64_t serial, const std::string& reason) const {
+        const auto taken = std::find_if(replaySerials.begin(), replaySerials.end(), [serial](const auto& entry) { return entry.second == serial; });
+        return std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (submit, position " + options.depth->names[plan->position[current]] + ") reads, stores or waits on " + addressText(address) + ", which submission " + std::to_string(serial) + " (capture serial " +
+                                  (taken != replaySerials.end() ? std::to_string(taken->first) : std::string("none")) + ") still stores into or a delta held back until it has run, but " + reason);
+    }
+
+    void prepareIssue(const FrameCall& call) {
+        prep = {};
+        const auto limit = call.completed <= *captureBase ? replayBase : mappedSerial(call.completed);
+        const auto* const guest = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(call.address));
+        const auto words = static_cast<std::size_t>(call.size);
+        for (std::size_t pass = 1;; ++pass) {
+            const auto scanned = Clock::now();
+            prep.scan = {};
+            if (words != 0 && !AgcDriver::GuestMemory::Accessible(guest, words * sizeof(std::uint32_t))) prep.scan.opaque = true;
+            else prep.scan = scanSubmission(std::span(guest, words), call.address);
+            scanNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - scanned).count();
+            std::uint64_t need = 0;
+            std::uint64_t at = 0;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> landing;
+            for (const auto& [begin, end] : prep.scan.acceptReads) {
+                for (const auto& target : inFlight) {
+                    if (target.wait || target.serial > limit) continue;
+                    const auto low = std::max(begin, target.begin);
+                    const auto high = std::min(end, target.end);
+                    if (low >= high) continue;
+                    if (target.serial <= gpuWaitedThrough && AgcDriverGuestStoreSettled_nid_postfix(low, static_cast<std::size_t>(high - low))) continue;
+                    if (target.serial > need) {
+                        need = target.serial;
+                        at = low;
+                    }
+                    landing.emplace_back(low, high);
+                }
+            }
+            if (need == 0) break;
+            if (pass > 4) throw issueBlocked(call, at, need, "the bytes it reads at accept kept changing");
+            ++issueWaits[0];
+            prep.need = std::max(prep.need, need);
+            issueWait(call, need, at, landing);
+        }
+        if (prep.scan.rewind || prep.scan.opaque) opaqueThrough = std::max(opaqueThrough, mappedSerial(call.values.back()));
+    }
+
+    void issueWait(const FrameCall& call, std::uint64_t serial, std::uint64_t address, std::span<const std::pair<std::uint64_t, std::uint64_t>> landing) {
+        const auto began = Clock::now();
+        awaitCompleted(serial, began + options.busyTimeout, [&](const std::string& reason) { return issueBlocked(call, address, serial, reason); });
+        waitThroughOnGpu(call, serial);
+        for (const auto& [begin, end] : landing) {
+            if (!AgcDriverGuestStoreSettled_nid_postfix(begin, static_cast<std::size_t>(end - begin))) throw issueBlocked(call, begin, serial, "its stores there are not in guest memory yet");
+        }
+        pruneInFlight();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+        issueWaitedNs += elapsed;
+        paceWaitedNs += elapsed;
+    }
+
+    void pruneInFlight() {
+        std::erase_if(inFlight, [&](const SplitTarget& target) {
+            if (target.serial > gpuWaitedThrough) return false;
+            if (target.wait || AgcDriverGuestStoreSettled_nid_postfix(target.begin, static_cast<std::size_t>(target.end - target.begin))) return true;
+            ++unsettledLandings;
+            return false;
+        });
     }
 
     void execute(const FrameCall& call) {
@@ -1013,11 +1225,19 @@ struct Replay {
             sceAgcDriverSetTFRing(reinterpret_cast<const volatile void*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size));
             return;
         case FrameCallKind::Submit: {
-            const Packet packet{reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
+            const Packet packet{prep.fromCopy ? prep.words.data() : reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(call.address)), static_cast<std::uint32_t>(call.size), static_cast<std::uint8_t>(call.flags), {}};
             issue(call, [&] {
                 if (call.queue == 0) sceAgcDriverSubmitDcb(&packet);
                 else sceAgcDriverSubmitAcb(call.queue, &packet);
             });
+            if (plan) {
+                const auto serial = *replaySerials.at(call.values.back());
+                for (auto target : prep.scan.targets) {
+                    target.serial = serial;
+                    inFlight.push_back(target);
+                }
+                prep = {};
+            }
             if (++submits % 25 == 0) report();
             return;
         }
@@ -1254,7 +1474,9 @@ struct Replay {
         awaitCompleted(target, began + options.busyTimeout, [&](const std::string& reason) {
             return std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for capture serial " + std::to_string(serial) + " (replay serial " + std::to_string(target) + "; store floor " + std::to_string(store) + ", wait floor " + std::to_string(wait) + ", bound " + std::to_string(bound) + " at position " + options.depth->names[position] + "), but " + reason);
         });
+        const auto waitedThrough = gpuWaitedThrough;
         if (waitThroughOnGpu(call, target)) ++entry.gpuWaits;
+        if (gpuWaitedThrough != waitedThrough) pruneInFlight();
         memoryWaited(gateWaitedNs, began);
         const auto [accepted, completed] = progress();
         if (!restoreGroup(call, Restore::AtDepth)) return restoreHeld(call, DepthCause::Pending);
@@ -1546,6 +1768,9 @@ struct Replay {
         if (options.depth && recording) {
             if (!captureBase) throw std::runtime_error(std::string(DepthWithoutFrameStart));
             plan = planDepth(calls, *options.depth);
+            inFlight.clear();
+            opaqueThrough = 0;
+            prep = {};
             plan->ceiling.assign(calls.size(), 0);
             for (std::size_t index = 0; index < calls.size(); ++index) {
                 if (plan->position[index] != DepthPlan::NoPosition) plan->ceiling[index] = boundOf(index);
@@ -2250,6 +2475,10 @@ std::string depthJson(const Options& options, const Replay& replay) {
     std::snprintf(gate, sizeof(gate), "%.3f", Replay::secondsOf(replay.gateWaitedNs));
     char reads[32];
     std::snprintf(reads, sizeof(reads), "%.3f", Replay::secondsOf(replay.readCheckNs));
+    char issueWaited[32];
+    std::snprintf(issueWaited, sizeof(issueWaited), "%.3f", Replay::secondsOf(replay.issueWaitedNs));
+    char scans[32];
+    std::snprintf(scans, sizeof(scans), "%.3f", Replay::secondsOf(replay.scanNs));
     std::string first = "null";
     if (replay.firstRead) {
         const auto& hit = *replay.firstRead;
@@ -2258,7 +2487,7 @@ std::string depthJson(const Options& options, const Replay& replay) {
     }
     std::string text = "{\"profile\":" + jsonText(std::string(name.begin(), name.end())) + ",\"cap\":" + number(options.depthCap) + ",\"probe\":" + number(options.depthProbe) + ",\"frames\":" + std::to_string(replay.plan ? replay.plan->frames : 0) +
                        ",\"fast_deltas\":" + std::to_string(replay.fastDeltas.load()) + ",\"gate_wait_s\":" + gate + ",\"tail\":" + std::to_string(replay.tailHeld) + ",\"read_waits\":" + std::to_string(replay.readWaits.load()) + ",\"read_wait_first\":" + first +
-                       ",\"read_check_s\":" + reads + ",\"positions\":[";
+                       ",\"read_check_s\":" + reads + ",\"issue_waits\":{\"inflight\":" + std::to_string(replay.issueWaits[0]) + "},\"issue_wait_s\":" + issueWaited + ",\"scan_s\":" + scans + ",\"unsettled_landings\":" + std::to_string(replay.unsettledLandings) + ",\"positions\":[";
     const auto spread = [](std::vector<std::uint64_t> values, bool deepest) {
         if (values.empty()) return std::string("null");
         std::sort(values.begin(), values.end());
@@ -2273,7 +2502,7 @@ std::string depthJson(const Options& options, const Replay& replay) {
             if (static_cast<DepthCause>(cause) != DepthCause::Tail) held += std::string(held.empty() ? "" : ",") + "\"" + std::string(HeldNames[cause]) + "\":" + std::to_string(entry.held[cause]);
         }
         text += std::string(position == 0 ? "" : ",") + "{\"position\":" + jsonText(profile.names[position]) + ",\"bound\":" + std::to_string(profile.bounds[position]) + ",\"observed\":" + std::to_string(profile.observed[position]) +
-                ",\"issued\":" + std::to_string(entry.issue.size()) + ",\"issue_depth\":" + spread(entry.issue, true) + ",\"ceiling\":" + spread(entry.ceiling, false) + ",\"restored\":" + std::to_string(entry.restore.size()) +
+                ",\"issued\":" + std::to_string(entry.issue.size()) + ",\"issue_depth\":" + spread(entry.issue, true) + ",\"issue_bound\":" + spread(entry.issueBound, false) + ",\"ceiling\":" + spread(entry.ceiling, false) + ",\"restored\":" + std::to_string(entry.restore.size()) +
                 ",\"restore_depth\":" + spread(entry.restore, true) + ",\"by_depth\":" + std::to_string(entry.byDepth) + ",\"by_store\":" + std::to_string(entry.byStore) + ",\"by_wait\":" + std::to_string(entry.byWait) +
                 ",\"cpu_waits\":" + std::to_string(entry.cpuWaits) + ",\"gpu_waits\":" + std::to_string(entry.gpuWaits) + ",\"held\":{" + held + "}}";
     }

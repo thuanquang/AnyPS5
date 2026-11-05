@@ -3361,6 +3361,18 @@ std::array<std::uint32_t, 7> dmaPacket(const void* from, const void* to, std::si
     return {0xc0055000u, 0x80000000u, low(from), high(from), low(to), high(to), static_cast<std::uint32_t>(bytes)};
 }
 
+std::array<std::uint32_t, 8> releasePacket(const void* label, std::uint32_t value) {
+    return {0xc0064900u, 0x514u, 0x20010000u, low(label), high(label), value, 0u, 0u};
+}
+
+std::array<std::uint32_t, 7> dmaImmediate(const void* to, std::uint32_t value) {
+    return {0xc0055000u, 0xc0300000u, value, 0u, low(to), high(to), 4u};
+}
+
+std::array<std::uint32_t, 4> ibPacket(const void* target, std::uint32_t words) {
+    return {0xc0023f00u, low(target), high(target) & 0xffffu, words};
+}
+
 template <std::size_t Size>
 std::size_t put(std::uint32_t* words, std::size_t at, const std::array<std::uint32_t, Size>& packet) {
     std::copy(packet.begin(), packet.end(), words + at);
@@ -3898,6 +3910,142 @@ void testPacingReadTracking(const std::filesystem::path& directory) {
     check(*sentinel == 0, "the replay restored the capture's snapshot before it refused to run with the GPU read tracking off");
 }
 
+std::string scanRanges(const std::byte* base, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    std::string text;
+    for (const auto& [begin, end] : ranges) text += (text.empty() ? "" : " ") + addressText(begin - address(base)) + "-" + addressText(end - address(base));
+    return "[" + text + "]";
+}
+
+std::string scanTargets(const std::byte* base, const std::vector<SplitTarget>& targets) {
+    std::string text;
+    for (const auto& target : targets) text += std::string(text.empty() ? "" : " ") + (target.wait ? "wait " : "store ") + addressText(target.begin - address(base)) + "-" + addressText(target.end - address(base));
+    return "[" + text + "]";
+}
+
+std::string scanAccesses(const std::byte* base, const std::vector<SplitAccess>& accesses) {
+    constexpr std::array<std::string_view, 4> kinds{"full", "store", "wait", "read"};
+    std::string text;
+    for (const auto& entry : accesses) text += std::string(text.empty() ? "" : " ") + std::string(kinds[static_cast<std::size_t>(entry.kind)]) + " " + addressText(entry.begin - address(base)) + "-" + addressText(entry.end - address(base));
+    return "[" + text + "]";
+}
+
+void checkScan(const std::byte* base, const char* stream, const SplitScan& scan, bool rewind, const std::vector<SplitTarget>& targets, const std::vector<SplitAccess>& accesses, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& acceptReads, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& indirect) {
+    const std::string name(stream);
+    check(scan.rewind == rewind && !scan.opaque, ("the scan of " + name + " found " + (scan.rewind ? "a REWIND" : "no REWIND") + (scan.opaque ? " and a packet it cannot follow" : "") + ", not " + (rewind ? "a REWIND" : "no REWIND")).c_str());
+    check(scanTargets(base, scan.targets) == scanTargets(base, targets), ("the scan of " + name + " found the targets " + scanTargets(base, scan.targets) + ", not " + scanTargets(base, targets)).c_str());
+    check(scanAccesses(base, scan.accesses) == scanAccesses(base, accesses), ("the scan of " + name + " found the accesses " + scanAccesses(base, scan.accesses) + ", not " + scanAccesses(base, accesses)).c_str());
+    check(scanRanges(base, scan.acceptReads) == scanRanges(base, acceptReads), ("the scan of " + name + " found the bytes read at submission " + scanRanges(base, scan.acceptReads) + ", not " + scanRanges(base, acceptReads)).c_str());
+    check(scanRanges(base, scan.indirect) == scanRanges(base, indirect), ("the scan of " + name + " found the bytes read at submission outside the command buffer " + scanRanges(base, scan.indirect) + ", not " + scanRanges(base, indirect)).c_str());
+}
+
+void testPacingSplitScan() {
+    using Kind = SplitAccess::Kind;
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes, false);
+    const auto at = [bytes](std::size_t offset) { return reinterpret_cast<std::uint32_t*>(bytes + offset); };
+    const auto range = [](const void* pointer, std::uint64_t size) { return std::pair{address(pointer), address(pointer) + size}; };
+    const auto store = [](const void* pointer, std::uint64_t size) { return SplitTarget{address(pointer), address(pointer) + size, 0, false}; };
+    const auto waited = [](const void* pointer, std::uint64_t size) { return SplitTarget{address(pointer), address(pointer) + size, 0, true}; };
+    const auto access = [](const void* pointer, std::uint64_t size, Kind kind) { return SplitAccess{address(pointer), address(pointer) + size, kind}; };
+    auto* stream = at(0);
+    auto* buffer = at(0x400);
+    auto* rewound = at(0x800);
+    auto* guarded = at(0xc00);
+    auto* x = at(0x1000);
+    auto* y = at(0x1010);
+    auto* source = at(0x1100);
+    auto* destination = at(0x1200);
+    auto* label = at(0x1300);
+    auto* gate = at(0x1310);
+    auto* own = at(0x1320);
+    auto* inner = at(0x1330);
+    auto* registers = at(0x1340);
+    auto* skipped = at(0x1360);
+    auto* predicate = at(0x1400);
+    auto* condition = at(0x1410);
+    auto* inRange = at(0x1420);
+    auto* predicated = at(0x1430);
+    auto* compared = at(0x1440);
+    auto* conditional = at(0x1450);
+    auto* semaphore = at(0x1460);
+    const auto inside = put(buffer, 0, writePacket(inner, 1));
+    auto used = put(stream, 0, writePacket(x, 1));
+    used = put(stream, used, dmaImmediate(y, 0));
+    used = put(stream, used, dmaPacket(source, destination, 64));
+    used = put(stream, used, releasePacket(label, 1));
+    used = put(stream, used, waitPacket(gate));
+    used = put(stream, used, releasePacket(own, 1));
+    used = put(stream, used, waitPacket(own));
+    used = put(stream, used, ibPacket(buffer, static_cast<std::uint32_t>(inside)));
+    used = put(stream, used, std::array<std::uint32_t, 5>{0xc0036300u, low(registers), high(registers), 0x80000000u, 2u});
+    checkScan(bytes, "a command buffer with an indirect buffer and a register list", scanSubmission(std::span<const std::uint32_t>(stream, used), address(stream)), false,
+              {store(x, 4), store(y, 4), store(destination, 64), store(label, 4), waited(gate, 4), store(own, 4), waited(own, 4), store(inner, 4)},
+              {access(x, 4, Kind::FullStore), access(y, 4, Kind::FullStore), access(source, 64, Kind::Read), access(destination, 64, Kind::FullStore), access(label, 4, Kind::FullStore), access(gate, 4, Kind::Wait), access(own, 4, Kind::FullStore), access(own, 4, Kind::Wait), access(inner, 4, Kind::FullStore)},
+              {range(stream, used * 4), range(gate, 4), range(buffer, inside * 4), range(registers, 16)}, {range(gate, 4), range(buffer, inside * 4), range(registers, 16)});
+    auto ended = put(rewound, 0, NopPacket);
+    ended = put(rewound, ended, std::array<std::uint32_t, 2>{0xc0005900u, 0x80000000u});
+    ended = put(rewound, ended, writePacket(skipped, 1));
+    checkScan(bytes, "a command buffer with a REWIND", scanSubmission(std::span<const std::uint32_t>(rewound, ended), address(rewound)), true, {}, {}, {range(rewound, ended * 4)}, {});
+    auto held = put(guarded, 0, std::array<std::uint32_t, 4>{0xc0022000u, 0x00030000u, low(predicate), high(predicate)});
+    held = put(guarded, held, std::array<std::uint32_t, 5>{0xc0032200u, low(condition), high(condition), 0u, 5u});
+    held = put(guarded, held, writePacket(inRange, 1));
+    auto predicatedWrite = writePacket(predicated, 1);
+    predicatedWrite[0] |= 1u;
+    held = put(guarded, held, predicatedWrite);
+    held = put(guarded, held, std::array<std::uint32_t, 9>{0xc0074500u, 0x13u, low(compared), high(compared), 1u, 0xffffffffu, low(conditional), high(conditional), 1u});
+    held = put(guarded, held, std::array<std::uint32_t, 4>{0xc0023900u, low(semaphore), high(semaphore), 0u});
+    checkScan(bytes, "a command buffer with predicated and conditional stores", scanSubmission(std::span<const std::uint32_t>(guarded, held), address(guarded)), false,
+              {store(inRange, 4), store(predicated, 4), store(conditional, 4), waited(semaphore, 8), store(semaphore, 8)},
+              {access(predicate, 8, Kind::Read), access(condition, 4, Kind::Read), access(inRange, 4, Kind::Store), access(predicated, 4, Kind::Store), access(compared, 4, Kind::Read), access(conditional, 4, Kind::Store), access(semaphore, 8, Kind::Store)},
+              {range(guarded, held * 4)}, {});
+}
+
+void testPacingAcceptInflight(const std::filesystem::path& directory) {
+    openDevice();
+    constexpr auto Base = DepthBase;
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* gate = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* stored = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    auto* reading = reinterpret_cast<std::uint32_t*>(bytes + 8192);
+    auto* words = reinterpret_cast<std::uint32_t*>(allocate(FrameCaptureWriter::BlockBytes, false));
+    *gate = 0;
+    *stored = 0;
+    auto* parking = words;
+    auto* releasing = words + 32;
+    auto* nop = words + 64;
+    auto* label = reading + 4;
+    const auto parked = put(parking, 0, waitPacket(gate));
+    const auto released = put(releasing, 0, releasePacket(label, 0x11u));
+    const auto read = put(reading, 0, writePacket(stored, 0x5au));
+    put(nop, 0, NopPacket);
+    FrameCaptureWriter writer(directory);
+    writer.WriteCall(depthFrameStart());
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.paceTimeout = std::chrono::seconds(2);
+    options.drainTimeout = std::chrono::seconds(2);
+    options.busyTimeout = std::chrono::seconds(10);
+    options.depth = depthProfile({{4, 4}, {4, 4}, {4, 4}});
+    Replay replay{options, reader};
+    replay.recording = true;
+    const std::array calls{pacedCall(FrameCallKind::Suspend, 1, Base + 1), pacedCall(FrameCallKind::Submit, 2, Base + 2, parking, parked), pacedCall(FrameCallKind::Submit, 3, Base + 3, releasing, released), pacedCall(FrameCallKind::Suspend, 4, Base + 4), pacedCall(FrameCallKind::Submit, 5, Base + 5, reading, read), pacedCall(FrameCallKind::Submit, 6, Base + 6, nop, NopPacket.size())};
+    const auto ran = runBehindGate(replay, calls, gate, 4, [] { return false; });
+    AgcDriverWaitIdle_nid_postfix();
+    const auto value = loaded(stored);
+    check(ran.failure.empty(), ("the replay of a submission whose command buffer an earlier submission's label writes failed: " + ran.failure).c_str());
+    check(ran.armed, "the replay did not run ahead of a parked submission");
+    check(value == 0x11u, ("the submission whose command buffer holds the dword an earlier submission's label writes stored " + addressText(value) + ", not 0x11: it was accepted before that label landed").c_str());
+    check(replay.issueWaits[0] == 1, ("the replay counted " + std::to_string(replay.issueWaits[0]) + " waits for in-flight stores into bytes a submission reads at submission, not 1").c_str());
+    const auto& entry = replay.census[1];
+    check(entry.issue.size() == 1 && entry.issue.front() <= 1, ("the submission that waited for the label started with " + (entry.issue.empty() ? std::string("no sample") : std::to_string(entry.issue.front())) + " submissions in flight, not at most 1").c_str());
+    check(entry.issueBound == std::vector<std::uint64_t>{1}, "the submission that waited for the label did not record the depth bound 1 that wait left it");
+    check(Replay::secondsOf(replay.issueWaitedNs) >= 0.25, ("the submission waited " + std::to_string(Replay::secondsOf(replay.issueWaitedNs)) + " s for the label, not the 0.3 s the submission that writes it stayed parked").c_str());
+    const auto json = depthJson(options, replay);
+    check(json.find("\"issue_waits\":{\"inflight\":1}") != std::string::npos && json.find("\"issue_bound\":[1,1,1]") != std::string::npos, ("the depth object does not list the wait and the bound it left: " + json).c_str());
+    check(replay.unfinished == 0, "the replay of a submission whose command buffer an earlier submission's label writes did not finish");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -3973,6 +4121,8 @@ int main(int argc, char** argv) {
         else if (mode == "pacing_refusals") testPacingRefusals(directory);
         else if (mode == "pacing_gpu_read" || mode == "pacing_gpu_read_same") testPacingGpuRead(directory, mode == "pacing_gpu_read_same");
         else if (mode == "pacing_read_tracking") testPacingReadTracking(directory);
+        else if (mode == "pacing_split_scan") testPacingSplitScan();
+        else if (mode == "pacing_accept_inflight") testPacingAcceptInflight(directory);
         else throw std::runtime_error("unknown test");
         if (mode != "reservation_failure" && mode != "gate_failure" && mode != "pacing_failure") AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");
