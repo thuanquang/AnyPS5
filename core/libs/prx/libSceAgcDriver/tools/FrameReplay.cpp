@@ -33,6 +33,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -96,6 +97,7 @@ struct Options {
     std::optional<DepthProfile> depth;
     std::optional<std::uint64_t> depthCap, depthProbe;
     std::vector<std::string> depthHold;
+    bool depthSplit = false;
 };
 
 std::uint64_t contentHash(const std::byte* bytes, std::size_t size);
@@ -114,6 +116,44 @@ struct FlipHash {
 };
 
 thread_local bool issuing = false;
+
+using ByteRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+thread_local std::span<const std::pair<std::uint64_t, std::uint64_t>> restoring;
+
+struct RestoringScope {
+    explicit RestoringScope(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) : previous(restoring) {
+        restoring = ranges;
+    }
+    ~RestoringScope() {
+        restoring = previous;
+    }
+    RestoringScope(const RestoringScope&) = delete;
+    RestoringScope& operator=(const RestoringScope&) = delete;
+
+private:
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> previous;
+};
+
+bool restoringCovers(std::uint64_t begin, std::uint64_t end) {
+    auto cursor = begin;
+    for (const auto& [low, high] : restoring) {
+        if (low > cursor) break;
+        cursor = std::max(cursor, high);
+        if (cursor >= end) return true;
+    }
+    return cursor >= end;
+}
+
+ByteRanges sortedRanges(ByteRanges ranges) {
+    std::sort(ranges.begin(), ranges.end());
+    ByteRanges merged;
+    for (const auto& [begin, end] : ranges) {
+        if (!merged.empty() && begin <= merged.back().second) merged.back().second = std::max(merged.back().second, end);
+        else merged.emplace_back(begin, end);
+    }
+    return merged;
+}
 
 std::string addressText(std::uint64_t value) {
     char text[24];
@@ -459,7 +499,7 @@ std::string readKindName(std::uint32_t kind) {
 
 struct PositionCensus {
     std::vector<std::uint64_t> issue, restore, ceiling, issueBound;
-    std::uint64_t byDepth = 0, byStore = 0, byWait = 0, cpuWaits = 0, gpuWaits = 0;
+    std::uint64_t byDepth = 0, byStore = 0, byWait = 0, cpuWaits = 0, gpuWaits = 0, split = 0;
     std::array<std::uint64_t, HeldCauses> held{};
 };
 
@@ -1001,6 +1041,55 @@ struct Replay {
     std::atomic<std::int64_t> scanNs{0};
     std::array<std::uint64_t, 4> issueWaits{};
     std::uint64_t unsettledLandings = 0;
+    using LateDwords = std::map<std::uint64_t, std::uint64_t>;
+    struct Deferred {
+        std::uint32_t value = 0;
+        std::uint64_t floor = 0, call = 0;
+        bool valued = false;
+    };
+    std::map<std::uint64_t, Deferred> deferred;
+    struct Guard {
+        std::uint64_t begin = 0, end = 0;
+    };
+    struct GuardSet {
+        std::vector<Guard> runs;
+        std::uint64_t low = 0, high = 0, call = 0;
+        std::uint64_t store = 0, wait = 0;
+        std::uint32_t position = 0;
+    };
+    std::vector<GuardSet> guards;
+    std::shared_mutex splitMutex;
+    std::atomic<std::size_t> watched{0};
+    struct Violation {
+        bool held = false;
+        std::uint64_t serial = 0, begin = 0, end = 0, call = 0, store = 0, wait = 0, floor = 0;
+        std::uint32_t position = 0;
+    };
+    std::mutex violationMutex;
+    std::optional<Violation> violation;
+    std::atomic<bool> violated{false};
+    inline static std::atomic<Replay*> splitting{nullptr};
+    static constexpr std::uint64_t SplitLimitBytes = std::uint64_t{1} << 20u;
+    std::uint64_t splitDeltas = 0, lateDwords = 0, unexplained = 0, splitBlocked = 0, flushedDwords = 0, flushUnsettled = 0, deferredMax = 0, deferredLeft = 0, inFlightFlushes = 0;
+    std::atomic<std::uint64_t> unattributedViolations{0};
+    std::atomic<std::int64_t> observerNs{0};
+
+    struct SplitObserver {
+        explicit SplitObserver(Replay& replay) {
+            splitting.store(&replay, std::memory_order_release);
+            AgcDriver::GuestMemory::SetDriverStoreObserver(&Replay::observeStore);
+            AgcDriver::GuestMemory::SetGpuWriteNoteObserver(&Replay::observeStore);
+        }
+        ~SplitObserver() {
+            AgcDriver::GuestMemory::SetDriverStoreObserver(nullptr);
+            AgcDriver::GuestMemory::SetGpuWriteNoteObserver(nullptr);
+            splitting.store(nullptr, std::memory_order_release);
+        }
+        SplitObserver(const SplitObserver&) = delete;
+        SplitObserver& operator=(const SplitObserver&) = delete;
+    };
+
+    enum class Flush { AtDepth, Held, Final };
 
     struct SettledHold {
         bool held;
@@ -1120,10 +1209,24 @@ struct Replay {
         }
     }
 
-    std::runtime_error issueBlocked(const FrameCall& call, std::uint64_t address, std::uint64_t serial, const std::string& reason) const {
+    std::string submissionText(std::uint64_t serial) const {
         const auto taken = std::find_if(replaySerials.begin(), replaySerials.end(), [serial](const auto& entry) { return entry.second == serial; });
-        return std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (submit, position " + options.depth->names[plan->position[current]] + ") reads, stores or waits on " + addressText(address) + ", which submission " + std::to_string(serial) + " (capture serial " +
-                                  (taken != replaySerials.end() ? std::to_string(taken->first) : std::string("none")) + ") still stores into or a delta held back until it has run, but " + reason);
+        return "submission " + std::to_string(serial) + " (capture serial " + (taken != replaySerials.end() ? std::to_string(taken->first) : std::string("none")) + ")";
+    }
+
+    std::runtime_error issueBlocked(const FrameCall& call, std::uint64_t address, std::uint64_t serial, const std::string& reason) const {
+        return std::runtime_error("frame replay: call " + std::to_string(call.ordinal) + " (submit, position " + options.depth->names[plan->position[current]] + ") reads, stores or waits on " + addressText(address) + ", which " + submissionText(serial) + " still stores into or a delta held back until it has run, but " + reason);
+    }
+
+    ByteRanges outsideDeferred(std::uint64_t begin, std::uint64_t end) const {
+        ByteRanges pieces;
+        auto cursor = begin;
+        for (auto entry = deferred.lower_bound(begin & ~std::uint64_t{3}); entry != deferred.end() && entry->first < end; ++entry) {
+            if (entry->first > cursor) pieces.emplace_back(cursor, entry->first);
+            cursor = std::max(cursor, entry->first + 4);
+        }
+        if (cursor < end) pieces.emplace_back(cursor, end);
+        return pieces;
     }
 
     void prepareIssue(const FrameCall& call) {
@@ -1139,26 +1242,63 @@ struct Replay {
             scanNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - scanned).count();
             std::uint64_t need = 0;
             std::uint64_t at = 0;
-            std::vector<std::pair<std::uint64_t, std::uint64_t>> landing;
+            const auto needs = [&](std::uint64_t serial, std::uint64_t address) {
+                if (serial <= need) return;
+                need = serial;
+                at = address;
+            };
+            ByteRanges landing;
             for (const auto& [begin, end] : prep.scan.acceptReads) {
                 for (const auto& target : inFlight) {
                     if (target.wait || target.serial > limit) continue;
                     const auto low = std::max(begin, target.begin);
                     const auto high = std::min(end, target.end);
                     if (low >= high) continue;
-                    if (target.serial <= gpuWaitedThrough && AgcDriverGuestStoreSettled_nid_postfix(low, static_cast<std::size_t>(high - low))) continue;
-                    if (target.serial > need) {
-                        need = target.serial;
-                        at = low;
+                    for (const auto& [from, to] : outsideDeferred(low, high)) {
+                        if (target.serial <= gpuWaitedThrough && AgcDriverGuestStoreSettled_nid_postfix(from, static_cast<std::size_t>(to - from))) continue;
+                        needs(target.serial, from);
+                        landing.emplace_back(from, to);
                     }
-                    landing.emplace_back(low, high);
                 }
+            }
+            const bool landed = !landing.empty();
+            bool stream = false;
+            bool indirect = false;
+            std::size_t accessed = 0;
+            std::vector<std::uint64_t> held;
+            if (!deferred.empty()) {
+                const auto collect = [&](std::uint64_t begin, std::uint64_t end, bool& found) {
+                    for (auto entry = deferred.lower_bound(begin & ~std::uint64_t{3}); entry != deferred.end() && entry->first < end; ++entry) {
+                        found = true;
+                        needs(entry->second.floor, entry->first);
+                        held.push_back(entry->first);
+                    }
+                };
+                collect(call.address, call.address + words * sizeof(std::uint32_t), stream);
+                for (const auto& [begin, end] : prep.scan.indirect) collect(begin, end, indirect);
+                std::set<std::uint64_t> touched;
+                for (const auto& access : prep.scan.accesses) {
+                    for (auto entry = deferred.lower_bound(access.begin & ~std::uint64_t{3}); entry != deferred.end() && entry->first < access.end; ++entry) {
+                        if (!touched.insert(entry->first).second) continue;
+                        needs(entry->second.floor, entry->first);
+                        held.push_back(entry->first);
+                    }
+                }
+                accessed = touched.size();
             }
             if (need == 0) break;
             if (pass > 4) throw issueBlocked(call, at, need, "the bytes it reads at accept kept changing");
-            ++issueWaits[0];
+            if (landed) ++issueWaits[0];
+            if (stream) ++issueWaits[1];
+            if (indirect) ++issueWaits[2];
+            issueWaits[3] += accessed;
             prep.need = std::max(prep.need, need);
             issueWait(call, need, at, landing);
+            if (held.empty()) continue;
+            flushDue(Flush::AtDepth);
+            for (const auto dword : held) {
+                if (const auto kept = deferred.find(dword); kept != deferred.end()) throw issueBlocked(call, dword, kept->second.floor, "its stores there are not in guest memory yet");
+            }
         }
         if (prep.scan.rewind || prep.scan.opaque) opaqueThrough = std::max(opaqueThrough, mappedSerial(call.values.back()));
     }
@@ -1167,8 +1307,12 @@ struct Replay {
         const auto began = Clock::now();
         awaitCompleted(serial, began + options.busyTimeout, [&](const std::string& reason) { return issueBlocked(call, address, serial, reason); });
         waitThroughOnGpu(call, serial);
-        for (const auto& [begin, end] : landing) {
-            if (!AgcDriverGuestStoreSettled_nid_postfix(begin, static_cast<std::size_t>(end - begin))) throw issueBlocked(call, begin, serial, "its stores there are not in guest memory yet");
+        const auto settling = sortedRanges(ByteRanges(landing.begin(), landing.end()));
+        {
+            const RestoringScope scope(settling);
+            for (const auto& [begin, end] : landing) {
+                if (!AgcDriverGuestStoreSettled_nid_postfix(begin, static_cast<std::size_t>(end - begin))) throw issueBlocked(call, begin, serial, "its stores there are not in guest memory yet");
+            }
         }
         pruneInFlight();
         const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
@@ -1185,7 +1329,214 @@ struct Replay {
         });
     }
 
+    static void observeStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial) {
+        if (auto* const replay = splitting.load(std::memory_order_acquire)) replay->checkStore(begin, end, serial);
+    }
+
+    void checkStore(std::uint64_t begin, std::uint64_t end, std::uint64_t serial) {
+        if (watched.load(std::memory_order_acquire) == 0 || begin >= end) return;
+        const auto began = Clock::now();
+        const bool anonymous = serial == 0 || serial == AgcDriver::GuestMemory::TitleCallStoreSerial;
+        std::optional<Violation> found;
+        {
+            const std::shared_lock lock(splitMutex);
+            for (const auto& set : guards) {
+                if (!anonymous && (serial <= set.low || serial > set.high)) continue;
+                auto run = std::upper_bound(set.runs.begin(), set.runs.end(), begin, [](std::uint64_t value, const Guard& guard) { return value < guard.begin; });
+                if (run != set.runs.begin()) --run;
+                for (; run != set.runs.end() && run->begin < end; ++run) {
+                    const auto low = std::max(begin, run->begin);
+                    const auto high = std::min(end, run->end);
+                    if (low >= high || restoringCovers(low, high)) continue;
+                    found = Violation{false, serial, begin, end, set.call, set.store, set.wait, 0, set.position};
+                    break;
+                }
+                if (found) break;
+            }
+            if (!found) {
+                for (auto entry = deferred.lower_bound(begin & ~std::uint64_t{3}); entry != deferred.end() && entry->first < end; ++entry) {
+                    if (serial != 0 && serial <= entry->second.floor) continue;
+                    found = Violation{true, serial, begin, end, entry->second.call, 0, 0, entry->second.floor, 0};
+                    break;
+                }
+            }
+        }
+        if (found) {
+            if (!found->held && anonymous) ++unattributedViolations;
+            const std::lock_guard lock(violationMutex);
+            if (!violation) {
+                violation = found;
+                violated.store(true, std::memory_order_release);
+            }
+        }
+        observerNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
+    }
+
+    void checkViolation() {
+        if (!violated.load(std::memory_order_acquire)) return;
+        Violation found;
+        {
+            const std::lock_guard lock(violationMutex);
+            found = *violation;
+        }
+        const bool anonymous = found.serial == 0 || found.serial == AgcDriver::GuestMemory::TitleCallStoreSerial;
+        const auto stored = "frame replay: " + (anonymous ? std::string("a store the driver reported with no submission") : submissionText(found.serial)) + " stored " + std::to_string(found.end - found.begin) + " bytes at " + addressText(found.begin);
+        if (found.held) throw std::runtime_error(stored + " while --depth-split held back the value the memory delta at call " + std::to_string(found.call) + " restores there until submission " + std::to_string(found.floor) + " has run; the replay orders only the PM4 stores of later submissions, so that value would land after this store");
+        throw std::runtime_error(stored + ", which --depth-split restored ahead of the floor of the memory delta at call " + std::to_string(found.call) + " (store floor " + std::to_string(found.store) + ", wait floor " + std::to_string(found.wait) +
+                                 "): no PM4 store of the submissions in flight targets those bytes, so the delta's floor came from a store the replay cannot order; restore that position with --depth-hold " + options.depth->names[found.position] + " or replay without --depth-split");
+    }
+
+    void flushDue(Flush mode) {
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> due;
+        {
+            const std::lock_guard lock(splitMutex);
+            if (deferred.empty() && guards.empty()) return;
+            for (const auto& [dword, held] : deferred) {
+                if (held.valued && (mode == Flush::Final || held.floor <= gpuWaitedThrough)) due.emplace_back(dword, held.value);
+            }
+            std::erase_if(guards, [this](const GuardSet& set) { return set.high <= gpuWaitedThrough; });
+            watched.store(guards.size() + deferred.size(), std::memory_order_release);
+        }
+        std::vector<std::uint64_t> written;
+        for (const auto& [dword, value] : due) {
+            const std::array range{std::pair{dword, dword + 4}};
+            const RestoringScope scope(range);
+            if (mode != Flush::AtDepth) {
+                AgcDriverPrepareGuestStore_nid_postfix(dword, 4);
+            } else if (!AgcDriverGuestStoreSettled_nid_postfix(dword, 4)) {
+                ++flushUnsettled;
+                continue;
+            }
+            std::atomic_ref<std::uint32_t>(*reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(dword))).store(value, std::memory_order_release);
+            written.push_back(dword);
+        }
+        if (written.empty()) return;
+        const std::lock_guard lock(splitMutex);
+        for (const auto dword : written) deferred.erase(dword);
+        flushedDwords += written.size();
+        watched.store(guards.size() + deferred.size(), std::memory_order_release);
+    }
+
+    LateDwords groupDeferred(const FrameCall& call) const {
+        LateDwords held;
+        const auto found = groups.find(call.values.at(0));
+        if (deferred.empty() || found == groups.end()) return held;
+        for (const auto* chunk : found->second) {
+            if (skipped.Overlaps(*chunk)) continue;
+            for (auto entry = deferred.lower_bound(chunk->address & ~std::uint64_t{3}); entry != deferred.end() && entry->first < chunk->address + chunk->bytes; ++entry) held.emplace(entry->first, entry->second.floor);
+        }
+        return held;
+    }
+
+    struct LateSet {
+        LateDwords dwords;
+        bool blocked = false;
+        bool limited = false;
+    };
+
+    LateSet lateDwordsOf(const FrameCall& call) const {
+        LateSet late;
+        if (opaqueThrough > gpuWaitedThrough) {
+            late.blocked = true;
+            return late;
+        }
+        const auto found = groups.find(call.values.at(0));
+        if (found == groups.end()) return late;
+        constexpr auto Limit = SplitLimitBytes / sizeof(std::uint32_t);
+        const auto refuse = [&late](bool blocked) {
+            late.dwords.clear();
+            (blocked ? late.blocked : late.limited) = true;
+            return late;
+        };
+        for (const auto* chunk : found->second) {
+            if (skipped.Overlaps(*chunk)) continue;
+            const auto begin = chunk->address;
+            const auto end = begin + chunk->bytes;
+            const bool unaligned = begin % 4 != 0 || chunk->bytes % 4 != 0;
+            for (const auto& target : inFlight) {
+                const auto low = std::max(begin, target.begin);
+                const auto high = std::min(end, target.end);
+                if (low >= high) continue;
+                if (unaligned) return refuse(true);
+                for (auto dword = low & ~std::uint64_t{3}; dword < high; dword += 4) {
+                    auto& floor = late.dwords[dword];
+                    floor = std::max(floor, target.serial);
+                    if (late.dwords.size() > Limit) return refuse(false);
+                }
+            }
+            for (auto entry = deferred.lower_bound(begin & ~std::uint64_t{3}); entry != deferred.end() && entry->first < end; ++entry) {
+                if (unaligned) return refuse(true);
+                auto& floor = late.dwords[entry->first];
+                floor = std::max(floor, entry->second.floor);
+                if (late.dwords.size() > Limit) return refuse(false);
+            }
+        }
+        return late;
+    }
+
+    void holdBack(const FrameCall& call, const LateDwords& late, std::uint64_t recorded, std::uint64_t store, std::uint64_t wait, std::uint32_t position) {
+        const auto& chunks = groups.at(call.values.at(0));
+        GuardSet set{{}, gpuWaitedThrough, recorded, call.ordinal, store, wait, position};
+        for (const auto& [begin, end] : sortedRanges(cutRuns(chunks, chunkRuns(chunks), &late))) set.runs.push_back(Guard{begin, end});
+        const std::lock_guard lock(splitMutex);
+        guards.push_back(std::move(set));
+        for (const auto& [dword, floor] : late) {
+            auto& held = deferred[dword];
+            held.floor = std::max(held.floor, floor);
+            if (!held.valued) held.call = call.ordinal;
+        }
+        deferredMax = std::max<std::uint64_t>(deferredMax, deferred.size());
+        watched.store(guards.size() + deferred.size(), std::memory_order_release);
+    }
+
+    void withdraw(const FrameCall& call) {
+        const std::lock_guard lock(splitMutex);
+        std::erase_if(guards, [&call](const GuardSet& set) { return set.call == call.ordinal; });
+        std::erase_if(deferred, [&call](const auto& entry) { return entry.second.call == call.ordinal && !entry.second.valued; });
+        watched.store(guards.size() + deferred.size(), std::memory_order_release);
+    }
+
+    void settleHeldFor(const FrameCall& call) {
+        const auto held = groupDeferred(call);
+        if (held.empty()) return;
+        std::uint64_t floor = 0;
+        for (const auto& [dword, serial] : held) floor = std::max(floor, serial);
+        const auto blocked = [&](std::uint64_t address, const std::string& reason) {
+            return std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + ", read with submissions in flight, restores the dword at " + addressText(address) + ", which --depth-split held back until " + submissionText(floor) + " has run, but " + reason);
+        };
+        awaitCompleted(floor, Clock::now() + options.busyTimeout, [&](const std::string& reason) { return blocked(held.begin()->first, reason); });
+        const auto waitedThrough = gpuWaitedThrough;
+        waitThroughOnGpu(call, floor);
+        if (gpuWaitedThrough != waitedThrough) pruneInFlight();
+        flushDue(Flush::AtDepth);
+        ++inFlightFlushes;
+        for (const auto& [dword, serial] : held) {
+            if (deferred.contains(dword)) throw blocked(dword, "the stores of the submissions it waited for there did not settle");
+        }
+    }
+
+    void finishSplit() {
+        checkViolation();
+        if (unfinished == 0) {
+            if (!AgcDriverWaitRecordedOnGpuFor_nid_postfix(options.busyTimeout.count())) throw std::runtime_error("frame replay: the GPU work recorded so far did not finish after the last captured call, so --depth-split cannot restore the dwords it held back");
+            gpuWaitedThrough = std::max(gpuWaitedThrough, progress().first);
+            flushDue(Flush::Final);
+        }
+        std::uint64_t left = 0;
+        {
+            const std::lock_guard lock(splitMutex);
+            left = deferred.size();
+            deferred.clear();
+            guards.clear();
+            watched.store(0, std::memory_order_release);
+        }
+        deferredLeft += left;
+        checkViolation();
+        if (options.strict && left != 0) throw std::runtime_error("frame replay: " + std::to_string(left * sizeof(std::uint32_t)) + " bytes that --depth-split held back were never restored, because the submissions they wait for did not complete");
+    }
+
     void execute(const FrameCall& call) {
+        checkViolation();
         const struct Issuing {
             Issuing() { issuing = true; }
             ~Issuing() { issuing = false; }
@@ -1267,6 +1618,7 @@ struct Replay {
             if (pacing && reader.Version() >= AgcDriver::InFlightCallsVersion && (call.flags & AgcDriver::InFlightDeltaFlag) != 0) {
                 if (call.ordinal > singleThreadOrdinal) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " was read with submissions in flight after a second thread made calls, which this replay cannot order");
                 if (const auto accepted = progress().first; captureBase && accepted != mappedSerial(call.accepted)) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " was read in flight at capture serial " + std::to_string(call.accepted) + ", which maps to replay serial " + std::to_string(mappedSerial(call.accepted)) + ", but this replay had accepted " + std::to_string(accepted));
+                if (plan && options.depthSplit) settleHeldFor(call);
                 waitStarted(call);
                 memoryWaited(inFlightWaitedNs, began);
                 waitSerialsOnGpu(call);
@@ -1442,15 +1794,93 @@ struct Replay {
         memoryWaited(heldWaitedNs, began);
         if (!settled) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " (" + std::string(HeldReasons[static_cast<std::size_t>(cause)]) + ") is restored with nothing running or every busy queue parked on title memory, but the replay did not settle within " + std::to_string(options.busyTimeout.count()) + " ms");
         waitSettledOnGpu(call);
-        restoreGroup(call, Restore::Held);
+        LateDwords held;
+        if (options.depthSplit) {
+            const auto waitedThrough = gpuWaitedThrough;
+            gpuWaitedThrough = std::max(gpuWaitedThrough, progress().second);
+            flushDue(Flush::Held);
+            if (gpuWaitedThrough != waitedThrough) pruneInFlight();
+            held = groupDeferred(call);
+        }
+        restoreGroup(call, Restore::Held, &held);
         const auto next = plan->next[current];
         if (next == DepthPlan::Tail) ++tailHeld;
         else ++census[plan->position[next]].held[static_cast<std::size_t>(cause)];
     }
 
+    void restoreSplit(const FrameCall& call, Clock::time_point began) {
+        const auto next = plan->next[current];
+        const auto position = plan->position[next];
+        const auto bound = boundOf(next);
+        const auto floors = memoryFloors(call);
+        const auto store = floors.store.value_or(0);
+        const auto wait = floors.wait.value_or(0);
+        const auto& paced = window[next];
+        auto& entry = census[position];
+        bool cpuWaited = false;
+        bool gpuWaited = false;
+        const auto gate = [&](std::uint64_t serial) {
+            const auto target = replayTarget(call, serial);
+            if (!AgcDriverSerialDone_nid_postfix(target) || progress().second < target) cpuWaited = true;
+            awaitCompleted(target, began + options.busyTimeout, [&](const std::string& reason) {
+                return std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for capture serial " + std::to_string(serial) + " (replay serial " + std::to_string(target) + "; store floor " + std::to_string(store) + ", wait floor " + std::to_string(wait) + ", bound " + std::to_string(bound) + " at position " + options.depth->names[position] + "), but " + reason);
+            });
+            const auto waitedThrough = gpuWaitedThrough;
+            if (waitThroughOnGpu(call, target)) gpuWaited = true;
+            if (gpuWaitedThrough != waitedThrough) pruneInFlight();
+            flushDue(Flush::AtDepth);
+        };
+        const auto term = paced.accepted > bound ? paced.accepted - bound : 0;
+        gate(term);
+        const auto recorded = replayTarget(call, std::max(store, wait));
+        enum class Term { Depth, Store, Wait } by = Term::Depth;
+        auto late = groupDeferred(call);
+        bool split = false;
+        if (recorded > gpuWaitedThrough) {
+            auto found = lateDwordsOf(call);
+            std::uint64_t newest = 0;
+            for (const auto& [dword, floor] : found.dwords) newest = std::max(newest, floor);
+            if (found.blocked || found.limited || recorded > newest) {
+                auto serial = term;
+                if (store > serial) {
+                    serial = store;
+                    by = Term::Store;
+                }
+                if (wait > serial) {
+                    serial = wait;
+                    by = Term::Wait;
+                }
+                gate(serial);
+                late = groupDeferred(call);
+                ++(found.blocked ? splitBlocked : unexplained);
+            } else {
+                late = std::move(found.dwords);
+                holdBack(call, late, recorded, store, wait, position);
+                split = true;
+            }
+        }
+        if (cpuWaited) ++entry.cpuWaits;
+        if (gpuWaited) ++entry.gpuWaits;
+        memoryWaited(gateWaitedNs, began);
+        const auto [accepted, completed] = progress();
+        if (!restoreGroup(call, Restore::AtDepth, &late)) {
+            if (split) withdraw(call);
+            return restoreHeld(call, DepthCause::Pending);
+        }
+        if (split) {
+            ++entry.split;
+            ++splitDeltas;
+            lateDwords += late.size();
+        }
+        ++fastDeltas;
+        ++(by == Term::Depth ? entry.byDepth : by == Term::Store ? entry.byStore : entry.byWait);
+        if (plan->frame[next] >= 2) entry.restore.push_back(accepted - completed);
+    }
+
     void restoreAtDepth(const FrameCall& call, Clock::time_point began) {
         const auto index = current;
         if (const auto cause = depthCause(call, index); cause != DepthCause::Ahead) return restoreHeld(call, cause);
+        if (options.depthSplit) return restoreSplit(call, began);
         const auto next = plan->next[index];
         const auto position = plan->position[next];
         const auto bound = boundOf(next);
@@ -1531,18 +1961,7 @@ struct Replay {
         }
     }
 
-    bool restoreGroup(const FrameCall& call, Restore mode) {
-        const auto found = groups.find(call.values.at(0));
-        if (found == groups.end()) return true;
-        const auto began = Clock::now();
-        std::array<AgcDriver::AwaitedWait, 64> awaited{};
-        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
-        std::vector<std::uint64_t> parked;
-        for (std::size_t slot = 0; slot < count; ++slot) {
-            if (rewindWait(awaited[slot])) parked.push_back(awaited[slot].address);
-        }
-        std::vector<std::pair<std::uint32_t*, std::uint32_t>> controls;
-        const auto& chunks = found->second;
+    std::vector<std::pair<std::size_t, std::size_t>> chunkRuns(const std::vector<const FrameMemoryChunk*>& chunks) const {
         std::vector<std::pair<std::size_t, std::size_t>> runs;
         for (std::size_t first = 0; first < chunks.size();) {
             if (skipped.Overlaps(*chunks[first])) {
@@ -1555,15 +1974,83 @@ struct Replay {
                 end += chunks[last]->bytes;
                 ++last;
             }
-            if (mode == Restore::Held) AgcDriverPrepareGuestStore_nid_postfix(chunks[first]->address, static_cast<std::size_t>(end - chunks[first]->address));
             runs.emplace_back(first, last);
             first = last;
         }
-        if (mode == Restore::AtDepth) {
-            for (const auto& [first, last] : runs) {
-                const auto begin = chunks[first]->address;
-                const auto end = chunks[last - 1]->address + chunks[last - 1]->bytes;
-                if (!AgcDriverGuestStoreSettled_nid_postfix(begin, static_cast<std::size_t>(end - begin))) return false;
+        return runs;
+    }
+
+    static ByteRanges cutRuns(const std::vector<const FrameMemoryChunk*>& chunks, const std::vector<std::pair<std::size_t, std::size_t>>& runs, const LateDwords* late) {
+        ByteRanges pieces;
+        for (const auto& [first, last] : runs) {
+            auto cursor = chunks[first]->address;
+            const auto end = chunks[last - 1]->address + chunks[last - 1]->bytes;
+            if (late != nullptr) {
+                for (auto entry = late->lower_bound(cursor & ~std::uint64_t{3}); entry != late->end() && entry->first < end; ++entry) {
+                    if (entry->first > cursor) pieces.emplace_back(cursor, entry->first);
+                    cursor = std::max(cursor, entry->first + 4);
+                }
+            }
+            if (cursor < end) pieces.emplace_back(cursor, end);
+        }
+        return pieces;
+    }
+
+    static std::vector<std::pair<std::size_t, std::size_t>> holesIn(const FrameMemoryChunk& chunk, const LateDwords* late) {
+        std::vector<std::pair<std::size_t, std::size_t>> holes;
+        if (late == nullptr) return holes;
+        const auto end = chunk.address + chunk.bytes;
+        for (auto entry = late->lower_bound(chunk.address & ~std::uint64_t{3}); entry != late->end() && entry->first < end; ++entry) {
+            const auto low = std::max(chunk.address, entry->first);
+            const auto high = std::min(end, entry->first + 4);
+            if (low < high) holes.emplace_back(static_cast<std::size_t>(low - chunk.address), static_cast<std::size_t>(high - chunk.address));
+        }
+        return holes;
+    }
+
+    static void copyAround(std::byte* target, std::span<const std::byte> bytes, const std::vector<std::pair<std::size_t, std::size_t>>& holes) {
+        std::size_t cursor = 0;
+        for (const auto& [low, high] : holes) {
+            if (low > cursor) std::memcpy(target + cursor, bytes.data() + cursor, low - cursor);
+            cursor = std::max(cursor, high);
+        }
+        if (cursor < bytes.size()) std::memcpy(target + cursor, bytes.data() + cursor, bytes.size() - cursor);
+    }
+
+    void keepLate(const FrameCall& call, const FrameMemoryChunk& chunk, std::span<const std::byte> bytes, const LateDwords& late) {
+        const auto end = chunk.address + chunk.bytes;
+        const std::lock_guard lock(splitMutex);
+        for (auto entry = late.lower_bound(chunk.address & ~std::uint64_t{3}); entry != late.end() && entry->first < end; ++entry) {
+            auto& held = deferred.at(entry->first);
+            const auto low = std::max(chunk.address, entry->first);
+            const auto high = std::min(end, entry->first + 4);
+            std::memcpy(reinterpret_cast<std::byte*>(&held.value) + (low - entry->first), bytes.data() + (low - chunk.address), static_cast<std::size_t>(high - low));
+            held.valued = true;
+            held.call = call.ordinal;
+        }
+    }
+
+    bool restoreGroup(const FrameCall& call, Restore mode, const LateDwords* late = nullptr) {
+        const auto found = groups.find(call.values.at(0));
+        if (found == groups.end()) return true;
+        const auto began = Clock::now();
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        std::vector<std::uint64_t> parked;
+        for (std::size_t slot = 0; slot < count; ++slot) {
+            if (rewindWait(awaited[slot])) parked.push_back(awaited[slot].address);
+        }
+        std::vector<std::pair<std::uint32_t*, std::uint32_t>> controls;
+        const auto& chunks = found->second;
+        if (late != nullptr && late->empty()) late = nullptr;
+        const auto runs = chunkRuns(chunks);
+        const auto pieces = cutRuns(chunks, runs, late);
+        {
+            const auto covered = sortedRanges(pieces);
+            const RestoringScope scope(covered);
+            for (const auto& [begin, end] : pieces) {
+                if (mode == Restore::Held) AgcDriverPrepareGuestStore_nid_postfix(begin, static_cast<std::size_t>(end - begin));
+                else if (!AgcDriverGuestStoreSettled_nid_postfix(begin, static_cast<std::size_t>(end - begin))) return false;
             }
         }
         std::vector<const FrameMemoryChunk*> ordered;
@@ -1585,12 +2072,15 @@ struct Replay {
                 firstControl = controls.size();
             }
             auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address));
+            const auto holes = holesIn(chunk, late);
+            if (!holes.empty()) keepLate(call, chunk, bytes, *late);
             for (const auto address : parked) {
                 if (address % 4 == 0 && address >= chunk.address && bytes.size() >= 4 && address - chunk.address <= bytes.size() - 4) offsets.push_back(static_cast<std::size_t>(address - chunk.address));
             }
             std::sort(offsets.begin(), offsets.end());
             const auto control = [&](std::size_t at) {
                 if (at + 4 > bytes.size()) return false;
+                if (std::any_of(holes.begin(), holes.end(), [at](const auto& hole) { return hole.first < at + 4 && at < hole.second; })) return false;
                 std::uint32_t value = 0;
                 std::memcpy(&value, bytes.data() + at, sizeof(value));
                 if ((value & AgcDriver::Pm4::RewindValid) == 0) return false;
@@ -1610,7 +2100,7 @@ struct Replay {
             if (reading) {
                 contents.emplace_back(bytes.begin(), bytes.end());
             } else {
-                std::memcpy(target, bytes.data(), bytes.size());
+                copyAround(target, bytes, holes);
                 deltaBytes += chunk.bytes;
             }
             if (++applied < last - first) return;
@@ -1618,11 +2108,11 @@ struct Replay {
             ++run;
             if (!reading) return;
             const auto compared = Clock::now();
-            waitForReaders(call, std::span(chunks).subspan(first, last - first), contents, std::span(controls).subspan(firstControl));
+            waitForReaders(call, std::span(chunks).subspan(first, last - first), contents, std::span(controls).subspan(firstControl), late);
             readCheckNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - compared).count();
             for (auto index = first; index < last; ++index) {
                 const auto& kept = contents[index - first];
-                std::memcpy(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunks[index]->address)), kept.data(), kept.size());
+                copyAround(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunks[index]->address)), kept, holesIn(*chunks[index], late));
                 deltaBytes += chunks[index]->bytes;
             }
         });
@@ -1631,7 +2121,7 @@ struct Replay {
         return true;
     }
 
-    void waitForReaders(const FrameCall& call, std::span<const FrameMemoryChunk* const> run, const std::vector<std::vector<std::byte>>& contents, std::span<const std::pair<std::uint32_t*, std::uint32_t>> deferred) {
+    void waitForReaders(const FrameCall& call, std::span<const FrameMemoryChunk* const> run, const std::vector<std::vector<std::byte>>& contents, std::span<const std::pair<std::uint32_t*, std::uint32_t>> controls, const LateDwords* late) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
         for (std::size_t index = 0; index < run.size(); ++index) {
             const auto address = run[index]->address;
@@ -1641,12 +2131,13 @@ struct Replay {
                 const auto differs = std::mismatch(bytes.begin() + static_cast<std::ptrdiff_t>(at), bytes.end(), current + at).first;
                 if (differs == bytes.end()) break;
                 const auto dword = (address + static_cast<std::uint64_t>(differs - bytes.begin())) & ~std::uint64_t{3};
+                at = static_cast<std::size_t>(dword + 4 - address);
+                if (late != nullptr && late->contains(dword)) continue;
                 if (!spans.empty() && spans.back().second >= dword) spans.back().second = std::max(spans.back().second, dword + 4);
                 else spans.emplace_back(dword, dword + 4);
-                at = static_cast<std::size_t>(dword + 4 - address);
             }
         }
-        for (const auto& [control, value] : deferred) {
+        for (const auto& [control, value] : controls) {
             if (std::atomic_ref<std::uint32_t>(*control).load(std::memory_order_acquire) != value) spans.emplace_back(reinterpret_cast<std::uintptr_t>(control), reinterpret_cast<std::uintptr_t>(control) + 4);
         }
         for (const auto& [begin, end] : spans) {
@@ -1771,6 +2262,17 @@ struct Replay {
             inFlight.clear();
             opaqueThrough = 0;
             prep = {};
+            if (options.depthSplit) {
+                {
+                    const std::lock_guard lock(splitMutex);
+                    deferred.clear();
+                    guards.clear();
+                    watched.store(0, std::memory_order_release);
+                }
+                const std::lock_guard lock(violationMutex);
+                violation.reset();
+                violated.store(false, std::memory_order_release);
+            }
             plan->ceiling.assign(calls.size(), 0);
             for (std::size_t index = 0; index < calls.size(); ++index) {
                 if (plan->position[index] != DepthPlan::NoPosition) plan->ceiling[index] = boundOf(index);
@@ -1819,6 +2321,8 @@ struct Replay {
                 if (plan->position[index] != DepthPlan::NoPosition && plan->frame[index] >= 2) census[plan->position[index]].ceiling.push_back(plan->ceiling[index]);
             }
         }
+        std::optional<SplitObserver> observer;
+        if (plan && options.depthSplit) observer.emplace(*this);
         std::thread breaker([&] {
             if (!options.release) return;
             try {
@@ -1878,6 +2382,7 @@ struct Replay {
         finished.store(true);
         breaker.join();
         if (failure != nullptr) std::rethrow_exception(failure);
+        if (observer) finishSplit();
     }
 
     void drain() {
@@ -1986,7 +2491,7 @@ struct Replay {
 int usage() {
     std::fprintf(stderr, "usage: agc_frame_replay <capture directory> [--no-pace] [--pace-timeout-ms <n>] [--no-release] [--release-after-ms <n>] [--strict]\n"
                          "                        [--repeat <n>] [--cold-pipelines] [--flip-hashes <file>] [--expect-flip-hashes <file>] [--dump <address>:<bytes>:<file>]...\n"
-                         "                        [--depth-profile <file> [--depth-cap <n> | --depth-probe <n>] [--depth-hold <position>]...]\n"
+                         "                        [--depth-profile <file> [--depth-cap <n> | --depth-probe <n>] [--depth-hold <position>]... [--depth-split]]\n"
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
@@ -2030,7 +2535,8 @@ int usage() {
                          "  --depth-probe <n>   sets every bound of the depth profile to n, for sensitivity runs\n"
                          "  --depth-hold <position>\n"
                          "                      restores the memory deltas before the calls at that position of the depth profile (suspend,\n"
-                         "                      s1, s2 and so on) with no queue running, as without the profile; repeatable\n");
+                         "                      s1, s2 and so on) with no queue running, as without the profile; repeatable\n"
+                         "  --depth-split       restores deltas at depth around the dwords in-flight submissions still store into or wait on\n");
     return 2;
 }
 
@@ -2479,6 +2985,8 @@ std::string depthJson(const Options& options, const Replay& replay) {
     std::snprintf(issueWaited, sizeof(issueWaited), "%.3f", Replay::secondsOf(replay.issueWaitedNs));
     char scans[32];
     std::snprintf(scans, sizeof(scans), "%.3f", Replay::secondsOf(replay.scanNs));
+    char observed[32];
+    std::snprintf(observed, sizeof(observed), "%.3f", Replay::secondsOf(replay.observerNs));
     std::string first = "null";
     if (replay.firstRead) {
         const auto& hit = *replay.firstRead;
@@ -2487,7 +2995,11 @@ std::string depthJson(const Options& options, const Replay& replay) {
     }
     std::string text = "{\"profile\":" + jsonText(std::string(name.begin(), name.end())) + ",\"cap\":" + number(options.depthCap) + ",\"probe\":" + number(options.depthProbe) + ",\"frames\":" + std::to_string(replay.plan ? replay.plan->frames : 0) +
                        ",\"fast_deltas\":" + std::to_string(replay.fastDeltas.load()) + ",\"gate_wait_s\":" + gate + ",\"tail\":" + std::to_string(replay.tailHeld) + ",\"read_waits\":" + std::to_string(replay.readWaits.load()) + ",\"read_wait_first\":" + first +
-                       ",\"read_check_s\":" + reads + ",\"issue_waits\":{\"inflight\":" + std::to_string(replay.issueWaits[0]) + "},\"issue_wait_s\":" + issueWaited + ",\"scan_s\":" + scans + ",\"unsettled_landings\":" + std::to_string(replay.unsettledLandings) + ",\"positions\":[";
+                       ",\"read_check_s\":" + reads + ",\"issue_waits\":{\"inflight\":" + std::to_string(replay.issueWaits[0]) + ",\"stream\":" + std::to_string(replay.issueWaits[1]) + ",\"indirect\":" + std::to_string(replay.issueWaits[2]) + ",\"access\":" + std::to_string(replay.issueWaits[3]) +
+                       "},\"issue_wait_s\":" + issueWaited + ",\"scan_s\":" + scans + ",\"unsettled_landings\":" + std::to_string(replay.unsettledLandings) + ",\"split\":" + (options.depthSplit ? "true" : "false") + ",\"split_deltas\":" + std::to_string(replay.splitDeltas) +
+                       ",\"late_dwords\":" + std::to_string(replay.lateDwords) + ",\"unexplained\":" + std::to_string(replay.unexplained) + ",\"split_blocked\":" + std::to_string(replay.splitBlocked) + ",\"flushed_dwords\":" + std::to_string(replay.flushedDwords) +
+                       ",\"flush_unsettled\":" + std::to_string(replay.flushUnsettled) + ",\"deferred_max\":" + std::to_string(replay.deferredMax) + ",\"deferred_left\":" + std::to_string(replay.deferredLeft) + ",\"in_flight_flushes\":" + std::to_string(replay.inFlightFlushes) +
+                       ",\"r21_unattributed\":" + std::to_string(replay.unattributedViolations.load()) + ",\"observer_s\":" + observed + ",\"positions\":[";
     const auto spread = [](std::vector<std::uint64_t> values, bool deepest) {
         if (values.empty()) return std::string("null");
         std::sort(values.begin(), values.end());
@@ -2504,7 +3016,7 @@ std::string depthJson(const Options& options, const Replay& replay) {
         text += std::string(position == 0 ? "" : ",") + "{\"position\":" + jsonText(profile.names[position]) + ",\"bound\":" + std::to_string(profile.bounds[position]) + ",\"observed\":" + std::to_string(profile.observed[position]) +
                 ",\"issued\":" + std::to_string(entry.issue.size()) + ",\"issue_depth\":" + spread(entry.issue, true) + ",\"issue_bound\":" + spread(entry.issueBound, false) + ",\"ceiling\":" + spread(entry.ceiling, false) + ",\"restored\":" + std::to_string(entry.restore.size()) +
                 ",\"restore_depth\":" + spread(entry.restore, true) + ",\"by_depth\":" + std::to_string(entry.byDepth) + ",\"by_store\":" + std::to_string(entry.byStore) + ",\"by_wait\":" + std::to_string(entry.byWait) +
-                ",\"cpu_waits\":" + std::to_string(entry.cpuWaits) + ",\"gpu_waits\":" + std::to_string(entry.gpuWaits) + ",\"held\":{" + held + "}}";
+                ",\"cpu_waits\":" + std::to_string(entry.cpuWaits) + ",\"gpu_waits\":" + std::to_string(entry.gpuWaits) + ",\"split\":" + std::to_string(entry.split) + ",\"held\":{" + held + "}}";
     }
     return text + "]}";
 }
@@ -2705,13 +3217,15 @@ int main(int argc, char** argv) {
         } else if (argument == "--depth-hold" && index + 1 < argc) {
             if (*argv[index + 1] == '\0') return usage();
             options.depthHold.emplace_back(argv[++index]);
-        } else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
+        } else if (argument == "--depth-split") options.depthSplit = true;
+        else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
     if (options.directory.empty()) return usage();
     if ((options.shaders || options.submits != 0) && (!options.flipHashes.empty() || !options.expectedFlipHashes.empty())) return usage();
     if ((options.depthCap || options.depthProbe) && (options.depthFile.empty() || (options.depthCap && options.depthProbe))) return usage();
     if (!options.depthHold.empty() && options.depthFile.empty()) return usage();
+    if (options.depthSplit && options.depthFile.empty()) return usage();
     if (!options.depthFile.empty() && (!options.pace || options.shaders || options.submits != 0)) return usage();
     configureEnvironment(options);
     int code = 2;

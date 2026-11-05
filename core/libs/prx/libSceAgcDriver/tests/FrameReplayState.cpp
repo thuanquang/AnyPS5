@@ -4042,8 +4042,265 @@ void testPacingAcceptInflight(const std::filesystem::path& directory) {
     check(entry.issueBound == std::vector<std::uint64_t>{1}, "the submission that waited for the label did not record the depth bound 1 that wait left it");
     check(Replay::secondsOf(replay.issueWaitedNs) >= 0.25, ("the submission waited " + std::to_string(Replay::secondsOf(replay.issueWaitedNs)) + " s for the label, not the 0.3 s the submission that writes it stayed parked").c_str());
     const auto json = depthJson(options, replay);
-    check(json.find("\"issue_waits\":{\"inflight\":1}") != std::string::npos && json.find("\"issue_bound\":[1,1,1]") != std::string::npos, ("the depth object does not list the wait and the bound it left: " + json).c_str());
+    check(json.find("\"issue_waits\":{\"inflight\":1,\"stream\":0,\"indirect\":0,\"access\":0}") != std::string::npos && json.find("\"issue_bound\":[1,1,1]") != std::string::npos, ("the depth object does not list the wait and the bound it left: " + json).c_str());
     check(replay.unfinished == 0, "the replay of a submission whose command buffer an earlier submission's label writes did not finish");
+}
+
+enum class SplitShape { Base, Carry, CarryHeld, InFlight, Explained, Rewind };
+
+struct SplitWindow {
+    std::uint32_t* gate = nullptr;
+    std::uint32_t* label = nullptr;
+    std::uint32_t* stored = nullptr;
+    std::uint32_t* block = nullptr;
+    std::vector<FrameCall> calls;
+};
+
+SplitWindow splitWindow(const std::filesystem::path& directory, SplitShape shape) {
+    constexpr auto Base = DepthBase;
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* words = reinterpret_cast<std::uint32_t*>(allocate(FrameCaptureWriter::BlockBytes, false));
+    SplitWindow window;
+    window.gate = reinterpret_cast<std::uint32_t*>(bytes);
+    window.stored = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    auto* other = reinterpret_cast<std::uint32_t*>(bytes + 4096 + 64);
+    auto* reading = reinterpret_cast<std::uint32_t*>(bytes + 8192);
+    window.block = reinterpret_cast<std::uint32_t*>(bytes + 12288);
+    window.label = reading + 4;
+    *window.gate = 0;
+    *window.stored = 0;
+    *other = 0;
+    std::fill_n(window.block, 16, 0u);
+    auto* parking = shape == SplitShape::Rewind ? reinterpret_cast<std::uint32_t*>(bytes + 16384) : words;
+    auto* releasing = words + 32;
+    auto* nop = words + 64;
+    auto parked = put(parking, 0, waitPacket(window.gate));
+    if (shape == SplitShape::Rewind) parked = put(parking, put(parking, parked, std::array<std::uint32_t, 2>{0xc0005900u, AgcDriver::Pm4::RewindValid}), NopPacket);
+    auto released = put(releasing, 0, writePacket(other, 0x11u));
+    if (shape != SplitShape::Explained) released = put(releasing, put(releasing, put(releasing, 0, dmaImmediate(window.label, 0)), releasePacket(window.label, 1)), waitPacket(window.label));
+    const auto read = put(reading, put(reading, 0, writePacket(window.stored, 0x77u)), NopPacket);
+    const std::vector<std::uint32_t> restored(reading, reading + read);
+    if (shape != SplitShape::Explained) *window.label = 0x5au;
+    put(nop, 0, NopPacket);
+    const std::uint32_t replaced = 0x99u;
+    FrameCaptureWriter writer(directory);
+    if (shape != SplitShape::Explained) writer.WriteDelta(1, 0, address(reading), std::as_bytes(std::span(restored)));
+    writer.WriteDelta(1, 0, address(window.block), std::vector<std::byte>(64, std::byte{0xab}));
+    if (shape == SplitShape::Carry || shape == SplitShape::CarryHeld || shape == SplitShape::InFlight) writer.WriteDelta(2, 0, address(window.label), std::as_bytes(std::span(&replaced, 1)));
+    writer.WriteCall(depthFrameStart());
+    writer.Finish("{}");
+    auto floored = depthDelta(4, 1, Base + 3, Base + 3);
+    floored.storeFloor = Base + 3;
+    floored.waitFloor = shape == SplitShape::Explained ? 0 : Base + 3;
+    window.calls = {pacedCall(FrameCallKind::Suspend, 1, Base + 1), pacedCall(FrameCallKind::Submit, 2, Base + 2, parking, parked), pacedCall(FrameCallKind::Submit, 3, Base + 3, releasing, released), floored, pacedCall(FrameCallKind::Suspend, 5, Base + 4)};
+    std::uint64_t ordinal = 6;
+    if (shape == SplitShape::Carry || shape == SplitShape::CarryHeld) {
+        auto carried = depthDelta(ordinal++, 2, Base + 4, Base + 4);
+        if (shape == SplitShape::CarryHeld) carried.floorFlags = FrameFloorFlag::ReleasesWait;
+        window.calls.push_back(carried);
+    }
+    if (shape == SplitShape::InFlight) {
+        auto inFlight = depthDelta(ordinal++, 2, Base + 4, Base + 1);
+        inFlight.flags = AgcDriver::InFlightDeltaFlag;
+        inFlight.values = {2, Base + 3};
+        window.calls.push_back(inFlight);
+    }
+    window.calls.push_back(pacedCall(FrameCallKind::Submit, ordinal, Base + 5, reading, read));
+    window.calls.push_back(pacedCall(FrameCallKind::Submit, ordinal + 1, Base + 6, nop, NopPacket.size()));
+    return window;
+}
+
+Options splitOptions() {
+    Options options;
+    options.release = false;
+    options.paceTimeout = std::chrono::seconds(2);
+    options.drainTimeout = std::chrono::seconds(2);
+    options.busyTimeout = std::chrono::seconds(10);
+    options.depth = depthProfile({{4, 4}, {4, 4}, {4, 4}});
+    options.depthSplit = true;
+    return options;
+}
+
+GatedWindow runGated(Replay& replay, std::span<const FrameCall> window, std::uint32_t* gate, std::function<bool()> arm, std::function<bool()> release) {
+    if (progress().first == 0) Replay::primeAcceptedSerial();
+    check(loaded(gate) == 0, "the dword the first submission waits on was already written");
+    GatedWindow result;
+    Gate opener(gate, std::move(arm), std::move(release));
+    try {
+        replay.runWindow(window);
+    } catch (const std::runtime_error& error) {
+        result.failure = error.what();
+    }
+    result.armed = opener.Armed();
+    return result;
+}
+
+void testPacingSplit(const std::filesystem::path& directory) {
+    openDevice();
+    const auto window = splitWindow(directory, SplitShape::Base);
+    const FrameCaptureReader reader(directory);
+    const auto options = splitOptions();
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    std::uint32_t atArming = 0;
+    const auto ran = runGated(replay, window.calls, window.gate, [&] {
+        if (loaded(window.block) != 0xababababu) return false;
+        atArming = loaded(window.label);
+        return true;
+    }, [] { return false; });
+    AgcDriverWaitIdle_nid_postfix();
+    const auto stored = loaded(window.stored);
+    const auto label = loaded(window.label);
+    check(ran.armed, "the replay did not restore the bulk of the delta while the submission its floor names was parked");
+    check(ran.failure.empty(), ("the replay of a delta split around the dword a parked submission's labels store failed: " + ran.failure).c_str());
+    check(atArming == 0x5au, ("the dword the parked submission's labels store held " + addressText(atArming) + " once the bulk of the delta was restored, not 0x5a: the delta wrote it ahead of those labels").c_str());
+    check(stored == 0x77u, ("the submission whose command buffer holds the held dword stored " + addressText(stored) + ", not the 0x77 the delta restores there: it was accepted before the held dword was written").c_str());
+    check(label == 0x77u, ("the held dword ends as " + addressText(label) + ", not the 0x77 the delta restores there: it was written before the labels of the submission its floor names").c_str());
+    check(replay.splitDeltas == 1 && replay.lateDwords == 1 && replay.issueWaits[1] == 1 && replay.flushedDwords == 1 && replay.unexplained == 0,
+          ("the replay split " + std::to_string(replay.splitDeltas) + " deltas around " + std::to_string(replay.lateDwords) + " held dwords, waited " + std::to_string(replay.issueWaits[1]) + " times for a held dword in a command buffer, wrote " + std::to_string(replay.flushedDwords) + " held dwords and restored " +
+           std::to_string(replay.unexplained) + " deltas as without the split, not 1, 1, 1, 1 and 0").c_str());
+    check(replay.census[0].split == 1, "the split delta was not counted at the suspend point it precedes");
+    const auto json = depthJson(options, replay);
+    check(json.find("\"issue_waits\":{\"inflight\":0,\"stream\":1,\"indirect\":0,\"access\":0}") != std::string::npos &&
+              json.find("\"split\":true,\"split_deltas\":1,\"late_dwords\":1,\"unexplained\":0,\"split_blocked\":0,\"flushed_dwords\":1,\"flush_unsettled\":0,\"deferred_max\":1,\"deferred_left\":0,\"in_flight_flushes\":0,\"r21_unattributed\":0,\"observer_s\":") != std::string::npos,
+          ("the depth object does not list the split: " + json).c_str());
+    check(replay.unfinished == 0, "the replay of a delta split around a held dword did not finish");
+}
+
+void runSplitCarry(const std::filesystem::path& directory, bool held) {
+    const auto window = splitWindow(directory, held ? SplitShape::CarryHeld : SplitShape::Carry);
+    const FrameCaptureReader reader(directory);
+    const auto options = splitOptions();
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    const auto ran = runBehindGate(replay, window.calls, window.gate, 4, [] { return false; });
+    AgcDriverWaitIdle_nid_postfix();
+    const auto stored = loaded(window.stored);
+    const auto label = loaded(window.label);
+    const std::string later = held ? "a later delta restored with the queue parked" : "a later delta restored at depth";
+    check(ran.failure.empty(), ("the replay of " + later + " over a held dword failed: " + ran.failure).c_str());
+    check(ran.armed, "the replay did not run ahead of a parked submission");
+    check(stored == 0x99u && label == 0x99u, ("with " + later + " over a held dword, the submission that reads it stored " + addressText(stored) + " and the dword ends as " + addressText(label) + ", not the later delta's 0x99 twice").c_str());
+    check(replay.splitDeltas == 1 && (held ? replay.census[1].held[static_cast<std::size_t>(DepthCause::Releases)] == 1 : replay.census[1].byDepth == 1), ("the first delta was not split, or the later delta was not restored " + std::string(held ? "with the queue parked" : "at depth by the bound")).c_str());
+    check(replay.unfinished == 0, ("the replay of " + later + " over a held dword did not finish").c_str());
+}
+
+void testPacingSplitCarry(const std::filesystem::path& directory) {
+    openDevice();
+    runSplitCarry(directory / "depth", false);
+    runSplitCarry(directory / "held", true);
+}
+
+void runSplitObserver(const std::filesystem::path& directory, int run) {
+    const auto window = splitWindow(directory, SplitShape::Base);
+    const FrameCaptureReader reader(directory);
+    const auto options = splitOptions();
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    if (progress().first == 0) Replay::primeAcceptedSerial();
+    const auto base = progress().first;
+    const std::uint64_t serial = run == 1 ? base + 3 : run == 2 ? base + 6 : 0;
+    const auto begin = run == 2 ? address(window.label) : address(window.block);
+    const auto end = begin + (run == 2 ? 4u : 16u);
+    std::atomic<bool> reported{false};
+    std::thread reporter([&] {
+        const auto deadline = Clock::now() + std::chrono::seconds(5);
+        while (loaded(window.block) != 0xababababu && Clock::now() < deadline) std::this_thread::sleep_for(std::chrono::microseconds(50));
+        if (loaded(window.block) == 0xababababu) {
+            const AgcDriver::GuestMemory::StoreSerialScope scope(serial);
+            AgcDriver::GuestMemory::ReportGpuWriteNote(begin, end);
+            reported.store(true);
+        }
+        std::atomic_ref<std::uint32_t>(*window.gate).store(1, std::memory_order_release);
+    });
+    std::string failure;
+    try {
+        replay.runWindow(window.calls);
+    } catch (const std::runtime_error& error) {
+        failure = error.what();
+    }
+    reporter.join();
+    std::atomic_ref<std::uint32_t>(*window.gate).store(1, std::memory_order_release);
+    AgcDriverWaitIdle_nid_postfix();
+    check(reported.load(), "the delta's bulk was never restored, so no store into it was reported");
+    const std::string floors = ", which --depth-split restored ahead of the floor of the memory delta at call 4 (store floor " + std::to_string(DepthBase + 3) + ", wait floor " + std::to_string(DepthBase + 3) +
+                               "): no PM4 store of the submissions in flight targets those bytes, so the delta's floor came from a store the replay cannot order; restore that position with --depth-hold suspend or replay without --depth-split";
+    const std::string expected = run == 1 ? "frame replay: submission " + std::to_string(base + 3) + " (capture serial " + std::to_string(DepthBase + 3) + ") stored 16 bytes at " + addressText(begin) + floors
+                                 : run == 2 ? "frame replay: submission " + std::to_string(base + 6) + " (capture serial none) stored 4 bytes at " + addressText(begin) + " while --depth-split held back the value the memory delta at call 4 restores there until submission " + std::to_string(base + 3) +
+                                                  " has run; the replay orders only the PM4 stores of later submissions, so that value would land after this store"
+                                            : "frame replay: a store the driver reported with no submission stored 16 bytes at " + addressText(begin) + floors;
+    check(failure == expected, ("the replay with a store reported " + std::string(run == 1 ? "into the restored bulk by the submission the delta's floor names" : run == 2 ? "into a held dword by a later submission" : "into the restored bulk with no submission") + " ended with '" + failure + "', not '" + expected + "'").c_str());
+    check(replay.unattributedViolations.load() == (run == 3 ? 1u : 0u), ("the replay counted " + std::to_string(replay.unattributedViolations.load()) + " stores reported with no submission into restored bytes, not " + (run == 3 ? "1" : "0")).c_str());
+}
+
+void testPacingSplitObserver(const std::filesystem::path& directory) {
+    openDevice();
+    for (int run = 1; run <= 3; ++run) runSplitObserver(directory / std::to_string(run), run);
+}
+
+void testPacingSplitExplained(const std::filesystem::path& directory) {
+    openDevice();
+    const auto window = splitWindow(directory, SplitShape::Explained);
+    const FrameCaptureReader reader(directory);
+    const auto options = splitOptions();
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    std::uint32_t atRelease = 0;
+    const auto ran = runBehindGate(replay, window.calls, window.gate, 3, [&] {
+        atRelease = loaded(window.block);
+        return false;
+    });
+    AgcDriverWaitIdle_nid_postfix();
+    const auto block = loaded(window.block);
+    check(ran.failure.empty(), ("the replay of a delta whose floor names no store a submission in flight makes into it failed: " + ran.failure).c_str());
+    check(ran.armed, "the replay did not run ahead of a parked submission");
+    check(atRelease == 0, ("the delta whose floor names a submission with no PM4 store into its bytes was restored before that submission ran (the block held " + addressText(atRelease) + " when it was released)").c_str());
+    check(block == 0xababababu, ("the delta's block holds " + addressText(block) + ", not 0xabababab").c_str());
+    check(replay.unexplained == 1 && replay.splitDeltas == 0 && replay.census[0].byStore == 1, ("the delta was counted " + std::to_string(replay.unexplained) + " times unexplained and split " + std::to_string(replay.splitDeltas) + " times, and its store floor ordered " + std::to_string(replay.census[0].byStore) + " deltas, not 1, 0 and 1").c_str());
+    check(replay.unfinished == 0, "the replay of a delta whose floor no store in flight explains did not finish");
+}
+
+void testPacingSplitRewind(const std::filesystem::path& directory) {
+    openDevice();
+    const auto window = splitWindow(directory, SplitShape::Rewind);
+    const FrameCaptureReader reader(directory);
+    const auto options = splitOptions();
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    const auto ran = runBehindGate(replay, window.calls, window.gate, 3, [] { return false; });
+    AgcDriverWaitIdle_nid_postfix();
+    const auto stored = loaded(window.stored);
+    const auto label = loaded(window.label);
+    const auto block = loaded(window.block);
+    check(ran.failure.empty(), ("the replay of a delta with a submission holding a REWIND in flight failed: " + ran.failure).c_str());
+    check(ran.armed, "the replay did not run ahead of a parked submission");
+    check(stored == 0x77u && label == 0x77u && block == 0xababababu, ("with a REWIND in flight the delta's dword ends as " + addressText(label) + ", its block as " + addressText(block) + " and the submission that reads the dword stored " + addressText(stored) + ", not 0x77, 0xabababab and 0x77").c_str());
+    check(replay.splitBlocked == 1 && replay.splitDeltas == 0 && replay.census[0].byStore == 1, ("with a REWIND in flight the replay blocked the split " + std::to_string(replay.splitBlocked) + " times and split " + std::to_string(replay.splitDeltas) + " deltas, and the store floor ordered " + std::to_string(replay.census[0].byStore) + ", not 1, 0 and 1").c_str());
+    check(replay.unfinished == 0, "the replay of a delta with a REWIND in flight did not finish");
+}
+
+void testPacingSplitInFlight(const std::filesystem::path& directory) {
+    openDevice();
+    const auto window = splitWindow(directory, SplitShape::InFlight);
+    const FrameCaptureReader reader(directory);
+    const auto options = splitOptions();
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    const auto ran = runBehindGate(replay, window.calls, window.gate, 4, [] { return false; });
+    AgcDriverWaitIdle_nid_postfix();
+    const auto stored = loaded(window.stored);
+    const auto label = loaded(window.label);
+    check(ran.failure.empty(), ("the replay of a delta read in flight over a held dword failed: " + ran.failure).c_str());
+    check(ran.armed, "the replay did not run ahead of a parked submission");
+    check(label == 0x99u && stored == 0x99u, ("with a delta read in flight over a held dword, the dword ends as " + addressText(label) + " and the submission that reads it stored " + addressText(stored) + ", not the 0x99 the delta read in flight restores").c_str());
+    check(replay.inFlightFlushes == 1, ("the replay wrote held dwords " + std::to_string(replay.inFlightFlushes) + " times before a delta read in flight, not 1").c_str());
+    check(replay.unfinished == 0, "the replay of a delta read in flight over a held dword did not finish");
 }
 
 }
@@ -4123,6 +4380,12 @@ int main(int argc, char** argv) {
         else if (mode == "pacing_read_tracking") testPacingReadTracking(directory);
         else if (mode == "pacing_split_scan") testPacingSplitScan();
         else if (mode == "pacing_accept_inflight") testPacingAcceptInflight(directory);
+        else if (mode == "pacing_split") testPacingSplit(directory);
+        else if (mode == "pacing_split_carry") testPacingSplitCarry(directory);
+        else if (mode == "pacing_split_observer") testPacingSplitObserver(directory);
+        else if (mode == "pacing_split_explained") testPacingSplitExplained(directory);
+        else if (mode == "pacing_split_rewind") testPacingSplitRewind(directory);
+        else if (mode == "pacing_split_inflight") testPacingSplitInFlight(directory);
         else throw std::runtime_error("unknown test");
         if (mode != "reservation_failure" && mode != "gate_failure" && mode != "pacing_failure") AgcDriverShutdown_nid_postfix();
         std::puts("frame replay state test passed");
