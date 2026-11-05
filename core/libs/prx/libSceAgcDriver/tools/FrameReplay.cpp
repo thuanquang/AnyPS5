@@ -499,7 +499,7 @@ std::string readKindName(std::uint32_t kind) {
 
 struct PositionCensus {
     std::vector<std::uint64_t> issue, restore, ceiling, issueBound;
-    std::uint64_t byDepth = 0, byStore = 0, byWait = 0, cpuWaits = 0, gpuWaits = 0, split = 0;
+    std::uint64_t byDepth = 0, byStore = 0, byWait = 0, cpuWaits = 0, gpuWaits = 0, split = 0, patched = 0;
     std::array<std::uint64_t, HeldCauses> held{};
 };
 
@@ -1070,7 +1070,7 @@ struct Replay {
     std::atomic<bool> violated{false};
     inline static std::atomic<Replay*> splitting{nullptr};
     static constexpr std::uint64_t SplitLimitBytes = std::uint64_t{1} << 20u;
-    std::uint64_t splitDeltas = 0, lateDwords = 0, unexplained = 0, splitBlocked = 0, flushedDwords = 0, flushUnsettled = 0, deferredMax = 0, deferredLeft = 0, inFlightFlushes = 0;
+    std::uint64_t splitDeltas = 0, lateDwords = 0, unexplained = 0, splitBlocked = 0, flushedDwords = 0, flushUnsettled = 0, deferredMax = 0, deferredLeft = 0, inFlightFlushes = 0, patchedAccepts = 0, droppedDwords = 0;
     std::atomic<std::uint64_t> unattributedViolations{0};
     std::atomic<std::int64_t> observerNs{0};
 
@@ -1234,12 +1234,27 @@ struct Replay {
         const auto limit = call.completed <= *captureBase ? replayBase : mappedSerial(call.completed);
         const auto* const guest = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(call.address));
         const auto words = static_cast<std::size_t>(call.size);
+        const auto streamEnd = call.address + words * sizeof(std::uint32_t);
+        bool copied = false;
+        std::vector<std::uint64_t> drops;
         for (std::size_t pass = 1;; ++pass) {
             const auto scanned = Clock::now();
             prep.scan = {};
-            if (words != 0 && !AgcDriver::GuestMemory::Accessible(guest, words * sizeof(std::uint32_t))) prep.scan.opaque = true;
-            else prep.scan = scanSubmission(std::span(guest, words), call.address);
+            prep.words.clear();
+            std::vector<std::uint64_t> unplaced;
+            const bool readable = words == 0 || AgcDriver::GuestMemory::Accessible(guest, words * sizeof(std::uint32_t));
+            for (auto entry = deferred.lower_bound(call.address & ~std::uint64_t{3}); entry != deferred.end() && entry->first < streamEnd; ++entry) {
+                if (!readable || !entry->second.valued || call.address % sizeof(std::uint32_t) != 0) {
+                    unplaced.push_back(entry->first);
+                    continue;
+                }
+                if (prep.words.empty()) prep.words.assign(guest, guest + words);
+                prep.words[static_cast<std::size_t>((entry->first - call.address) / sizeof(std::uint32_t))] = entry->second.value;
+            }
+            if (!readable) prep.scan.opaque = true;
+            else prep.scan = scanSubmission(prep.words.empty() ? std::span(guest, words) : std::span<const std::uint32_t>(prep.words), call.address);
             scanNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - scanned).count();
+            copied = !prep.words.empty() && !prep.scan.rewind && !prep.scan.opaque;
             std::uint64_t need = 0;
             std::uint64_t at = 0;
             const auto needs = [&](std::uint64_t serial, std::uint64_t address) {
@@ -1266,25 +1281,37 @@ struct Replay {
             bool indirect = false;
             std::size_t accessed = 0;
             std::vector<std::uint64_t> held;
+            drops.clear();
             if (!deferred.empty()) {
+                const auto hold = [&](std::uint64_t dword, const Deferred& entry) {
+                    needs(entry.floor, dword);
+                    held.push_back(dword);
+                };
                 const auto collect = [&](std::uint64_t begin, std::uint64_t end, bool& found) {
                     for (auto entry = deferred.lower_bound(begin & ~std::uint64_t{3}); entry != deferred.end() && entry->first < end; ++entry) {
                         found = true;
-                        needs(entry->second.floor, entry->first);
-                        held.push_back(entry->first);
+                        hold(entry->first, entry->second);
                     }
                 };
-                collect(call.address, call.address + words * sizeof(std::uint32_t), stream);
+                if (!copied) {
+                    collect(call.address, streamEnd, stream);
+                } else {
+                    for (const auto dword : unplaced) hold(dword, deferred.at(dword));
+                    stream = !unplaced.empty();
+                }
                 for (const auto& [begin, end] : prep.scan.indirect) collect(begin, end, indirect);
                 std::set<std::uint64_t> touched;
                 for (const auto& access : prep.scan.accesses) {
                     for (auto entry = deferred.lower_bound(access.begin & ~std::uint64_t{3}); entry != deferred.end() && entry->first < access.end; ++entry) {
                         if (!touched.insert(entry->first).second) continue;
-                        needs(entry->second.floor, entry->first);
-                        held.push_back(entry->first);
+                        if (access.kind == SplitAccess::Kind::FullStore && !prep.scan.opaque && access.begin <= entry->first && entry->first + sizeof(std::uint32_t) <= access.end) {
+                            drops.push_back(entry->first);
+                            continue;
+                        }
+                        ++accessed;
+                        hold(entry->first, entry->second);
                     }
                 }
-                accessed = touched.size();
             }
             if (need == 0) break;
             if (pass > 4) throw issueBlocked(call, at, need, "the bytes it reads at accept kept changing");
@@ -1301,6 +1328,16 @@ struct Replay {
             }
         }
         if (prep.scan.rewind || prep.scan.opaque) opaqueThrough = std::max(opaqueThrough, mappedSerial(call.values.back()));
+        if (copied) {
+            prep.fromCopy = true;
+            ++patchedAccepts;
+            ++census[plan->position[current]].patched;
+        }
+        if (drops.empty()) return;
+        const std::lock_guard lock(splitMutex);
+        for (const auto dword : drops) deferred.erase(dword);
+        droppedDwords += drops.size();
+        watched.store(guards.size() + deferred.size(), std::memory_order_release);
     }
 
     void issueWait(const FrameCall& call, std::uint64_t serial, std::uint64_t address, std::span<const std::pair<std::uint64_t, std::uint64_t>> landing) {
@@ -2999,7 +3036,7 @@ std::string depthJson(const Options& options, const Replay& replay) {
                        "},\"issue_wait_s\":" + issueWaited + ",\"scan_s\":" + scans + ",\"unsettled_landings\":" + std::to_string(replay.unsettledLandings) + ",\"split\":" + (options.depthSplit ? "true" : "false") + ",\"split_deltas\":" + std::to_string(replay.splitDeltas) +
                        ",\"late_dwords\":" + std::to_string(replay.lateDwords) + ",\"unexplained\":" + std::to_string(replay.unexplained) + ",\"split_blocked\":" + std::to_string(replay.splitBlocked) + ",\"flushed_dwords\":" + std::to_string(replay.flushedDwords) +
                        ",\"flush_unsettled\":" + std::to_string(replay.flushUnsettled) + ",\"deferred_max\":" + std::to_string(replay.deferredMax) + ",\"deferred_left\":" + std::to_string(replay.deferredLeft) + ",\"in_flight_flushes\":" + std::to_string(replay.inFlightFlushes) +
-                       ",\"r21_unattributed\":" + std::to_string(replay.unattributedViolations.load()) + ",\"observer_s\":" + observed + ",\"positions\":[";
+                       ",\"r21_unattributed\":" + std::to_string(replay.unattributedViolations.load()) + ",\"observer_s\":" + observed + ",\"patched_accepts\":" + std::to_string(replay.patchedAccepts) + ",\"dropped_dwords\":" + std::to_string(replay.droppedDwords) + ",\"positions\":[";
     const auto spread = [](std::vector<std::uint64_t> values, bool deepest) {
         if (values.empty()) return std::string("null");
         std::sort(values.begin(), values.end());
@@ -3016,7 +3053,7 @@ std::string depthJson(const Options& options, const Replay& replay) {
         text += std::string(position == 0 ? "" : ",") + "{\"position\":" + jsonText(profile.names[position]) + ",\"bound\":" + std::to_string(profile.bounds[position]) + ",\"observed\":" + std::to_string(profile.observed[position]) +
                 ",\"issued\":" + std::to_string(entry.issue.size()) + ",\"issue_depth\":" + spread(entry.issue, true) + ",\"issue_bound\":" + spread(entry.issueBound, false) + ",\"ceiling\":" + spread(entry.ceiling, false) + ",\"restored\":" + std::to_string(entry.restore.size()) +
                 ",\"restore_depth\":" + spread(entry.restore, true) + ",\"by_depth\":" + std::to_string(entry.byDepth) + ",\"by_store\":" + std::to_string(entry.byStore) + ",\"by_wait\":" + std::to_string(entry.byWait) +
-                ",\"cpu_waits\":" + std::to_string(entry.cpuWaits) + ",\"gpu_waits\":" + std::to_string(entry.gpuWaits) + ",\"split\":" + std::to_string(entry.split) + ",\"held\":{" + held + "}}";
+                ",\"cpu_waits\":" + std::to_string(entry.cpuWaits) + ",\"gpu_waits\":" + std::to_string(entry.gpuWaits) + ",\"split\":" + std::to_string(entry.split) + ",\"patched\":" + std::to_string(entry.patched) + ",\"held\":{" + held + "}}";
     }
     return text + "]}";
 }
