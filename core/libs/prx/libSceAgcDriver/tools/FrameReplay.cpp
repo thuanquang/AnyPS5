@@ -1312,6 +1312,13 @@ struct Replay {
                         hold(entry->first, entry->second);
                     }
                 }
+                if (prep.scan.rewind || prep.scan.opaque) {
+                    for (const auto& [dword, entry] : deferred) {
+                        if (!touched.insert(dword).second) continue;
+                        ++accessed;
+                        hold(dword, entry);
+                    }
+                }
             }
             if (need == 0) break;
             if (pass > 4) throw issueBlocked(call, at, need, "the bytes it reads at accept kept changing");
