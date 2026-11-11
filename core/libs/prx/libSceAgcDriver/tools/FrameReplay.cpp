@@ -2188,10 +2188,20 @@ struct Replay {
         for (const auto& [control, value] : controls) {
             if (std::atomic_ref<std::uint32_t>(*control).load(std::memory_order_acquire) != value) spans.emplace_back(reinterpret_cast<std::uintptr_t>(control), reinterpret_cast<std::uintptr_t>(control) + 4);
         }
+        std::vector<std::uint64_t> ranges;
+        ranges.reserve(spans.size() * 2);
         for (const auto& [begin, end] : spans) {
-            const auto bytes = static_cast<std::size_t>(end - begin);
+            ranges.push_back(begin);
+            ranges.push_back(end);
+        }
+        for (std::size_t from = 0; from < spans.size();) {
+            std::size_t hit = 0;
             AgcDriver::PendingGpuRead read;
-            while (AgcDriverPendingGpuRead_nid_postfix(begin, bytes, &read)) {
+            if (!AgcDriverPendingGpuReadAny_nid_postfix(ranges.data() + from * 2, spans.size() - from, &hit, &read)) break;
+            from += hit;
+            const auto begin = spans[from].first;
+            const auto bytes = static_cast<std::size_t>(spans[from].second - begin);
+            {
                 if (!firstRead) firstRead = ReadHit{call.ordinal, begin, bytes, read};
                 if (!AgcDriverWaitGpuBatchFor_nid_postfix(read.batch, options.busyTimeout.count())) throw std::runtime_error("frame replay: GPU batch " + std::to_string(read.batch) + ", which reads " + addressText(begin) + " (" + std::to_string(bytes) + " bytes) of the memory delta at call " + std::to_string(call.ordinal) + " in place, did not finish within " + std::to_string(options.busyTimeout.count()) + " ms");
                 ++readWaits;

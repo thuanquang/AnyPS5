@@ -73,6 +73,7 @@ extern "C" void AgcDriverPrepareGuestStore_nid_postfix(std::uint64_t address, st
 extern "C" bool AgcDriverGuestStoreSettled_nid_postfix(std::uint64_t address, std::size_t bytes);
 extern "C" bool AgcDriverGpuReadTracking_nid_postfix();
 extern "C" bool AgcDriverPendingGpuRead_nid_postfix(std::uint64_t address, std::size_t bytes, AgcDriver::PendingGpuRead* read);
+extern "C" bool AgcDriverPendingGpuReadAny_nid_postfix(const std::uint64_t* ranges, std::size_t count, std::size_t* index, AgcDriver::PendingGpuRead* read);
 extern "C" bool AgcDriverWaitGpuBatchFor_nid_postfix(std::uint64_t batch, std::int64_t milliseconds);
 extern "C" void AgcDriverRequestBatchStamps_nid_postfix();
 extern "C" void AgcDriverCountReplayPresents_nid_postfix();

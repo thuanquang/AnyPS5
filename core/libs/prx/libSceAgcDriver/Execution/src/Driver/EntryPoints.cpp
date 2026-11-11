@@ -236,6 +236,24 @@ extern "C" bool AgcDriverPendingGpuRead_nid_postfix(std::uint64_t address, std::
     return true;
 }
 
+extern "C" bool AgcDriverPendingGpuReadAny_nid_postfix(const std::uint64_t* ranges, std::size_t count, std::size_t* index, AgcDriver::PendingGpuRead* read) {
+    AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Wait);
+    std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+    const auto* const recorder = AgcDriver::Graphics::Recorder::Active();
+    if (recorder == nullptr) return false;
+    for (std::size_t at = 0; at < count; ++at) {
+        const auto begin = ranges[at * 2];
+        const auto bytes = static_cast<std::size_t>(ranges[at * 2 + 1] - begin);
+        if (!recorder->PendingReadOverlaps(begin, bytes)) continue;
+        const auto pending = recorder->DescribePendingRead(begin, bytes);
+        if (!pending) continue;
+        if (index != nullptr) *index = at;
+        if (read != nullptr) *read = AgcDriver::PendingGpuRead{pending->serial, pending->queue, static_cast<std::uint32_t>(pending->kind), pending->open};
+        return true;
+    }
+    return false;
+}
+
 extern "C" bool AgcDriverWaitGpuBatchFor_nid_postfix(std::uint64_t batch, std::int64_t milliseconds) {
     return AgcDriver::DriverDetail::Driver::Get().WaitGpuBatchFor(batch, std::chrono::milliseconds(milliseconds));
 }
