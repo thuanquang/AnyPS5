@@ -1877,6 +1877,10 @@ struct Replay {
         const auto term = paced.accepted > bound ? paced.accepted - bound : 0;
         gate(term);
         const auto recorded = replayTarget(call, std::max(store, wait));
+        while (progress().second < recorded && !AgcDriverSettled_nid_postfix()) {
+            if (Clock::now() >= began + options.busyTimeout) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for the queues to run every submission through replay serial " + std::to_string(recorded) + " before --depth-split restores it at depth, but they did not within " + std::to_string(options.busyTimeout.count()) + " ms");
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
         enum class Term { Depth, Store, Wait } by = Term::Depth;
         auto late = groupDeferred(call);
         bool split = false;
