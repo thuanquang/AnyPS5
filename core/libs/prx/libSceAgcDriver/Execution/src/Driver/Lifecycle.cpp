@@ -353,7 +353,8 @@ std::vector<AwaitedWait> Driver::AwaitedWaits() {
         const auto shape = slot.shape.load(std::memory_order_relaxed);
         wait.function = static_cast<std::uint32_t>(shape);
         wait.bytes = static_cast<std::uint32_t>(shape >> 32u);
-        if (slot.address.load(std::memory_order_acquire) == address) result.push_back(wait);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (slot.address.load(std::memory_order_relaxed) == address) result.push_back(wait);
     }
     return result;
 }

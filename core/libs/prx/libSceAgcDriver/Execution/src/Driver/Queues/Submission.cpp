@@ -334,6 +334,8 @@ bool Driver::awaitsTitle(std::uint64_t awaited) const {
 
 bool Driver::stillAwaited(const AwaitedSlot& slot, std::uint64_t awaited) {
     const auto shape = slot.shape.load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (slot.address.load(std::memory_order_relaxed) != awaited) return false;
     if (shape == 0) return (*reinterpret_cast<const volatile std::uint32_t*>(awaited) & Pm4::RewindValid) == 0;
     const std::uint64_t value = shape >> 32u == 8 ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
     return !Pm4::WaitCompares(static_cast<std::uint32_t>(shape), slot.reference.load(std::memory_order_relaxed), slot.mask.load(std::memory_order_relaxed), value);
@@ -780,9 +782,9 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
     if (!blocked) {
         runningWorkers.fetch_add(1, std::memory_order_seq_cst);
         while (captureHold.load(std::memory_order_seq_cst)) PollSleep();
-        slot.shape.store(0, std::memory_order_relaxed);
     }
     slot.address.store(blocked ? awaited : 0, std::memory_order_release);
+    if (!blocked) slot.shape.store(0, std::memory_order_release);
     if (blocked) {
         if (runningWorkers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             idleEpoch.fetch_add(1, std::memory_order_release);

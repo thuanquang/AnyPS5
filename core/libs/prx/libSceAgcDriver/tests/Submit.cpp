@@ -1137,6 +1137,44 @@ void testWorkerFailure() {
     check(expectFailure([&] { sceAgcDriverSubmitAcb(0x20, &packet); }) == messages[0], "subsequent ACB lost worker failure");
 }
 
+void testAwaitedWaitShape() {
+    using AgcDriver::DriverDetail::DriverTestAccess;
+    constexpr std::uint32_t Rounds = 100000;
+    constexpr std::size_t Gates = 64;
+    alignas(64) static volatile std::uint32_t gates[Gates] = {};
+    alignas(64) static volatile std::uint32_t done = 0;
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> mixed{0};
+    std::atomic<std::uint64_t> reads{0};
+    const auto first = reinterpret_cast<std::uintptr_t>(&gates[0]);
+    const auto last = reinterpret_cast<std::uintptr_t>(&gates[Gates - 1]);
+    std::thread reader([&] {
+        std::array<AgcDriver::AwaitedWait, 8> waits{};
+        while (!stop.load(std::memory_order_relaxed)) {
+            const auto count = AgcDriverAwaitedWaits_nid_postfix(waits.data(), waits.size());
+            for (std::size_t index = 0; index < count; ++index) {
+                if (waits[index].address >= first && waits[index].address <= last && waits[index].function != 3) mixed.fetch_add(1, std::memory_order_relaxed);
+            }
+            reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    for (std::uint32_t round = 1; round <= Rounds; ++round) {
+        auto* const gate = &gates[round % Gates];
+        submit(0x20, commands(waitEqual(gate, round), writeData(&done, round)));
+        const auto start = std::chrono::steady_clock::now();
+        while (DriverTestAccess::AwaitedAddress(0x20) != reinterpret_cast<std::uintptr_t>(gate)) {
+            check(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), "the queue never parked on its gate");
+            std::this_thread::yield();
+        }
+        *gate = round;
+        waitFor(&done, round, "the queue did not pass its gate");
+    }
+    stop.store(true, std::memory_order_relaxed);
+    reader.join();
+    std::printf("awaited wait reads %llu, mixed %llu\n", static_cast<unsigned long long>(reads.load()), static_cast<unsigned long long>(mixed.load()));
+    check(mixed.load() == 0, "the awaited waits listed a gate the queue was leaving with another compare function, the shape of a REWIND wait");
+}
+
 void testWaitProducerChain() {
     using AgcDriver::DriverDetail::DriverTestAccess;
     alignas(64) static volatile std::uint32_t gateFrozen = 0, gateA = 0, gateB = 0, gateC = 0;
@@ -1212,6 +1250,12 @@ int main(int argc, char** argv) {
             testReadOnlyResummarize();
             LibcRunShutdown_nid_postfix();
             std::puts("Read-only resummarize submission passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--awaited-wait-shape") {
+            testAwaitedWaitShape();
+            LibcRunShutdown_nid_postfix();
+            std::puts("AGC awaited wait shape test passed");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--wait-producer-chain") {
