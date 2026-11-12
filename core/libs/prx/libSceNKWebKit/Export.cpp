@@ -10089,10 +10089,6 @@ int APS5_VABI _ZN7WebCore27TranslateTransformOperationC1ERKNS_6LengthES3_S3_NS_1
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI WKDownloadCancel() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI _ZNK7WebCore14SecurityOrigin20isSameSchemeHostPortERKS0_() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -16048,10 +16044,6 @@ int APS5_VABI _ZN3WTF26getAndResetAccumulatedLogsEv() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-int APS5_VABI _ZN3WTF28encodeWithURLEscapeSequencesERKNS_6StringE() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
 int APS5_VABI _ZN3WTF30numCodeUnitsInGraphemeClustersENS_10StringViewEj() {
     NotImplemented_nid_no_patch(__func__);
 }
@@ -21656,10 +21648,6 @@ int APS5_VABI _ZN7WebCore18isEditablePositionERKNS_8PositionENS_12EditableTypeE(
 }
 
 int APS5_VABI _ZN7WebCore18isStartOfParagraphERKNS_15VisiblePositionENS_27EditingBoundaryCrossingRuleE() {
-    NotImplemented_nid_no_patch(__func__);
-}
-
-int APS5_VABI _ZN7WebCore18isValidContentTypeERKN3WTF6StringENS_4ModeE() {
     NotImplemented_nid_no_patch(__func__);
 }
 
@@ -29583,10 +29571,6 @@ int APS5_VABI _ZNK3WTF3URL4dumpERNS_11PrintStreamE() {
     NotImplemented_nid_no_patch(__func__);
 }
 
-
-int APS5_VABI _ZNK3WTF6String18simplifyWhiteSpaceEPFbDsE() {
-    NotImplemented_nid_no_patch(__func__);
-}
 
 int APS5_VABI _ZNK3WTF6String28convertToLowercaseWithLocaleERKNS_10AtomStringE() {
     NotImplemented_nid_no_patch(__func__);
