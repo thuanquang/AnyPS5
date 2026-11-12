@@ -637,19 +637,18 @@ struct Replay {
     }
 
     void waitStarted(const FrameCall& call) {
-        const auto accepted = progress().first;
         const auto limit = Clock::now() + options.busyTimeout;
         auto lastSeen = progress();
         auto quietSince = Clock::now();
         for (std::size_t index = 1; index < call.values.size(); ++index) {
-            const auto serial = startedSerial(call, accepted, call.values[index]);
+            const auto serial = startedSerial(call, call.values[index]);
             if (!serial) continue;
             awaitSerial(*serial, limit, lastSeen, quietSince, [&](const std::string& reason) { return std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " waits for submission " + std::to_string(call.values[index]) + " (replay serial " + std::to_string(*serial) + "), which had started when the capture read the delta, but " + reason); });
         }
     }
 
-    std::optional<std::uint64_t> startedSerial(const FrameCall& call, std::uint64_t accepted, std::uint64_t serial) const {
-        if (!captureBase) return accepted - (call.accepted - serial);
+    std::optional<std::uint64_t> startedSerial(const FrameCall& call, std::uint64_t serial) const {
+        if (!captureBase) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " was read with submission " + std::to_string(serial) + " in flight, but the capture has no frame start to map its serials from");
         const auto found = replaySerials.find(serial);
         if (found == replaySerials.end()) throw std::runtime_error("frame replay: memory delta at call " + std::to_string(call.ordinal) + " lists submission " + std::to_string(serial) + ", which had started when the capture read the delta, but no call since the frame start recorded that serial");
         return found->second;

@@ -812,7 +812,45 @@ void testBlockingSubmission(const std::filesystem::path& directory) {
     AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
 }
 
+FrameCall frameStart(std::uint64_t base) {
+    FrameCall start;
+    start.kind = FrameCallKind::FrameStart;
+    start.accepted = base;
+    start.completed = base;
+    return start;
+}
+
+FrameCall parkedSubmit(const std::uint32_t* commands, std::size_t dwords, std::uint64_t base) {
+    FrameCall call;
+    call.kind = FrameCallKind::Submit;
+    call.ordinal = 1;
+    call.thread = 1;
+    call.address = address(commands);
+    call.size = dwords;
+    call.accepted = base;
+    call.completed = base;
+    call.values = {base + 1};
+    return call;
+}
+
+FrameCall inFlightDelta(std::uint64_t ordinal, std::uint64_t base) {
+    auto call = memoryCall(1, 1);
+    call.ordinal = ordinal;
+    call.flags = AgcDriver::InFlightDeltaFlag;
+    call.accepted = base + 1;
+    call.completed = base;
+    call.values = {1, base + 1};
+    return call;
+}
+
+bool parkedOn(std::uint64_t label) {
+    std::array<AgcDriver::AwaitedWait, 64> awaited{};
+    const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+    return std::any_of(awaited.begin(), awaited.begin() + static_cast<std::ptrdiff_t>(count), [&](const AgcDriver::AwaitedWait& slot) { return slot.address == label; });
+}
+
 void testGateSettled(const std::filesystem::path& directory) {
+    constexpr std::uint64_t Base = 40;
     auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
     auto* label = reinterpret_cast<std::uint32_t*>(bytes);
     auto* commands = reinterpret_cast<std::uint32_t*>(bytes + 4096);
@@ -824,6 +862,7 @@ void testGateSettled(const std::filesystem::path& directory) {
     const std::uint32_t stored = 7;
     FrameCaptureWriter writer(directory);
     writer.WriteDelta(1, 0, address(restored), std::as_bytes(std::span(&stored, 1)));
+    writer.WriteCall(frameStart(Base));
     writer.Finish("{}");
     const FrameCaptureReader reader(directory);
     Options options;
@@ -833,37 +872,21 @@ void testGateSettled(const std::filesystem::path& directory) {
     Replay replay{options, reader};
     replay.recording = true;
     collectGroups(replay);
-    AgcDriverSubmitGraphics_nid_postfix(commands, static_cast<std::uint32_t>(wait.size()));
-    const auto parked = [&] {
-        std::array<AgcDriver::AwaitedWait, 64> awaited{};
-        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
-        return std::any_of(awaited.begin(), awaited.begin() + static_cast<std::ptrdiff_t>(count), [&](const AgcDriver::AwaitedWait& slot) { return slot.address == address(label); });
-    };
-    const auto deadline = Clock::now() + std::chrono::seconds(10);
-    while (!parked()) {
-        check(Clock::now() < deadline, "the submission did not wait on its unwritten label");
-        std::this_thread::yield();
-    }
-    const auto [accepted, completed] = progress();
-    check(accepted == completed + 1, "the parked submission was not the only one in flight");
-    auto call = memoryCall(1, 1);
-    call.ordinal = 1;
-    call.flags = AgcDriver::InFlightDeltaFlag;
-    call.accepted = accepted;
-    call.completed = completed;
-    call.values = {1, accepted};
+    const std::array calls{parkedSubmit(commands, wait.size(), Base), inFlightDelta(2, Base)};
     std::string failure;
     try {
-        replay.runWindow(std::span(&call, 1));
+        replay.runWindow(calls);
     } catch (const std::runtime_error& error) {
         failure = error.what();
     }
+    const auto completed = replay.replayBase;
+    const auto accepted = completed + 1;
     const auto delta = std::atomic_ref<std::uint32_t>(*restored).load(std::memory_order_acquire);
     std::atomic_ref<std::uint32_t>(*label).store(1, std::memory_order_release);
     AgcDriverWaitIdle_nid_postfix();
     char blocked[64];
     std::snprintf(blocked, sizeof(blocked), "; blocked on 0x%llx (", static_cast<unsigned long long>(address(label)));
-    check(failure.find("but no queue runs and the serials stopped at " + std::to_string(completed) + "/" + std::to_string(accepted) + blocked) != std::string::npos, ("the gate of a delta read in flight did not end once no queue ran while the submission it waits for stayed parked on title memory: " + failure).c_str());
+    check(failure.find("(replay serial " + std::to_string(accepted) + "), which had started when the capture read the delta, but no queue runs and the serials stopped at " + std::to_string(completed) + "/" + std::to_string(accepted) + blocked) != std::string::npos, ("the gate of a delta read in flight did not end once no queue ran while the submission it waits for stayed parked on title memory: " + failure).c_str());
     check(delta == 0, "the replay restored a delta read in flight although the submission it waits for never completed");
 }
 
@@ -954,6 +977,7 @@ void testDepthOfTimedPasses(const std::filesystem::path& directory) {
 }
 
 void testGateFailure(const std::filesystem::path& directory) {
+    constexpr std::uint64_t Base = 40;
     auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
     auto* label = reinterpret_cast<std::uint32_t*>(bytes);
     auto* commands = reinterpret_cast<std::uint32_t*>(bytes + 4096);
@@ -963,6 +987,7 @@ void testGateFailure(const std::filesystem::path& directory) {
     const std::uint32_t stored = 7;
     FrameCaptureWriter writer(directory);
     writer.WriteDelta(1, 0, address(bytes + 8192), std::as_bytes(std::span(&stored, 1)));
+    writer.WriteCall(frameStart(Base));
     writer.Finish("{}");
     const FrameCaptureReader reader(directory);
     Options options;
@@ -971,19 +996,60 @@ void testGateFailure(const std::filesystem::path& directory) {
     Replay replay{options, reader};
     replay.recording = true;
     collectGroups(replay);
+    std::atomic<bool> injected{false};
+    std::thread reporter([&] {
+        const auto deadline = Clock::now() + std::chrono::seconds(10);
+        while (!parkedOn(address(label))) {
+            if (Clock::now() >= deadline) return;
+            std::this_thread::yield();
+        }
+        AgcDriverReportFailure_nid_postfix(std::make_exception_ptr(std::runtime_error("gate driver failure")));
+        injected.store(true);
+    });
+    const std::array calls{parkedSubmit(commands, wait.size(), Base), inFlightDelta(2, Base)};
+    std::string failure;
+    try {
+        replay.runWindow(calls);
+    } catch (const std::runtime_error& error) {
+        failure = error.what();
+    }
+    reporter.join();
+    check(injected.load(), "the submission did not wait on its unwritten label");
+    check(failure == "gate driver failure", ("a driver failure during a flagged delta's gate did not end the replay with the driver's error: " + failure).c_str());
+    bool rethrown = false;
+    try { AgcDriverShutdown_nid_postfix(); }
+    catch (const std::runtime_error& error) { rethrown = std::string_view(error.what()) == "gate driver failure"; }
+    check(rethrown, "the injected driver failure was not propagated at shutdown");
+}
+
+void testGateWithoutFrameStart(const std::filesystem::path& directory) {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* label = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* commands = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    auto* restored = reinterpret_cast<std::uint32_t*>(bytes + 8192);
+    *label = 0;
+    *restored = 0;
+    const std::array<std::uint32_t, 7> wait{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address(label)), static_cast<std::uint32_t>(address(label) >> 32u), 1u, 0xffffffffu, 4u};
+    std::copy(wait.begin(), wait.end(), commands);
+    const std::uint32_t stored = 7;
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(restored), std::as_bytes(std::span(&stored, 1)));
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.paceTimeout = std::chrono::milliseconds(300);
+    options.busyTimeout = std::chrono::milliseconds(3000);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
     AgcDriverSubmitGraphics_nid_postfix(commands, static_cast<std::uint32_t>(wait.size()));
-    const auto parked = [&] {
-        std::array<AgcDriver::AwaitedWait, 64> awaited{};
-        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
-        return std::any_of(awaited.begin(), awaited.begin() + static_cast<std::ptrdiff_t>(count), [&](const AgcDriver::AwaitedWait& slot) { return slot.address == address(label); });
-    };
     const auto deadline = Clock::now() + std::chrono::seconds(10);
-    while (!parked()) {
+    while (!parkedOn(address(label))) {
         check(Clock::now() < deadline, "the submission did not wait on its unwritten label");
         std::this_thread::yield();
     }
     const auto [accepted, completed] = progress();
-    AgcDriverReportFailure_nid_postfix(std::make_exception_ptr(std::runtime_error("gate driver failure")));
     auto call = memoryCall(1, 1);
     call.ordinal = 1;
     call.flags = AgcDriver::InFlightDeltaFlag;
@@ -996,11 +1062,11 @@ void testGateFailure(const std::filesystem::path& directory) {
     } catch (const std::runtime_error& error) {
         failure = error.what();
     }
-    check(failure == "gate driver failure", "a driver failure during a flagged delta's gate did not end the replay with the driver's error");
-    bool rethrown = false;
-    try { AgcDriverShutdown_nid_postfix(); }
-    catch (const std::runtime_error& error) { rethrown = std::string_view(error.what()) == "gate driver failure"; }
-    check(rethrown, "the injected driver failure was not propagated at shutdown");
+    const auto delta = std::atomic_ref<std::uint32_t>(*restored).load(std::memory_order_acquire);
+    std::atomic_ref<std::uint32_t>(*label).store(1, std::memory_order_release);
+    AgcDriverWaitIdle_nid_postfix();
+    check(failure == "frame replay: memory delta at call 1 was read with submission " + std::to_string(accepted) + " in flight, but the capture has no frame start to map its serials from", ("a delta read in flight in a capture without a frame start was gated by its distance from the accepted serial instead of refused: " + failure).c_str());
+    check(delta == 0, "the replay restored a delta read in flight that it could not order");
 }
 
 void testRewindBreaker(const std::filesystem::path& directory, bool previous) {
@@ -1942,6 +2008,7 @@ int main(int argc, char** argv) {
         else if (mode == "depth_submits") testDepthAfterSubmits(directory);
         else if (mode == "depth_passes") testDepthOfTimedPasses(directory);
         else if (mode == "gate_failure") testGateFailure(directory);
+        else if (mode == "gate_no_frame_start") testGateWithoutFrameStart(directory);
         else if (mode == "in_flight_breaker" || mode == "previous_breaker") testRewindBreaker(directory, mode == "previous_breaker");
         else if (mode == "unverified") testUnverifiedDeltas(directory);
         else if (mode == "serial_diverged") testSerialDiverged(directory);
